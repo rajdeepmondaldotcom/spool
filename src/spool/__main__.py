@@ -50,13 +50,13 @@ def main(argv=None):
     url = f"http://127.0.0.1:{port}/#t={token}"  # a fragment never leaves the browser
     write_private(lock, json.dumps({"port": port, "pid": os.getpid()}))
     signal.signal(signal.SIGTERM, interrupt)
-    engines.start()
-    js.start()
-    print(f"Spool is running at {url}", flush=True)
-    print("Press Ctrl+C to stop it.", flush=True)
-    if not args.no_open:
-        webbrowser.open(url + carrying(args.links))
-    try:
+    try:  # from here a stop (Ctrl+C or SIGTERM) at any moment shuts down quietly
+        engines.start()
+        js.start()
+        print(f"Spool is running at {url}", flush=True)
+        print("Press Ctrl+C to stop it.", flush=True)
+        if not args.no_open:
+            webbrowser.open(url + carrying(args.links))
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
