@@ -949,6 +949,25 @@ def test_a_refused_token_never_replaces_the_kept_one(page, spool):
     expect(page.get_by_label("Link to download")).to_be_visible()
 
 
+def test_a_second_tab_with_a_token_spool_refuses_says_so_too(page, context, spool):
+    origin = spool[0].split("#")[0]
+    page.goto(origin + "#t=stale")
+    expect(page.get_by_text("This tab lost its link to Spool.", exact=False)).to_be_visible()
+    second = context.new_page()  # joins the first tab's stream, which has already been refused
+    second.goto(origin + "#t=stale")
+    expect(second.get_by_text("This tab lost its link to Spool.", exact=False)).to_be_visible()
+
+
+def test_a_tab_from_an_earlier_launch_works_again_once_a_new_tab_is_let_in(page, context, spool):
+    origin = spool[0].split("#")[0]
+    page.goto(origin + "#t=stale")  # as a tab left open across a restart: its token opens nothing now
+    expect(page.get_by_text("This tab lost its link to Spool.", exact=False)).to_be_visible()
+    newer = context.new_page()
+    newer.goto(spool[0])  # the tab the new launch opens
+    expect(newer.get_by_label("Link to download")).to_be_visible()
+    expect(page.get_by_label("Link to download")).to_be_visible()
+
+
 def test_clear_sends_only_the_rows_it_took_off(app, spool):
     sent = clear_requests(app)
     add(spool, [("https://fake.test/video/1", "Fake video 1")])

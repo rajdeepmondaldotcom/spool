@@ -80,12 +80,13 @@ def carrying(links):
 
 
 def running(lock):
-    """The link of the Spool that wrote this lockfile, if its process is alive and it answers to its token."""
+    """The link of the Spool that wrote this lockfile, if it still answers to its token.
+
+    The token is that launch's own, so after a crash it opens nothing, whatever holds the port now."""
     # shortcut: two launches in the same instant can both start; a real lock (flock) if that ever bites
     try:
         saved = json.loads(lock.read_text())
-        port, pid, token = int(saved["port"]), int(saved["pid"]), str(saved["token"])
-        os.kill(pid, 0)  # a dead Spool's port may belong to anything now: never send it a token
+        port, token = int(saved["port"]), str(saved["token"])
         # the event stream answers after a destination check, which can take CHECK_TIMEOUT on a sleeping drive
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=system.CHECK_TIMEOUT + 2)
         conn.request("GET", "/api/events", headers={"Host": f"127.0.0.1:{port}", "X-Spool-Token": token})
@@ -94,7 +95,7 @@ def running(lock):
         conn.close()
         if answered:
             return f"http://127.0.0.1:{port}/#t={token}"
-    except (OSError, ValueError, KeyError, TypeError):  # PermissionError: that pid is another user's now
+    except (OSError, ValueError, KeyError, TypeError):
         pass
     return None
 

@@ -13,6 +13,8 @@ const token = given && /^[\w-]+$/.test(given) ? given : kept();
 const remember = () => { try { localStorage.setItem(KEY, token); } catch { /* private window: the token lives only in this page */ } };
 if (location.hash) history.replaceState(null, "", location.pathname + location.search);
 const auth = { "X-Spool-Token": token };
+// A tab left open across a restart holds a token that opens nothing. When a newer tab is let in, this one follows.
+window.addEventListener("storage", (e) => { if (e.key === KEY && e.newValue && e.newValue !== token) location.reload(); });
 
 let unauthorized = () => {};
 export const onUnauthorized = (fn) => { unauthorized = fn; };
@@ -90,7 +92,7 @@ export function listen({ snapshot, job, removed, connected }) {
     handlers[event]?.(data);
   };
   const emit = (m) => { deliver(m); channel.postMessage(m); };
-  let leading = false, stream, again = false;
+  let leading = false, stream, again = false, refused = false;
   channel.onmessage = ({ data }) => (data.event === "refresh" ? leading && reopen() : deliver(data));
   reopen = () => channel.postMessage({ event: "refresh" });
   reopen(); // a tab that joins asks for a snapshot
@@ -111,7 +113,7 @@ export function listen({ snapshot, job, removed, connected }) {
     quiet();
     try {
       const res = await fetch("/api/events", { headers: auth, cache: "no-store", signal: stream.signal });
-      if (res.status === 401) { clearTimeout(timer); return emit({ event: "unauthorized" }); }
+      if (res.status === 401) { clearTimeout(timer); refused = true; return emit({ event: "unauthorized" }); }
       if (!res.ok) throw new Error(`events ${res.status}`);
       const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
       let buffer = "";
@@ -134,7 +136,8 @@ export function listen({ snapshot, job, removed, connected }) {
   };
   const lead = () => {
     leading = true;
-    reopen = () => { again = true; stream?.abort(); };
+    // a tab that joins after the token was refused has to hear it too: the stream is not coming back
+    reopen = () => { if (refused) return emit({ event: "unauthorized" }); again = true; stream?.abort(); };
     open();
     return new Promise(() => {}); // held until this tab closes
   };

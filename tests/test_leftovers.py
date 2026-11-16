@@ -97,3 +97,17 @@ def test_remove_cleans_up_in_a_folder_reached_through_a_link(app, events, tmp_pa
     assert names(real) == ["Fake refused video [refused-1].f137.mp4.part"]
     assert app.request("DELETE", f"/api/jobs/{job_id}")[0] == 204
     assert names(real) == []
+
+
+def test_remove_keeps_an_mp3_an_earlier_run_of_the_job_finished(tmp_path):
+    from spool.jobs import remove_leftovers
+
+    mp3 = tmp_path / "Song [a].mp3"
+    mp3.write_bytes(b"finished")
+    job = {"files": [str(tmp_path / "Song [a].webm")], "preset": "mp3", "state": "cancelled", "dest": str(tmp_path)}
+    for started in (None, time.time() + 60):  # finished, then Download again, then Cancel: waiting, or just begun
+        remove_leftovers({**job, "started": started}, set())
+        assert mp3.exists()  # written before this run began: the earlier run's finished file
+    job["started"] = time.time() - 30
+    remove_leftovers(job, set())
+    assert not mp3.exists()  # written during this run: the half-written file a cancel leaves

@@ -51,7 +51,8 @@ class Jobs:
             "preset": lambda v: isinstance(v, str) and v in PRESETS,
         }
         self.settings.update({k: v for k, v in saved.get("settings", {}).items() if k in valid and valid[k](v)})
-        later = {"files": [], "item": None, "progress": None, "what": None}  # keys added after v0.1's first saves
+        # keys added after v0.1's first saves
+        later = {"files": [], "item": None, "progress": None, "what": None, "started": None}
         keys = set(new_job({"url": "https://x.test"}, "best", "yt-dlp", "/")) - set(later)
         self.jobs = [  # newest first; a malformed record is dropped, not fatal
             {**later, **j} for j in saved.get("jobs", []) if isinstance(j, dict) and keys <= set(j)
@@ -360,7 +361,7 @@ class Jobs:
             if len(self.procs) >= AT_ONCE or self.closed:
                 return
             if job["state"] == "queued" and job["id"] not in self.procs:
-                job.update(state="running", stage="starting")
+                job.update(state="running", stage="starting", started=time.time())
                 self._changed(job)
                 self.procs[job["id"]] = None  # no worker yet
                 threading.Thread(target=self._run, args=(job,), daemon=True).start()
@@ -652,6 +653,7 @@ def text(value, limit=1000):
 
 RUN = {  # a job's fields for one run, as it is before the run starts; Retry sets them back
     "state": "queued",
+    "started": None,  # when this run began; Remove tells this run's half-written file from an earlier run's
     "stage": None,
     "part": 0,
     "progress": None,  # 0 to 1 across all parts, never decreasing
@@ -763,8 +765,8 @@ def remove_leftovers(job, keep):
     for f in job["files"]:
         names |= {f, f + ".part", f + ".ytdl"}
         mp3 = mp3_of(job, f)
-        if mp3 and job["state"] != "done":  # ffmpeg's half-written .mp3 looks finished
-            if os.path.exists(mp3) and os.path.getmtime(mp3) >= job["created"]:  # never an older job's mp3
+        if mp3 and job["state"] != "done" and job["started"]:  # ffmpeg's half-written .mp3 looks finished
+            if os.path.exists(mp3) and os.path.getmtime(mp3) >= job["started"]:  # never an earlier run's mp3
                 names.add(mp3)
     for name in names - keep:
         try:  # the worker reports names under the folder's real path, which the typed one may not spell

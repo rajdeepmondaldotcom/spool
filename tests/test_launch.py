@@ -162,22 +162,6 @@ def dead_pid():
     return gone.pid
 
 
-def test_a_stale_lockfile_never_sends_its_token_to_whatever_holds_the_port_now(data):
-    with socket.socket() as stranger:
-        stranger.bind(("127.0.0.1", 0))
-        stranger.listen()
-        stranger.setblocking(False)
-        lock = {"port": stranger.getsockname()[1], "pid": dead_pid(), "token": "old-token"}
-        (data / "spool.lock").write_text(json.dumps(lock))
-        proc, line = launch(data)
-        try:
-            assert "Spool is running at" in line
-            with pytest.raises(BlockingIOError):
-                stranger.accept()  # nobody called
-        finally:
-            stop(proc)
-
-
 def test_a_stale_lockfile_is_ignored(data):
     (data / "spool.lock").write_text(json.dumps({"port": 9, "pid": dead_pid()}))
     proc, line = launch(data)
