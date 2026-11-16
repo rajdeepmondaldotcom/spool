@@ -28,34 +28,36 @@ class Log:
     info = warning = error = debug
 
 
+AUDIO = {"audio": "bestaudio[ext=m4a]/bestaudio/best", "mp3": "bestaudio/best"}
 LONG = {2160: 3840, 1440: 2560, 1080: 1920, 720: 1280, 480: 854, 360: 640, 240: 426}  # the 16:9 long side
 
 
-def selector(preset, ffmpeg):
-    """A preset's format selector. A class N is the short side, so N fits [height<=L][width<=L] either way up;
-    sites that give no widths fall back to [height<=N]."""
+def format_params(preset, ffmpeg, module):
+    """The engine params that choose a preset's streams."""
+    if preset in AUDIO:
+        return {"format": AUDIO[preset]}
+    if module == "yt_dlp":  # its sorter's res is the short side; resolution first, H.264 + AAC only break ties
+        res = "res" if preset == "best" else f"res:{preset}"
+        return {"format": "bv*+ba/b" if ffmpeg else "b", "format_sort": [res, "fps", "vcodec:h264", "acodec:aac"]}
+    return {"format": ladder(preset, ffmpeg)}
+
+
+def ladder(preset, ffmpeg):
+    """youtube-dl's selector: it has no format sorting, so fallbacks stand in for it.
+
+    shortcut: youtube-dl cannot rank by the short side or break ties by codec, so a 4:3 or 3:4 video's class N can
+    give a format one class up, and H.264 is preferred only at exactly N; Best takes the engine's own top format.
+    Upgrade if youtube-dl gains format sorting, or drop the ladder if yt-dlp becomes the only engine."""
     if preset == "best":
-        if ffmpeg:  # above 1080 any codec; up to 1080 prefer H.264 + AAC, which plays everywhere
-            return (
-                "bestvideo[height>1080][width>?1080]+bestaudio"
-                "/bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
-            )
-        return "best"
-    if preset == "audio":
-        return "bestaudio[ext=m4a]/bestaudio/best"
-    if preset == "mp3":
-        return "bestaudio/best"
+        return "bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best" if ffmpeg else "best"
     n = int(preset)
     fit, tall = f"[height<={LONG[n]}][width<={LONG[n]}]", f"[height<={n}]"
     if not ffmpeg:
         return f"best{fit}/best{tall}/best"
-    if n <= 1080:
-        return (
-            f"bestvideo{fit}[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo{fit}+bestaudio"
-            f"/bestvideo{tall}[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo{tall}+bestaudio"
-            f"/best{fit}/best{tall}/best"
-        )
-    return f"bestvideo{fit}+bestaudio/bestvideo{tall}+bestaudio/best{fit}/best{tall}/best"
+    return (  # H.264 only when the class itself has it, landscape or portrait; then the best that fits
+        f"bestvideo[height={n}][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[width={n}][vcodec^=avc1]+bestaudio[ext=m4a]"
+        f"/bestvideo{fit}+bestaudio/bestvideo{tall}+bestaudio/best{fit}/best{tall}/best"
+    )
 
 
 # A file name holds 255 bytes (macOS) or 255 characters (exFAT), and the engines add " [id]" and ".f137.mp4.part".
@@ -78,57 +80,53 @@ def short(f):
     return min(f["width"], f["height"]) if f.get("width") and f.get("height") else (f.get("height") or 0)
 
 
-def within(formats, n):
-    """The formats a class-N selector looks at: fitting either way up, else by height."""
-    if n is None:
-        return formats
-    fit = [f for f in formats if f.get("width") and (f.get("height") or 0) <= LONG[n] and f["width"] <= LONG[n]]
-    return fit or [f for f in formats if (f.get("height") or 0) <= n]
-
-
 def has(f, codec):
     return f.get(codec) != "none"  # no codec info means the stream carries it
 
 
+def bytes_of(f, duration):
+    """A stream's bytes; from the bitrate when the site gives no size, as yt-dlp estimates it."""
+    return f.get("filesize") or f.get("filesize_approx") or (f.get("tbr") or 0) * 125 * (duration or 0)
+
+
 def size(duration, *formats):
-    """Bytes for these streams; from the bitrate when the site gives no size, as yt-dlp estimates it."""
-    sizes = [
-        f and (f.get("filesize") or f.get("filesize_approx") or (f.get("tbr") or 0) * 125 * (duration or 0))
-        for f in formats
-    ]
+    sizes = [f and bytes_of(f, duration) for f in formats]
     return int(sum(sizes)) if all(sizes) else None
 
 
-def top(formats, key):
-    return max(formats, key=key, default=None)
+def ranking(n, duration):
+    """yt-dlp's order for format_sort [res:N, fps, vcodec:h264, acodec:aac]: the site's own preference first,
+    then the largest short side up to N (above N the smallest), then frame rate, H.264, AAC, size, bitrate."""
 
+    def key(f):
+        side = short(f)
+        return (
+            -1 if f.get("preference") is None else f["preference"],
+            side if n is None or side <= n else -side,
+            f.get("fps") or 0,
+            str(f.get("vcodec")).startswith(("avc1", "h264")),
+            str(f.get("acodec")).startswith(("mp4a", "aac")),
+            bytes_of(f, duration),
+            f.get("tbr") or 0,
+        )
 
-def picture(f):
-    return (f.get("height") or 0, "m3u8" not in (f.get("protocol") or ""), f.get("tbr") or 0)  # engines rank HLS lower
-
-
-def sound(f):
-    return f.get("abr") or f.get("tbr") or 0
+    return key
 
 
 def estimate(formats, preset, ffmpeg, duration):
-    """Estimated bytes for a preset, following the same order as its selector. None when unknown."""
+    """Estimated bytes for a preset, choosing streams by the rule yt-dlp uses. None when unknown."""
     audio = [f for f in formats if has(f, "acodec") and not has(f, "vcodec")]
-    m4a = [f for f in audio if f.get("ext") == "m4a"]
     both = [f for f in formats if has(f, "acodec") and has(f, "vcodec")]
     if preset == "mp3":
         return None
     if preset == "audio":
-        return size(duration, top(m4a or audio or both, sound))
-    n = None if preset == "best" else int(preset)
-    video = within([f for f in formats if has(f, "vcodec") and not has(f, "acodec")], n)
-    if ffmpeg and video and audio:
-        tall = (n is None and any(short(f) > 1080 for f in video)) or (n or 0) > 1080
-        avc = [f for f in video if str(f.get("vcodec")).startswith("avc1")]
-        if not tall and avc and m4a:
-            return size(duration, top(avc, picture), top(m4a, sound))
-        return size(duration, top(video, picture), top(audio, sound))
-    return size(duration, top(within(both, n) or both or audio, picture))
+        m4a = [f for f in audio if f.get("ext") == "m4a"]
+        return size(duration, max(m4a or audio or both, key=lambda f: f.get("abr") or f.get("tbr") or 0, default=None))
+    key = ranking(None if preset == "best" else int(preset), duration)
+    video = [f for f in formats if has(f, "vcodec")]
+    if ffmpeg and video and audio:  # bv*+ba
+        return size(duration, max(video, key=key), max(audio, key=key))
+    return size(duration, max(both or formats, key=key, default=None))  # b
 
 
 def entry(info, ffmpeg):
@@ -136,7 +134,8 @@ def entry(info, ffmpeg):
         presets = [preset(p) for p in FLAT_PRESETS]
     else:
         formats = info.get("formats") or [info]  # a site with one stream puts it on the info itself
-        classes = {short(f) for f in formats if has(f, "vcodec")}
+        playable = formats if ffmpeg else [f for f in formats if has(f, "acodec")]  # no merging without ffmpeg
+        classes = {short(f) for f in playable if has(f, "vcodec")}
         ids = ["best", *(str(h) for h in HEIGHTS if h in classes), "audio"]
         presets = [preset(p, estimate(formats, p, ffmpeg, info.get("duration"))) for p in ids]
     if ffmpeg:
@@ -226,7 +225,7 @@ def download(engine, module, params, spec):
 
     params.update(
         match_filter=not_live,
-        format=selector(spec["preset"], spec["ffmpeg"]),
+        **format_params(spec["preset"], spec["ffmpeg"], module),
         outtmpl=TITLE[module] + " [%(id)s]" + CLASS.get(spec["preset"], "") + ".%(ext)s",  # relative to dest
         updatetime=False,  # stamp files with the download time, not the upload time
         progress_hooks=[hook],

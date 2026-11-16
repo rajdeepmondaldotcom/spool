@@ -98,6 +98,28 @@ VERTICAL_FORMATS = [  # a phone video: the class is the short side
     },
     {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "abr": 129, "filesize": 400_000},
 ]
+FOUR_THREE_FORMATS = [  # an old 4:3 video: 640x480 is class 480, 480x360 is class 360
+    {
+        "format_id": "v480",
+        "ext": "mp4",
+        "width": 640,
+        "height": 480,
+        "vcodec": "avc1.4d401e",
+        "acodec": "none",
+        "filesize": 500_000,
+    },
+    {
+        "format_id": "v360",
+        "ext": "mp4",
+        "width": 480,
+        "height": 360,
+        "vcodec": "avc1.4d401e",
+        "acodec": "none",
+        "filesize": 300_000,
+    },
+    {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "abr": 129, "filesize": 400_000},
+]
+VP9_TOP_FORMATS = [f for f in VIDEO_FORMATS if f["format_id"] not in ("hls-1080", "137")]  # 1080 only in VP9
 AUDIO_FORMATS = [
     {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "abr": 129, "filesize": 500_000},
     {"format_id": "251", "ext": "webm", "vcodec": "none", "acodec": "opus", "abr": 135, "filesize": 480_000},
@@ -201,6 +223,10 @@ def scenario(url):
         return {**video(url, n, title), "id": f"long-{n}"}, delay if delay is not None else 0.15
     if name == "vertical":
         return {**video(url, n, "Fake vertical video", VERTICAL_FORMATS), "id": f"vert-{n}"}, delay or 0
+    if name == "four-three":
+        return {**video(url, n, "Fake 4:3 video", FOUR_THREE_FORMATS), "id": f"43-{n}"}, delay or 0
+    if name == "vp9-top":
+        return {**video(url, n, "Fake VP9 video", VP9_TOP_FORMATS), "id": f"vp9-{n}"}, delay or 0
     if name == "hls":  # streams with a bitrate but no file size
         hls = [{"format_id": "hls-720", "ext": "mp4", "height": 720, "tbr": 800, "protocol": "m3u8_native"}]
         return {**video(url, n, "Fake streamed video", hls), "id": f"hls-{n}"}, 0

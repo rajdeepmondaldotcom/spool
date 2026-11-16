@@ -70,21 +70,22 @@ def presets(url, ffmpeg=True):
 def test_a_video_offers_best_its_real_heights_and_audio_with_size_estimates():
     sizes, order = presets("https://fake.test/video")
     assert order == ["best", "1080", "720", "480", "360", "audio", "mp3"]
-    # H.264 video stream plus the m4a audio stream; 360 exists only as one combined stream
+    # yt-dlp's rule: largest short side, then H.264, then size: at 1080 the H.264 HLS stream (9000 kbit/s for 95 s)
+    # outranks the smaller H.264 file; the AAC m4a outranks opus; at 360 the combined stream is merged with it too
     assert sizes == {
-        "best": 3_400_000,
-        "1080": 3_400_000,
-        "720": 1_900_000,
-        "480": 1_200_000,
-        "360": 600_000,
+        "best": 9000 * 125 * 95 + 400_000,
+        "1080": 9000 * 125 * 95 + 400_000,
+        "720": 1_500_000 + 400_000,
+        "480": 800_000 + 400_000,
+        "360": 600_000 + 400_000,
         "audio": 400_000,
         "mp3": None,
     }
 
 
-def test_without_ffmpeg_there_is_no_mp3_and_sizes_are_the_single_stream():
+def test_without_ffmpeg_only_streams_with_picture_and_sound_are_offered():
     sizes, order = presets("https://fake.test/video", ffmpeg=False)
-    assert order == ["best", "1080", "720", "480", "360", "audio"]
+    assert order == ["best", "360", "audio"]
     assert sizes["best"] == 600_000
     assert sizes["audio"] == 400_000
 
@@ -196,20 +197,30 @@ def test_playlist_presets_carry_labels_too():
     assert [p["label"] for p in entry["presets"]] == ["Best", "1080p", "720p", "480p", "Audio", "MP3"]
 
 
-def test_selectors_fit_the_class_in_either_orientation_and_fall_back_to_height():
-    from spool.worker import selector
+def test_yt_dlp_chooses_by_its_format_sorting_with_resolution_first():
+    from spool.worker import format_params
 
-    assert selector("1080", True) == (
-        "bestvideo[height<=1920][width<=1920][vcodec^=avc1]+bestaudio[ext=m4a]"
-        "/bestvideo[height<=1920][width<=1920]+bestaudio"
-        "/bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio"
-        "/best[height<=1920][width<=1920]/best[height<=1080]/best"
-    )
-    assert selector("2160", True) == (
-        "bestvideo[height<=3840][width<=3840]+bestaudio/bestvideo[height<=2160]+bestaudio"
-        "/best[height<=3840][width<=3840]/best[height<=2160]/best"
-    )
-    assert selector("480", False) == "best[height<=854][width<=854]/best[height<=480]/best"
+    assert format_params("720", True, "yt_dlp") == {
+        "format": "bv*+ba/b",
+        "format_sort": ["res:720", "fps", "vcodec:h264", "acodec:aac"],
+    }
+    assert format_params("best", False, "yt_dlp") == {
+        "format": "b",
+        "format_sort": ["res", "fps", "vcodec:h264", "acodec:aac"],
+    }
+    assert format_params("audio", True, "yt_dlp") == {"format": "bestaudio[ext=m4a]/bestaudio/best"}
+
+
+def test_a_4_3_video_is_classed_by_its_short_side():
+    sizes, order = presets("https://fake.test/four-three")
+    assert order == ["best", "480", "360", "audio", "mp3"]
+    assert sizes["360"] == 300_000 + 400_000  # the 480x360 stream, not the 640x480 one
+
+
+def test_the_top_class_wins_even_when_only_a_lower_class_is_h264():
+    sizes, order = presets("https://fake.test/vp9-top")
+    assert sizes["best"] == sizes["1080"] == 2_500_000 + 400_000  # VP9 1080p, not H.264 720p
+    assert sizes["720"] == 1_500_000 + 400_000
 
 
 def test_a_destination_deleted_just_before_the_engine_starts_is_not_recreated(tmp_path):
