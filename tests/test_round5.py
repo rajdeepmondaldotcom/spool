@@ -32,7 +32,7 @@ def finished(events, job_id):
 
 
 def test_progress_is_one_rising_number_across_video_and_audio(app, events):
-    job = add(app, "https://fake.test/video?delay=0.02")["jobs"][0]
+    job = add(app, "https://fake.test/video?delay=0.08")["jobs"][0]  # each part spans several 0.25 s ticks
     seen = finished(events, job["id"])
     running = [d for e, d in seen if e == "job" and d["id"] == job["id"] and d["progress"] is not None]
     progress = [d["progress"] for d in running]
