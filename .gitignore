@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+test-results/
+.DS_Store
+
+# Third-party design skill used while building; not part of this project.
+.claude/
