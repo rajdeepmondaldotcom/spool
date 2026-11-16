@@ -28,6 +28,10 @@ except metadata.PackageNotFoundError:  # run from a source tree that was never i
     VERSION = None
 LINK_LIMIT = 8192  # signed CDN links run to a few thousand characters
 WAITS = (10, 30, 60, 120, 300)  # seconds before each try again of a download cut short; then it fails
+# Sites limit a guest to a few hundred videos an hour: with PACE_FROM or more queued, the next starts PACE seconds after
+# one finishes. A handful is never slowed.
+PACE = 8
+PACE_FROM = 5
 TICK = 0.25  # job progress goes out at most once a tick: four a second
 
 
@@ -66,6 +70,8 @@ class Jobs:
         self.subscribers = []
         self.closed = False
         self.waits = WAITS
+        self.pace, self.pace_from = PACE, PACE_FROM
+        self.rest_until, self.resting = 0.0, False  # the queue pauses until rest_until; resting: a timer will pump
         self.wake = threading.Condition(self.lock)  # a job waiting to try again wakes for a cancel or a quit
         self.newer = None  # a newer Spool's version, once a look at the releases finds one
         for job in self.jobs:
@@ -396,6 +402,14 @@ class Jobs:
 
         A slot is an entry in procs: taken here, freed when the job's thread ends, so a cancelled worker that is
         still dying keeps its slot."""
+        rest = self.rest_until - time.monotonic()
+        if rest > 0:
+            if not self.resting:
+                self.resting = True
+                timer = threading.Timer(rest, self._rested)
+                timer.daemon = True
+                timer.start()
+            return
         for job in reversed(self.jobs):
             if len(self.procs) >= AT_ONCE or self.closed:
                 return
@@ -404,6 +418,11 @@ class Jobs:
                 self._changed(job)
                 self.procs[job["id"]] = None  # no worker yet
                 threading.Thread(target=self._run, args=(job,), daemon=True).start()
+
+    def _rested(self):
+        with self.lock:
+            self.resting = False
+            self._pump()
 
     def _run(self, job):
         """Run a job in the slot _pump reserved for it; the slot is freed only when its worker is gone."""
@@ -455,6 +474,8 @@ class Jobs:
                     job.update(state="failed", error=failure)
                 job.update(stage=None, note=None, speed=None, eta=None, finished=time.time())
                 self._changed(job)
+            if sum(j["state"] == "queued" for j in self.jobs) >= self.pace_from:  # a long list: let the site rest
+                self.rest_until = time.monotonic() + self.pace
             self._pump()
 
     def _wait(self, job, kind, waited):
@@ -609,7 +630,11 @@ MESSAGES = {  # kind -> (the sentence people read, hint). Every sentence the ser
     "unavailable": ("This video is private, removed, or needs a sign-in.", None),
     "live": ("This is live now. Download it after it ends.", None),
     "playlist": ("This link is a list of videos. Paste it in the link field to choose from it.", None),
-    "blocked": ("The site refused the download.", "retry"),  # update_engine when a newer engine exists
+    "blocked": ("The site refused the download.", "retry"),
+    "limited": (
+        "The site is limiting this connection for now. Wait an hour or so, then try again.",
+        "retry",
+    ),  # update_engine when a newer engine exists
     "network": ("Spool couldn't reach the site. Check your internet connection.", "retry"),
     "no_ffmpeg": ("This quality needs a free helper to join video and audio.", "install_ffmpeg"),
     "no_js": ("Spool couldn't set up what it needs for YouTube. Check your internet connection.", "retry"),
@@ -769,7 +794,9 @@ ERRORS = [  # (kind, lowercase pieces of engine messages); the first match wins.
     ("empty", ("found no video at this link",)),
     ("no_ffmpeg", ("ffmpeg not found", "ffprobe and ffmpeg not found", "ffmpeg is not installed", "ffprobe/avprobe")),
     ("engine", ("requested format is not available",)),  # the video is there; the log says what was asked
-    ("blocked", ("http error 403", "not a bot", "http error 429", "too many requests")),  # the bot check says sign in
+    # before "unavailable": the robot check says "sign in" too. Never tried again by itself: more requests make it worse
+    ("limited", ("not a bot", "http error 429", "too many requests", "isn't available, try again later")),
+    ("blocked", ("http error 403",)),
     (
         "unavailable",
         (
@@ -818,7 +845,7 @@ def classify(message):
     """An engine's message -> an error kind. The engine's own words stay in the job's log.
 
     File names carry the video's title, so an OS error's file names are not read."""
-    low = OS_ERROR.sub(r"\1", message.lower())
+    low = OS_ERROR.sub(r"\1", message.lower().replace("\u2019", "'"))  # a curly apostrophe reads as a straight one
     return next((kind for kind, pieces in ERRORS if any(p in low for p in pieces)), "engine")
 
 

@@ -138,6 +138,8 @@ def test_a_try_that_got_no_further_counts(app, events, monkeypatch, tmp_path):
         ("ERROR: Postprocessing: ffprobe and ffmpeg not found.", None),
         ("a list", "playlist"),
         ("ERROR: [youtube] abc: Some new breakage", None),
+        ("ERROR: [youtube] abc: Sign in to confirm you’re not a bot. Use --cookies-from-browser", None),
+        ("ERROR: unable to download video data: HTTP Error 429: Too Many Requests", None),
     ],
 )
 def test_what_another_try_cannot_fix_is_not_tried_again(app, events, monkeypatch, tmp_path, message, kind):
@@ -190,3 +192,60 @@ def test_quitting_while_waiting_leaves_the_job_interrupted(tmp_path):
     finally:
         httpd.shutdown()
         jobs.close()
+
+
+def test_a_site_limiting_the_connection_fails_at_once_with_a_way_to_try_by_hand(app, events, monkeypatch, tmp_path):
+    count = stub(monkeypatch, tmp_path, "ERROR: [youtube] abc: Sign in to confirm you’re not a bot.")
+    app.jobs.waits = (0.05,) * 5
+    job_id = add(app, "https://fake.test/big")
+    failed = wait_for(events, job_id, lambda d: d["state"] in ("done", "failed"))[-1][1]
+    assert failed["error"] == {
+        "kind": "limited",
+        "message": "The site is limiting this connection for now. Wait an hour or so, then try again.",
+        "hint": "retry",
+    }
+    assert count.read_text() == "1"
+
+
+# Pacing a long list
+
+
+def starts_and_ends(events, ids):
+    """(time, "start" | "end", id) for each job, until all have finished."""
+    seen, ended = [], set()
+
+    def note(e, d):
+        if e == "job" and d["id"] in ids:
+            if d["state"] == "running" and d["stage"] == "starting":
+                seen.append((time.monotonic(), "start", d["id"]))
+            elif d["state"] in ("done", "failed") and d["id"] not in ended:
+                ended.add(d["id"])
+                seen.append((time.monotonic(), "end", d["id"]))
+        return len(ended) == len(ids)
+
+    events.until(note, timeout=30)
+    return seen
+
+
+def test_with_many_waiting_the_next_starts_a_few_seconds_after_one_finishes(app, events):
+    app.jobs.pace = 1.0
+    app.jobs.pace_from = 3  # queued jobs at which the pause begins
+    ids = {add(app, f"https://fake.test/video/{n}?delay=0") for n in range(6)}
+    seen = starts_and_ends(events, ids)
+    starts = [t for t, what, _ in seen if what == "start"]
+    assert len(starts) == 6
+    for began in starts[2:4]:  # 4, then 3 were still queued when these began
+        last_end = max(t for t, what, _ in seen if what == "end" and t < began)
+        assert began - last_end >= 0.9
+
+
+def test_a_handful_of_downloads_is_not_slowed(app, events):
+    app.jobs.pace = 30
+    began = time.monotonic()
+    ids = {add(app, f"https://fake.test/video/{n}?delay=0") for n in range(4)}
+    starts_and_ends(events, ids)
+    assert time.monotonic() - began < 15
+
+
+def test_the_pace_is_kept_in_one_place():
+    assert (spool.jobs.PACE, spool.jobs.PACE_FROM) == (8, 5)
