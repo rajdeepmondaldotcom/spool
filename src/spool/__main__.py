@@ -17,7 +17,9 @@ PORT = 7766  # fixed by default, so a tab or bookmark survives a restart
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="spool", description="Save any video to your own disk. Runs on this computer and opens in your browser.")
+    parser = argparse.ArgumentParser(
+        prog="spool", description="Save any video to your own disk. Runs on this computer and opens in your browser."
+    )
     parser.add_argument("--port", type=int, help=f"port on 127.0.0.1 (default: {PORT}, else a free one)")
     parser.add_argument("--no-open", action="store_true", help="do not open a browser tab")
     args = parser.parse_args(argv)
