@@ -125,6 +125,16 @@ def reveal(path):
         subprocess.run(["xdg-open", os.path.dirname(path)], check=False)
 
 
+def open_folder(path):
+    """Open a folder in the file manager."""
+    if sys.platform == "darwin":
+        subprocess.run(["open", path], check=False)
+    elif sys.platform == "win32":
+        subprocess.run(["explorer", path], check=False)
+    else:
+        subprocess.run(["xdg-open", path], check=False)
+
+
 def spawn(args, **kwargs):
     """Start a child in its own process group, so killing it also kills what it started (ffmpeg)."""
     if sys.platform == "win32":

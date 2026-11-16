@@ -67,13 +67,13 @@ class Handler(BaseHTTPRequestHandler):
     def check_host(self):
         port = self.server.server_address[1]
         if self.headers.get("Host", "") not in (f"127.0.0.1:{port}", f"localhost:{port}"):  # DNS rebinding
-            raise Problem(403, "forbidden", "This address is not Spool's.")
+            raise Problem(403, "forbidden", "This address isn't Spool's.")
 
     def check_access(self, method, path):
         # The token travels in a header: a cookie would reach every server on 127.0.0.1, whatever its port.
         given = self.headers.get("X-Spool-Token", "")
         if path.startswith("/api/") and not hmac.compare_digest(given.encode(), self.server.token.encode()):
-            raise Problem(401, "unauthorized", "Open Spool from the link it printed when it started.")
+            raise Problem(401, "unauthorized", "Open Spool from the link it printed in your terminal.")
         if method != "GET":
             if self.headers.get("Origin") != f"http://{self.headers['Host']}":  # other websites
                 raise Problem(403, "forbidden", "Spool only takes changes from its own page.")
@@ -86,7 +86,7 @@ class Handler(BaseHTTPRequestHandler):
     def length(self):
         value = self.headers.get("Content-Length") or "0"
         if not re.fullmatch(r"[0-9]{1,12}", value):
-            raise Problem(400, "bad_request", "Spool could not read that request.")
+            raise Problem(400, "bad_request", "Spool couldn't read that request.")
         return int(value)
 
     def body(self):
@@ -94,9 +94,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             data = json.loads(self.rfile.read(length)) if length else {}
         except ValueError:
-            raise Problem(400, "bad_request", "Spool could not read that request.") from None
+            raise Problem(400, "bad_request", "Spool couldn't read that request.") from None
         if not isinstance(data, dict):
-            raise Problem(400, "bad_request", "Spool could not read that request.")
+            raise Problem(400, "bad_request", "Spool couldn't read that request.")
         return data
 
     # Routing
@@ -109,8 +109,8 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and not path.startswith("/api/"):
             return self.static, (path,)
         if any(re.fullmatch(pattern, path) for _, pattern, _ in ROUTES):
-            raise Problem(405, "bad_request", "That method is not allowed here.")
-        raise Problem(404, "not_found", "There is nothing here.")
+            raise Problem(405, "bad_request", "That method isn't allowed here.")
+        raise Problem(404, "bad_request", "There's nothing here.")
 
     def events(self):
         q = self.server.jobs.subscribe()
@@ -138,7 +138,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def add(self):
         body = self.body()
-        self.send_json(201, {"jobs": self.server.jobs.add(body.get("entries"), body.get("preset"), body.get("engine"))})
+        jobs, existing = self.server.jobs.add(body.get("entries"), body.get("preset"), body.get("engine"))
+        self.send_json(201, {"jobs": jobs, "existing": existing})
+
+    def clear(self):
+        self.server.jobs.clear(self.body().get("state"))
+        self.send_bytes(204, b"", "application/json")
+
+    def reveal_dest(self):
+        self.server.jobs.reveal_dest()
+        self.send_bytes(204, b"", "application/json")
 
     def cancel(self, job_id):
         self.send_json(200, self.server.jobs.cancel(job_id))
@@ -164,9 +173,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path = system.choose_folder()
         except NotImplementedError:
-            raise Problem(
-                501, "not_supported", "Type the folder path instead; this system has no folder dialog."
-            ) from None
+            raise Problem(501, "not_supported", "Type the folder's path. This system has no folder chooser.") from None
         if path is None:
             self.send_bytes(204, b"", "application/json")
         else:
@@ -176,16 +183,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.server.engines.update(name)
         except KeyError:
-            raise Problem(404, "not_found", "Spool has no engine by that name.") from None
+            raise Problem(404, "bad_request", "Spool has no engine by that name.") from None
         except Busy:
-            raise Problem(409, "busy", f"{name} is already being installed or updated.") from None
+            raise Problem(409, "busy", "Spool is already updating that engine.") from None
         self.send_bytes(202, b"", "application/json")
 
     def static(self, path):
         name = "index.html" if path == "/" else path.lstrip("/")
         file = (STATIC / name).resolve()
         if not re.fullmatch(r"[\w.\-/]+", name) or not file.is_relative_to(STATIC.resolve()) or not file.is_file():
-            raise Problem(404, "not_found", "There is nothing here.")
+            raise Problem(404, "bad_request", "There's nothing here.")
         kind = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
         self.send_bytes(200, file.read_bytes(), "text/javascript" if file.suffix == ".js" else kind)
 
@@ -210,6 +217,8 @@ ROUTES = [
     ("GET", r"/api/events", "events"),
     ("POST", r"/api/probe", "probe"),
     ("POST", r"/api/jobs", "add"),
+    ("POST", r"/api/jobs/clear", "clear"),
+    ("POST", r"/api/dest/reveal", "reveal_dest"),
     ("POST", r"/api/jobs/(\w+)/cancel", "cancel"),
     ("POST", r"/api/jobs/(\w+)/retry", "retry"),
     ("DELETE", r"/api/jobs/(\w+)", "remove"),

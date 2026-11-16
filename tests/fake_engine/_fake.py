@@ -205,6 +205,8 @@ def scenario(url):
             **video(url, n, "Fake slow video", SLOW_FORMATS),
             "id": f"slow-{n}",
         }, delay if delay is not None else 0.5
+    if name == "ytdl-only":
+        return {**video(url, n, "Fake video only youtube-dl reads"), "id": f"only-{n}"}, delay or 0
     if name == "vanish":  # the destination is deleted after Spool checked it and before the engine writes
         return {**video(url, n), "_rm": parse_qs(parts.query)["rm"][0]}, delay or 0
     if name in ("403-start", "403-once"):  # refused before any bytes: always, or only the first time
@@ -258,6 +260,13 @@ def scenario(url):
 
 class YoutubeDL:
     STEPS = 10
+    HOOK_INFO = False  # youtube-dl's progress hooks carry no info_dict; yt-dlp's do
+    NAME = "youtube-dl"
+
+    def scenario(self, url):
+        if self.NAME == "yt-dlp" and "/ytdl-only" in url:  # a site only the second engine reads
+            raise DownloadError(f"ERROR: Unsupported URL: {url}")
+        return scenario(url)
 
     METADATA_OPTIONS = set()  # what the engine's FFmpegMetadata post-processor accepts
     WHEN = {"post_process": 1}
@@ -292,7 +301,7 @@ class YoutubeDL:
     def extract_info(self, url, download=True):
         self.log(f"[fake] Extracting URL: {url}")
         try:
-            info, _ = scenario(url)
+            info, _ = self.scenario(url)
         except DownloadError as exc:
             self.fail(str(exc))
         self.needs_js(info)
@@ -313,7 +322,7 @@ class YoutubeDL:
     def download(self, urls):
         for url in urls:
             try:
-                info, delay = scenario(url)
+                info, delay = self.scenario(url)
             except DownloadError as exc:
                 self.fail(str(exc))
             self.needs_js(info)
@@ -381,7 +390,7 @@ class YoutubeDL:
                 filename=final,
             )
         else:
-            files = [self.fetch(info, f, delay, len(parts) > 1) for f in parts]
+            files = [self.fetch(info, f, delay, parts) for f in parts]
             if len(files) == 2:
                 self.log(f'[Merger] Merging formats into "{final}"')
                 time.sleep(delay)
@@ -407,8 +416,10 @@ class YoutubeDL:
         for pp in order:
             pp.run({**info, "filepath": final})
 
-    def fetch(self, info, f, delay, split):
+    def fetch(self, info, f, delay, parts):
+        split = len(parts) > 1
         name = self.name(info, f"f{f['format_id']}.{f['ext']}" if split else f["ext"])
+        about = {**info, **f, "requested_formats": parts} if split else {**info, **f}  # as yt-dlp's hooks carry
         part = name + ".part"
         total = f["filesize"]
         done = os.path.getsize(part) if os.path.exists(part) else 0
@@ -431,7 +442,7 @@ class YoutubeDL:
                 out.flush()
                 done += chunk
                 self.hook(
-                    info_dict=info,
+                    **({"info_dict": about} if self.HOOK_INFO else {}),
                     status="downloading",
                     downloaded_bytes=done,
                     total_bytes=total,

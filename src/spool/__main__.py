@@ -8,6 +8,7 @@ import secrets
 import signal
 import sys
 import webbrowser
+from urllib.parse import quote
 
 from . import server, system
 from .engines import Engines, write_atomic
@@ -22,6 +23,7 @@ def main(argv=None):
     )
     parser.add_argument("--port", type=int, help=f"port on 127.0.0.1 (default: {PORT}, else a free one)")
     parser.add_argument("--no-open", action="store_true", help="do not open a browser tab")
+    parser.add_argument("links", nargs="*", metavar="link", help="links to put in Spool's field")
     args = parser.parse_args(argv)
 
     data = system.data_dir()
@@ -31,7 +33,7 @@ def main(argv=None):
     if url:
         print(f"Spool is already running at {url}", flush=True)
         if not args.no_open:
-            webbrowser.open(url)
+            webbrowser.open(url + carrying(args.links))
         return
 
     engines = Engines(data / "engines")
@@ -41,7 +43,7 @@ def main(argv=None):
     except OSError as exc:
         if args.port is not None:
             jobs.close()
-            print(f"Spool could not use port {args.port}: {exc.strerror}", flush=True)
+            print(f"Spool couldn't use port {args.port}: {exc.strerror}", flush=True)
             sys.exit(1)
         httpd = server.make_server(jobs, engines, token, 0)  # something else holds the default port
     port = httpd.server_address[1]
@@ -50,8 +52,9 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, interrupt)
     engines.start()
     print(f"Spool is running at {url}", flush=True)
+    print("Press Ctrl+C to stop it.", flush=True)
     if not args.no_open:
-        webbrowser.open(url)
+        webbrowser.open(url + carrying(args.links))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -60,6 +63,11 @@ def main(argv=None):
         httpd.server_close()
         jobs.close()  # kills every worker's process group; their jobs read as interrupted next time
         lock.unlink(missing_ok=True)
+
+
+def carrying(links):
+    """The fragment part that puts links in the page's field; the page waits for Enter before reading them."""
+    return "&url=" + quote(" ".join(links), safe="") if links else ""
 
 
 def load_token(path):

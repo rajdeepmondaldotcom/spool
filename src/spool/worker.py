@@ -71,8 +71,11 @@ LABELS = {"best": "Best", "audio": "Audio", "mp3": "MP3"}
 CLASS = {str(h): f" {h}p" for h in HEIGHTS}  # two classes of one video must not share a file name
 
 
-def preset(pid, size=None):
-    return {"id": pid, "label": LABELS.get(pid, f"{pid}p"), "size": size}
+MP3_RATE = 128_000 // 8  # bytes a second: the engines' default MP3 quality averages about 128 kbit/s
+
+
+def preset(pid, size=None, detail=None):
+    return {"id": pid, "label": LABELS.get(pid, f"{pid}p"), "detail": detail, "size": size}
 
 
 def short(f):
@@ -124,15 +127,22 @@ def estimate(formats, preset, ffmpeg, duration):
     audio = [f for f in formats if has(f, "acodec") and not has(f, "vcodec")]
     both = [f for f in formats if has(f, "acodec") and has(f, "vcodec")]
     if preset == "mp3":
-        return None
+        return int(duration * MP3_RATE) if duration else None
     if preset == "audio":
         m4a = [f for f in audio if f.get("ext") == "m4a"]
         return size(duration, max(m4a or audio or both, key=lambda f: f.get("abr") or f.get("tbr") or 0, default=None))
-    key = ranking(None if preset == "best" else int(preset), duration)
+    return size(duration, *chosen(formats, None if preset == "best" else int(preset), ffmpeg, duration))
+
+
+def chosen(formats, n, ffmpeg, duration):
+    """The streams yt-dlp's rule picks for class n (None for Best): bv*+ba with ffmpeg, else b."""
+    key = ranking(n, duration)
+    audio = [f for f in formats if has(f, "acodec") and not has(f, "vcodec")]
     video = [f for f in formats if has(f, "vcodec")]
-    if ffmpeg and video and audio:  # bv*+ba
-        return size(duration, max(video, key=key), max(audio, key=key))
-    return size(duration, max(both or formats, key=key, default=None))  # b
+    if ffmpeg and video and audio:
+        return max(video, key=key), max(audio, key=key)
+    both = [f for f in formats if has(f, "acodec") and has(f, "vcodec")]
+    return (max(both or formats, key=key, default=None),)
 
 
 def entry(info, ffmpeg):
@@ -142,9 +152,12 @@ def entry(info, ffmpeg):
         formats = info.get("formats") or [info]  # a site with one stream puts it on the info itself
         playable = formats if ffmpeg else [f for f in formats if has(f, "acodec")]  # no merging without ffmpeg
         classes = {klass(f) for f in playable if has(f, "vcodec")}
-        ids = ["best", *(str(h) for h in HEIGHTS if h in classes), "audio"]
+        top = chosen(formats, None, ffmpeg, info.get("duration"))[0]
+        best = klass(top) if top and has(top, "vcodec") else None  # Best's own class: offered once, as its detail
+        ids = ["best", *(str(h) for h in HEIGHTS if h in classes and h != best), "audio"] + ["mp3"] * bool(ffmpeg)
         presets = [preset(p, estimate(formats, p, ffmpeg, info.get("duration"))) for p in ids]
-    if ffmpeg:
+        presets[0]["detail"] = best and f"{best}p"
+    if ffmpeg and presets[-1]["id"] != "mp3":
         presets.append(preset("mp3"))
     thumbnails = info.get("thumbnails") or [{}]
     url = info.get("webpage_url") or info.get("url")
@@ -161,6 +174,28 @@ def entry(info, ffmpeg):
         "live": bool(info.get("is_live") or info.get("live_status") == "is_live"),
         "presets": presets,
     }
+
+
+def where(d, n, spec):
+    """(progress across all parts, 0 to 1 or None; what the current part carries) for one progress hook call."""
+    info = d.get("info_dict")
+    if info:  # yt-dlp: each part's info names every part the job will download
+        parts = info.get("requested_formats") or [info]
+        i = next((k for k, f in enumerate(parts) if f.get("format_id") == info.get("format_id")), max(n, 1) - 1)
+        what = "video" if has(parts[i], "vcodec") else "audio" if has(parts[i], "acodec") else None
+    else:  # shortcut: youtube-dl's hooks carry no info, so the preset's usual parts stand in; fine until a surprise
+        parts = [{}] * (1 if spec["preset"] in AUDIO or not spec["ffmpeg"] else 2)
+        i = min(max(n, 1), len(parts)) - 1
+        what = "audio" if spec["preset"] in AUDIO or i == 1 else "video"
+    i = min(i, len(parts) - 1)
+    done, total = d.get("downloaded_bytes"), d.get("total_bytes") or d.get("total_bytes_estimate")
+    frac = 1.0 if d.get("status") == "finished" else min(1.0, done / total) if done is not None and total else None
+    sizes = [bytes_of(f, (info or {}).get("duration")) for f in parts]
+    if frac is None:
+        return (i / len(parts) or None), what
+    if all(sizes):
+        return (sum(sizes[:i]) + frac * sizes[i]) / sum(sizes), what
+    return (i + frac) / len(parts), what
 
 
 def probe(engine, params, spec):
@@ -210,10 +245,13 @@ def download(engine, module, params, spec):
         if d.get("status") == "downloading" and part["last"] != "downloading":
             part["n"] += 1
         part["last"] = d.get("status")
+        progress, what = where(d, part["n"], spec)
         emit(
             event="progress",
             status=d.get("status"),
             part=part["n"],
+            progress=progress,
+            what=what,
             downloaded=d.get("downloaded_bytes"),
             total=d.get("total_bytes") or d.get("total_bytes_estimate"),
             speed=d.get("speed"),
@@ -264,6 +302,8 @@ def download(engine, module, params, spec):
     if live:
         raise RuntimeError(LIVE)
     path = final.get("path")
+    if not path and not seen:
+        raise RuntimeError("Spool found no video at this link.")  # an empty playlist, or an item past its end
     if not path or not os.path.exists(path):
         raise RuntimeError("The engine finished but Spool could not find the file it saved.")
     emit(event="done", path=path, size=os.path.getsize(path))

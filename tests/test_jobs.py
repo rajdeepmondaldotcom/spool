@@ -7,7 +7,7 @@ import time
 import pytest
 from serve_fake import start
 
-from spool.jobs import classify
+from spool.jobs import classify, error
 
 
 def add(app, url, preset="best", **extra):
@@ -156,12 +156,12 @@ def test_the_log_is_the_engines_own_words(app, events):
 
 def test_jobs_survive_a_restart_and_a_job_caught_mid_download_becomes_interrupted(tmp_path):
     httpd, url, jobs, engines = start(tmp_path)
-    done = jobs.add([{"url": "https://fake.test/video?delay=0", "id": "vid-1", "title": "Done"}], "best")[0]
+    done = jobs.add([{"url": "https://fake.test/video?delay=0", "id": "vid-1", "title": "Done"}], "best")[0][0]
     end = time.time() + 10
     while jobs.snapshot()["jobs"][0]["state"] != "done":
         assert time.time() < end
         time.sleep(0.05)
-    cut = jobs.add([{"url": "https://fake.test/slow?delay=0.3", "id": "slow-1", "title": "Cut"}], "best")[0]
+    cut = jobs.add([{"url": "https://fake.test/slow?delay=0.3", "id": "slow-1", "title": "Cut"}], "best")[0][0]
     time.sleep(0.5)
     httpd.shutdown()
     jobs.close()
@@ -181,20 +181,20 @@ def test_jobs_survive_a_restart_and_a_job_caught_mid_download_becomes_interrupte
 # Plain-word errors
 
 
-def test_a_youtube_failure_without_a_javascript_runtime_says_so(app, events):
+def test_a_youtube_failure_without_a_javascript_runtime_is_no_js(app, events):
     status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/needs-js"})
-    assert (status, body["error"]["kind"], body["error"]["hint"]) == (422, "engine", "install_js_runtime")
-    assert "JavaScript" in body["error"]["message"]
-    assert body["error"]["message"].endswith("The engine said: Requested format is not available.")
+    assert (status, body["error"]["kind"], body["error"]["hint"]) == (422, "no_js", "retry")
     job = app.json("POST", "/api/jobs", {"entries": [{"url": "https://fake.test/needs-js"}], "preset": "best"})
     failed = wait_for(events, job[1]["jobs"][0]["id"], lambda d: d["state"] == "failed")
-    assert (failed["error"]["kind"], failed["error"]["hint"]) == ("engine", "install_js_runtime")
+    assert (failed["error"]["kind"], failed["error"]["hint"]) == ("no_js", "retry")
 
 
-def test_a_probe_that_fails_in_the_engine_carries_its_last_error_line_cleaned(app):
+def test_a_probe_that_fails_in_the_engine_asks_to_try_again(app):
     status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/broken"})
-    assert (status, body["error"]["kind"], body["error"]["hint"]) == (422, "engine", "update_engine")
-    assert body["error"]["message"] == "The engine failed: Something new broke."
+    assert (status, body["error"]) == (
+        422,
+        {"kind": "engine", "message": "Spool hit an error it doesn't recognise. Try again.", "hint": "retry"},
+    )
 
 
 def test_probe_errors_have_a_kind_and_plain_words(app):
@@ -208,85 +208,108 @@ def test_probe_errors_have_a_kind_and_plain_words(app):
 
 
 @pytest.mark.parametrize(
-    "message, kind, hint",
+    "message, kind",
     [
-        (
-            "ERROR: [youtube] abc: Sign in to confirm you’re not a bot. Use --cookies-from-browser",
-            "blocked",
-            "update_engine",
-        ),
-        ("ERROR: unable to download video data: HTTP Error 403: Forbidden", "blocked", "update_engine"),
-        (
-            "ERROR: [youtube] abc: Private video. Sign in if you've been granted access to this video",
-            "unavailable",
-            None,
-        ),
-        ("ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader", "unavailable", None),
+        ("ERROR: [youtube] abc: Sign in to confirm you’re not a bot. Use --cookies-from-browser", "blocked"),
+        ("ERROR: unable to download video data: HTTP Error 403: Forbidden", "blocked"),
+        ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access to this video", "unavailable"),
+        ("ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader", "unavailable"),
         (
             "ERROR: [youtube] abc: Sign in to confirm your age. This video may be inappropriate for some users.",
             "unavailable",
-            None,
         ),
-        ("ERROR: Unsupported URL: https://example.com/", "unsupported", "try_other_engine"),
+        ("ERROR: Unsupported URL: https://example.com/", "unsupported"),
         (
             "ERROR: [generic] Unable to download webpage: <urlopen error [Errno 8] nodename nor servname provided, or not known>",
             "network",
-            None,
         ),
         (
             "ERROR: Postprocessing: ffprobe and ffmpeg not found. Please install or provide the path using --ffmpeg-location",
             "no_ffmpeg",
-            "install_ffmpeg",
         ),
+        ("ERROR: unable to open for writing: [Errno 13] Permission denied: '/x/T [a].mp4.part'", "dest_denied"),
+        ("ERROR: [youtube] abc: Some new breakage", "engine"),
+        ("ERROR: unable to write data: [Errno 28] No space left on device", "dest_full"),
+        ("ERROR: [Errno 30] Read-only file system: '/Volumes/T7/Spool/x.part'", "dest_denied"),
+        ("[Errno 63] File name too long: '/x/a very long name.mp4'", "engine"),
+        ("ERROR: unable to open for writing: [Errno 2] No such file or directory: '/x/T.part'", "engine"),
+        ("ERROR: Unable to download webpage: <urlopen error [Errno 61] Connection refused>", "network"),
+        ("ERROR: [youtube] abc: This video is unavailable", "unavailable"),
+        ("ERROR: [youtube] abc: Video unavailable", "unavailable"),
         (
-            "ERROR: unable to open for writing: [Errno 13] Permission denied: '/x/T [a].mp4.part'",
-            "dest_denied",
-            "check_dest",
-        ),
-        ("ERROR: [youtube] abc: Some new breakage", "engine", "update_engine"),
-        ("ERROR: unable to write data: [Errno 28] No space left on device", "dest_full", "check_dest"),
-        ("ERROR: [Errno 30] Read-only file system: '/Volumes/T7/Spool/x.part'", "dest_denied", "check_dest"),
-        ("[Errno 63] File name too long: '/x/a very long name.mp4'", "engine", None),
-        ("ERROR: unable to open for writing: [Errno 2] No such file or directory: '/x/T.part'", "engine", None),
-        ("ERROR: Unable to download webpage: <urlopen error [Errno 61] Connection refused>", "network", None),
-        # from the tester's runs and the engines' own source
-        ("ERROR: [youtube] abc: This video is unavailable", "unavailable", None),
-        ("ERROR: [youtube] abc: Video unavailable", "unavailable", None),
-        (
-            "ERROR: [vimeo] 123: This video is only available for registered users. Use --cookies, "
-            "--cookies-from-browser, --username and --password, --netrc-cmd, or --netrc (vimeo) to provide account credentials",
+            "ERROR: [vimeo] 123: This video is only available for registered users. Use --cookies, --cookies-from-browser, --username and --password, --netrc-cmd, or --netrc (vimeo) to provide account credentials",
             "unavailable",
-            None,
         ),
         (
             "ERROR: [instagram] abc: Requested content is not available, rate-limit reached or login required",
             "unavailable",
-            None,
         ),
-        ("ERROR: [twitter] 1: You need to log in to view this content", "unavailable", None),
-        ("ERROR: [patreon] 1: You need to be logged-in to access this", "unavailable", None),
+        ("ERROR: [twitter] 1: You need to log in to view this content", "unavailable"),
+        ("ERROR: [patreon] 1: You need to be logged-in to access this", "unavailable"),
         (
             "ERROR: [youtube] abc: Join this channel to get access to members-only content like this video, and other exclusive perks.",
             "unavailable",
-            None,
         ),
         (
-            "No supported JavaScript runtime could be found. "
-            "ERROR: [youtube] KXItezz-BhA: Requested format is not available. Use --list-formats for a list of available formats",
-            "engine",
-            "install_js_runtime",
+            "No supported JavaScript runtime could be found. ERROR: [youtube] KXItezz-BhA: Requested format is not available. Use --list-formats for a list of available formats",
+            "no_js",
         ),
         (
             "ERROR: Unable to rename file: [Errno 2] No such file or directory: '/x/out/race/Me at the zoo [jNQXAC9IVRw].m4a.part'",
             "engine",
-            None,
         ),
     ],
 )
-def test_engine_messages_map_to_kinds_and_hints(message, kind, hint):
-    got_kind, words, got_hint = classify(message)
-    assert (got_kind, got_hint) == (kind, hint)
-    assert words and "ERROR:" not in words
+def test_engine_messages_map_to_kinds(message, kind):
+    assert classify(message) == kind
+
+
+@pytest.mark.parametrize(
+    "kind, name, message, hint",
+    [  # the error table in ux/plan.md, word for word
+        ("invalid_link", None, "That doesn't look like a link. Paste a video's web address.", None),
+        ("too_long", None, "That link is too long for Spool.", None),
+        ("unsupported", None, "Spool can't read this link.", None),
+        ("empty", None, "Spool found no video at this link.", None),
+        ("unavailable", None, "This video is private, removed, or needs a sign-in.", None),
+        ("live", None, "This is live now. Download it after it ends.", None),
+        ("blocked", None, "The site refused the download.", "retry"),
+        ("network", None, "Spool couldn't reach the site. Check your internet connection.", "retry"),
+        ("no_ffmpeg", None, "This quality needs a free helper to join video and audio.", "install_ffmpeg"),
+        ("no_js", None, "Spool couldn't set up what it needs for YouTube. Check your internet connection.", "retry"),
+        ("interrupted", None, "Spool was closed before this download finished.", "resume"),
+        (
+            "dest_unplugged",
+            "T7 › Spool",
+            "T7 › Spool isn't connected. Plug it in, or choose another folder.",
+            "check_dest",
+        ),
+        ("dest_missing", "Movies › Spool", "Movies › Spool doesn't exist. Choose another folder.", "check_dest"),
+        ("dest_not_folder", "a › b", "a › b is a file, not a folder. Choose another folder.", "check_dest"),
+        ("dest_denied", "a › b", "Spool isn't allowed to save to a › b. Choose another folder.", "check_dest"),
+        ("dest_full", "T7", "T7 is full. Free some space, or choose another folder.", "check_dest"),
+        (
+            "dest_not_responding",
+            "T7",
+            "T7 isn't answering. If macOS is asking whether Spool may use it, choose Allow.",
+            "check_dest",
+        ),
+        ("engine", None, "The download failed.", "show_log"),
+        ("engine_not_ready", None, "Spool is still setting up. Try again in a few seconds.", None),
+        ("not_found", None, "Spool can't find that download.", None),
+        ("gone", None, "Spool can't find the file. It was moved or deleted.", None),
+    ],
+)
+def test_every_error_is_the_sentence_in_the_plan(kind, name, message, hint):
+    assert error(kind, name) == {"kind": kind, "message": message, "hint": hint}
+
+
+def test_an_engine_error_in_a_probe_asks_to_try_again():
+    assert error("engine", probe=True) == {
+        "kind": "engine",
+        "message": "Spool hit an error it doesn't recognise. Try again.",
+        "hint": "retry",
+    }
 
 
 # Details a job learns while downloading

@@ -64,18 +64,15 @@ class Engines:
             }
 
     def start(self):
-        """Delete older engine files (no worker can be using one yet), then in the background install what is
-        missing and look up the latest versions."""
+        """Delete older engine files (no worker can be using one yet), then in the background install or update
+        each engine to the latest release."""
         for name in RELEASES:
             folder, keep = self.root / name, {self.version(name), "current"}
             for f in folder.iterdir() if folder.is_dir() else ():
                 if f.name not in keep and f.is_file():
                     f.unlink()
-        for name in RELEASES:
-            if self.version(name):
-                threading.Thread(target=self._check, args=(name,), daemon=True).start()
-            else:
-                self.update(name)
+        for name in RELEASES:  # at launch no job runs, so an engine can update itself
+            self.update(name)
 
     def update(self, name):
         """Install or update in the background. Raises KeyError for an unknown engine, Busy if one is running."""
@@ -87,12 +84,6 @@ class Engines:
             self.error[name] = None
         self.on_change()
         threading.Thread(target=self._update, args=(name,), daemon=True).start()
-
-    def _check(self, name):
-        try:
-            self._latest(name)
-        except OSError:
-            pass  # offline: latest stays None
 
     def _latest(self, name):
         tag = self.resolve(f"{RELEASES[name]}/latest").rstrip("/").rsplit("/", 1)[-1]
@@ -110,11 +101,11 @@ class Engines:
             if tag != self.version(name):
                 self._install(name, tag)
         except ChecksumMismatch:
-            error = f"The downloaded {name} did not match its published checksum, so Spool kept the version it had."
+            error = "The engine Spool downloaded didn't match its published checksum, so Spool kept the one it had."
         except OSError:
-            error = f"Spool could not download {name}. Check your internet connection and try again."
-        except Exception as exc:
-            error = f"Spool could not install {name}: {exc}"
+            error = "Spool couldn't update its engine. Check your internet connection."
+        except Exception:
+            error = "Spool couldn't update its engine."
         with self.lock:
             self.busy[name] = None
             self.error[name] = error

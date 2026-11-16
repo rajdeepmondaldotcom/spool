@@ -45,10 +45,10 @@ def fake_engine_zip():
 
 
 class FakeGitHub:
-    """Stands in for github.com: the latest tag is LATEST and each release holds the fake engine as a zip."""
+    """Stands in for github.com: the latest tag is `latest` and each release holds the fake engine as a zip."""
 
-    def __init__(self, delay=0.0, corrupt=False, offline=False):
-        self.delay, self.corrupt, self.offline = delay, corrupt, offline
+    def __init__(self, delay=0.0, corrupt=False, offline=False, latest=LATEST):
+        self.delay, self.corrupt, self.offline, self.latest = delay, corrupt, offline, latest
         self.asset = fake_engine_zip()
         self.fetched = []
 
@@ -61,7 +61,7 @@ class FakeGitHub:
     def resolve(self, url):
         self.check(url)
         assert url.endswith("/releases/latest"), url
-        return url.replace("/latest", f"/tag/{LATEST}")
+        return url.replace("/latest", f"/tag/{self.latest}")
 
     def fetch(self, url):
         self.check(url)
@@ -83,7 +83,7 @@ def start(data_dir, port=0, fresh=False, github=None, ffmpeg=True, js_runtime="d
     data = system.data_dir()
     if not fresh and not (data / "engines").exists():
         install_fake_engines(data)
-    github = github or FakeGitHub(delay=2.0 if fresh else 0.0)
+    github = github or FakeGitHub(delay=2.0 if fresh else 0.0, latest=LATEST if fresh else INSTALLED)
     engines = Engines(data / "engines", fetch=github.fetch, resolve=github.resolve)
     tools = {"ffmpeg": ffmpeg, "js_runtime": js_runtime, "platform": sys.platform, "can_choose_folder": False}
     jobs = Jobs(data, engines, tools=lambda: dict(tools))

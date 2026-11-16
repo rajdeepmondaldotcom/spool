@@ -71,6 +71,8 @@ def stop(proc):
 def test_launch_prints_the_link_with_the_token_in_the_fragment(data):
     proc, line = launch(data)
     try:
+        assert line.startswith("Spool is running at http://127.0.0.1:")
+        assert proc.stdout.readline() == "Press Ctrl+C to stop it.\n"
         url = url_in(line)
         token = (data / "token").read_text().strip()
         lock = json.loads((data / "spool.lock").read_text())
@@ -138,7 +140,7 @@ def test_a_chosen_port_is_used_and_a_taken_one_is_a_plain_error(data):
         s.listen()
         proc, line = launch(data, "--port", str(port))
         assert proc.wait(10) == 1
-        assert f"could not use port {port}" in line
+        assert f"Spool couldn't use port {port}" in line
     proc, line = launch(data, "--port", str(port))
     try:
         assert f"127.0.0.1:{port}/" in line
@@ -177,7 +179,7 @@ def test_tests_never_run_from_inside_the_repo(tmp_path):
 def test_a_damaged_state_file_does_not_stop_launch(data):
     (data / "state.json").write_text('{"settings": {"dest": ')
     proc, line = launch(data)
-    assert "started fresh" in line and "Traceback" not in line
+    assert line.startswith("Spool couldn't read its saved list, so it started a new one.") and "Traceback" not in line
     assert "Spool is running at" in proc.stdout.readline()
 
 
@@ -199,3 +201,12 @@ def test_two_launches_at_the_same_instant_both_come_up_cleanly(data):
     for proc in procs:
         proc.send_signal(signal.SIGTERM)
         assert "Traceback" not in proc.communicate(timeout=10)[0]
+
+
+def test_links_on_the_command_line_ride_in_the_fragment():
+    from spool.__main__ import carrying
+
+    assert carrying([]) == ""
+    assert carrying(["https://youtu.be/x?t=1", "https://v.test/a b"]) == (
+        "&url=https%3A%2F%2Fyoutu.be%2Fx%3Ft%3D1%20https%3A%2F%2Fv.test%2Fa%20b"
+    )

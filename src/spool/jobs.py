@@ -3,12 +3,12 @@
 import json
 import os
 import queue
-import re
 import secrets
 import subprocess
 import sys
 import threading
 import time
+from importlib import metadata
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -18,6 +18,10 @@ from .engines import RELEASES, write_atomic
 WORKER = Path(__file__).with_name("worker.py")
 PRESETS = ("best", "2160", "1440", "1080", "720", "480", "360", "240", "audio", "mp3")
 AT_ONCE = 2
+try:
+    VERSION = metadata.version("spool-dl")
+except metadata.PackageNotFoundError:  # run from a source tree that was never installed
+    VERSION = None
 LINK_LIMIT = 8192  # signed CDN links run to a few thousand characters
 RETRY_AFTER = 3  # seconds before the one automatic retry of a download refused before any bytes
 TICK = 0.25  # job progress goes out at most once a tick: four a second
@@ -44,9 +48,10 @@ class Jobs:
             "preset": lambda v: isinstance(v, str) and v in PRESETS,
         }
         self.settings.update({k: v for k, v in saved.get("settings", {}).items() if k in valid and valid[k](v)})
-        keys = set(new_job({"url": "https://x.test"}, "best", "yt-dlp", "/")) - {"files", "item"}  # added later
+        later = {"files": [], "item": None, "progress": None, "what": None}  # keys added after v0.1's first saves
+        keys = set(new_job({"url": "https://x.test"}, "best", "yt-dlp", "/")) - set(later)
         self.jobs = [  # newest first; a malformed record is dropped, not fatal
-            {"files": [], "item": None, **j} for j in saved.get("jobs", []) if isinstance(j, dict) and keys <= set(j)
+            {**later, **j} for j in saved.get("jobs", []) if isinstance(j, dict) and keys <= set(j)
         ]
         self.lock = threading.RLock()
         self.procs = {}  # job id -> the worker running it
@@ -55,8 +60,7 @@ class Jobs:
         self.closed = False
         for job in self.jobs:
             if job["state"] in ("queued", "running"):
-                message = "Spool was closed before this download finished. Retry to resume it."
-                job.update(state="failed", stage=None, error={"kind": "interrupted", "message": message, "hint": None})
+                job.update(state="failed", stage=None, error=error("interrupted"))
         self._save()
         engines.on_change = self._snapshot_changed  # the event stream lives here, so engines report to it
         threading.Thread(target=self._tick, daemon=True).start()
@@ -76,7 +80,7 @@ class Jobs:
         except ValueError:  # bad JSON, bad UTF-8 and the wrong shape
             aside = self.state_file.with_name(f"state.json.broken-{time.strftime('%Y%m%d-%H%M%S')}")
             os.replace(self.state_file, aside)
-            print(f"Spool could not read its saved state, so it started fresh; the old file is {aside}", flush=True)
+            print(f"Spool couldn't read its saved list, so it started a new one. The old file is {aside}", flush=True)
             return {}
 
     # Reading
@@ -89,9 +93,10 @@ class Jobs:
             jobs = [dict(j, file_exists=bool(j["path"]) and Path(j["path"]).exists()) for j in self.jobs]
             return {
                 "settings": dict(self.settings),
-                "dest": dest,
+                "dest": dest_message(dest),
                 "engines": self.engines.status(),
                 "tools": self.tools(),
+                "version": VERSION,
                 "jobs": jobs,
             }
 
@@ -111,41 +116,53 @@ class Jobs:
     # Probe and add
 
     def probe(self, url, engine=None):
-        url, engine = link(url), self._engine(engine)
+        """Read a link with the engine in settings, then the other when the first can't read it or finds nothing."""
+        url, first = link(url), self._engine(engine)
+        order = [first] if engine else [first, other(first)]
+        for n, name in enumerate(order):
+            try:
+                return self._probe(url, name)
+            except Problem as p:
+                last = n == len(order) - 1 or not self.engines.path(order[n + 1])
+                if p.kind not in ("unsupported", "empty") or last:
+                    raise
+
+    def _probe(self, url, engine):
         events = self._call({"mode": "probe", "url": url, "engine": engine})
         result = next((e for e in reversed(events) if e.get("event") in ("info", "error")), None)
-        if result is None:
-            raise Problem(422, "engine", "The engine stopped without an answer.", "update_engine")
-        if result["event"] == "error":
-            kind, message, hint = classify(result["message"])
-            line = last_error(result["message"])
-            if kind == "engine" and line and line not in message:  # a probe has no log to show, so say it here
-                message += f" The engine said: {line}"
-            raise Problem(422, kind, message, hint)
-        if not result["entries"]:
-            other = "youtube-dl" if engine == "yt-dlp" else "yt-dlp"
-            raise Problem(422, "empty", f"{engine} found no videos at this link. Try {other}.", "try_other_engine")
+        kind = "engine" if result is None else classify(result["message"]) if result["event"] == "error" else None
+        if kind is None and not result["entries"]:
+            kind = "empty"
+        if kind:
+            e = self._error(kind, engine, probe=True)
+            raise Problem(422, kind, e["message"], e["hint"])
         return {"engine": engine, "kind": result["kind"], "title": result["title"], "entries": result["entries"]}
 
     def add(self, entries, preset, engine=None):
+        """Add a job per entry. Returns (jobs, existing): an entry matching a job already in the list adds nothing."""
         engine = self._engine(engine)
         if preset not in PRESETS:
-            raise Problem(422, "invalid_preset", "That quality is not one Spool knows.")
+            raise Problem(422, "invalid_preset", "Spool doesn't know that quality.")
         if not isinstance(entries, list) or not entries or not all(isinstance(e, dict) for e in entries):
             raise Problem(422, "invalid_entries", "Choose at least one video to download.")
         dest = self.settings["dest"]
         dest_problem(system.check_dest(dest), status=409)
         new = [new_job(e, preset, engine, dest) for e in entries]
         with self.lock:
-            added = []
+            done = [(j, j["path"]) for j in self.jobs if j["state"] == "done" and j["path"]]
+        there = {id(j) for j, path in done if os.path.exists(path)}  # never a file-system call under the lock
+        with self.lock:
+            added, existing = [], 0
             for job in new:
-                same = next((j for j in self.jobs if j["state"] in ("queued", "running") and key(j) == key(job)), None)
+                live = (j for j in self.jobs if j["state"] in ("queued", "running") or id(j) in there)
+                same = next((j for j in live if key(j) == key(job)), None)
                 if same is None:
                     self.jobs.insert(0, job)
                     self._changed(job)
+                existing += same is not None
                 added.append(dict(same or job))
             self._pump()
-        return added
+        return added, existing
 
     # Job control
 
@@ -174,6 +191,8 @@ class Jobs:
                 state="queued",
                 stage=None,
                 part=0,
+                progress=None,
+                what=None,
                 downloaded=None,
                 total=None,
                 speed=None,
@@ -194,7 +213,7 @@ class Jobs:
         with self.lock:
             job = self._job(job_id)
             if job["state"] in ("queued", "running"):
-                raise Problem(409, "conflict", "Cancel this download before removing it.")
+                raise Problem(409, "conflict", "Cancel this download before removing it from the list.")
             proc = self.procs.get(job_id)
         if proc:
             try:
@@ -211,12 +230,30 @@ class Jobs:
         (self.logs / f"{job_id}.log").unlink(missing_ok=True)
         remove_leftovers(job, keep)
 
+    def clear(self, state):
+        """Take every finished job off the list. Their files stay."""
+        if state != "done":
+            raise Problem(422, "invalid_state", "Spool only clears finished downloads.")
+        with self.lock:
+            gone = [j for j in self.jobs if j["state"] == "done"]
+            self.jobs = [j for j in self.jobs if j["state"] != "done"]
+            for job in gone:
+                self._publish("job_removed", {"id": job["id"]})
+            self._save()
+        for job in gone:
+            (self.logs / f"{job['id']}.log").unlink(missing_ok=True)
+
     def reveal(self, job_id):
         with self.lock:
             path = self._job(job_id)["path"]
         if not path or not os.path.exists(path):
-            raise Problem(410, "gone", "The file is no longer there. It may have been moved or deleted.")
+            raise problem(410, "gone")
         system.reveal(path)
+
+    def reveal_dest(self):
+        dest = self.settings["dest"]
+        dest_problem(system.check_dest(dest), status=409)
+        system.open_folder(dest)
 
     def log(self, job_id):
         with self.lock:
@@ -229,23 +266,28 @@ class Jobs:
     def update_settings(self, changes):
         """Save settings. A destination with a problem is still saved: the drive may come back."""
         changes = dict(changes)
-        for key in changes.keys() - {"dest", "engine", "preset"}:
-            raise Problem(422, "invalid_setting", f"Spool has no setting called {key}.")
+        create = changes.pop("create", False)
+        if changes.keys() - {"dest", "engine", "preset"}:
+            raise Problem(422, "invalid_setting", "Spool has no setting by that name.")
+        if not isinstance(create, bool):
+            raise Problem(422, "invalid_setting", "Create is true or false.")
         if "dest" in changes:
             dest = changes["dest"]
             dest = os.path.expanduser(dest) if isinstance(dest, str) else ""
             if not os.path.isabs(dest):
-                raise Problem(422, "invalid_dest", "The destination must be a full folder path.")
+                raise Problem(422, "invalid_dest", "Type the folder's full path.")
             changes["dest"] = os.path.normpath(dest)
+            if create:
+                make_folder(changes["dest"])
         if "engine" in changes and not (isinstance(changes["engine"], str) and changes["engine"] in RELEASES):
-            raise Problem(422, "invalid_engine", "That engine is not one Spool knows.")
+            raise Problem(422, "invalid_engine", "Spool doesn't know that engine.")
         if "preset" in changes and not (isinstance(changes["preset"], str) and changes["preset"] in PRESETS):
-            raise Problem(422, "invalid_preset", "That quality is not one Spool knows.")
+            raise Problem(422, "invalid_preset", "Spool doesn't know that quality.")
         with self.lock:
             self.settings.update(changes)
             self._save()
         self._snapshot_changed()
-        return {"settings": dict(self.settings), "dest": system.check_dest(self.settings["dest"])}
+        return {"settings": dict(self.settings), "dest": dest_message(system.check_dest(self.settings["dest"]))}
 
     def close(self):
         with self.lock:
@@ -261,16 +303,24 @@ class Jobs:
     def _job(self, job_id):
         job = next((j for j in self.jobs if j["id"] == job_id), None)
         if job is None:
-            raise Problem(404, "not_found", "Spool has no download with that id.")
+            raise problem(404, "not_found")
         return job
 
     def _engine(self, engine):
         engine = engine or self.settings["engine"]
         if not (isinstance(engine, str) and engine in RELEASES):
-            raise Problem(422, "invalid_engine", "That engine is not one Spool knows.")
+            raise Problem(422, "invalid_engine", "Spool doesn't know that engine.")
         if not self.engines.path(engine):
-            raise Problem(503, "engine_not_ready", f"{engine} is not installed yet.")
+            raise problem(503, "engine_not_ready")
         return engine
+
+    def _error(self, kind, engine, dest=None, probe=False):
+        """The error for a kind, with the folder's name and, for a refusal, whether an engine update may help."""
+        e = error(kind, dest and system.display(dest), probe)
+        status = self.engines.status()[engine]
+        if kind == "blocked" and status["latest"] and status["latest"] != status["version"]:
+            e["hint"] = "update_engine"
+        return e
 
     def _spec(self, engine, **spec):
         tools = self.tools()
@@ -292,7 +342,7 @@ class Jobs:
                 timeout=timeout,
             ).stdout
         except subprocess.TimeoutExpired:
-            raise Problem(422, "network", "The site took too long to answer.") from None
+            raise problem(422, "network") from None
         return [e for e in map(parse, out.splitlines()) if e]
 
     def _pump(self):
@@ -312,32 +362,38 @@ class Jobs:
     def _run(self, job):
         """Run a job in the slot _pump reserved for it; the slot is freed only when its worker is gone."""
         try:
-            error = None
+            failure = None
             for attempt in (1, 2):
                 dest_problem(system.check_dest(job["dest"]))
                 result = self._attempt(job)
                 if result is None or result["event"] == "done":
                     break
-                kind, message, hint = classify(result["message"])
+                kind = classify(result["message"])
                 try:
                     dest_problem(system.check_dest(job["dest"]))  # a drive unplugged mid-download says so
                 except Problem as p:
-                    kind, message, hint = p.kind, p.message, p.hint
-                error = {"kind": kind, "message": message, "hint": hint}
-                if not (attempt == 1 and kind == "blocked" and not job["downloaded"]):
+                    kind = p.kind
+                failure = self._error(kind, job["engine"], job["dest"])
+                if attempt == 2:
                     break
-                time.sleep(RETRY_AFTER)  # a refusal before any bytes usually passes
+                if kind in ("unsupported", "empty") and self.engines.path(other(job["engine"])):
+                    with self.lock:  # the other engine may read what this one can't
+                        job["engine"] = other(job["engine"])
+                elif kind == "blocked" and not job["downloaded"]:
+                    time.sleep(RETRY_AFTER)  # a refusal before any bytes usually passes
+                else:
+                    break
         except Problem as p:
-            result, error = {"event": "error"}, {"kind": p.kind, "message": p.message, "hint": p.hint}
+            result, failure = {"event": "error"}, {"kind": p.kind, "message": p.message, "hint": p.hint}
         with self.lock:
             self.procs.pop(job["id"], None)
             if self.closed:
                 return
             if job["state"] == "running" and result is not None:  # else cancelled, and perhaps retried since
                 if result["event"] == "done":
-                    job.update(state="done", path=result["path"], size=result["size"], file_exists=True)
+                    job.update(state="done", path=result["path"], size=result["size"], file_exists=True, progress=1.0)
                 else:
-                    job.update(state="failed", error=error)
+                    job.update(state="failed", error=failure)
                 job.update(stage=None, speed=None, eta=None, finished=time.time())
                 self._changed(job)
             self._pump()
@@ -387,6 +443,9 @@ class Jobs:
         with self.lock:
             if job["state"] != "running":
                 return
+            if event.get("progress") is not None:  # never backwards, whatever the engine reports
+                job["progress"] = max(job["progress"] or 0.0, min(1.0, event["progress"]))
+            job["what"] = event.get("what")
             if event["status"] == "downloading":
                 job.update(
                     stage="downloading",
@@ -452,23 +511,77 @@ class Jobs:
             last = now
 
 
-DEST_PROBLEMS = {  # dest.problem -> (job error kind, plain words)
-    "unplugged": ("dest_unplugged", "The drive for {} is not plugged in."),
-    "missing": ("dest_missing", "The folder {} is not there."),
-    "not_a_folder": ("dest_not_folder", "{} is a file, not a folder."),
-    "not_writable": ("dest_denied", "Spool cannot write to {}."),
-    "not_responding": (
-        "dest_not_responding",
-        "The drive for {} is not answering. It may be asleep, or the system may be asking for permission.",
+MESSAGES = {  # kind -> (the sentence people read, hint). Every sentence the server sends; none names a program.
+    "invalid_link": ("That doesn't look like a link. Paste a video's web address.", None),
+    "too_long": ("That link is too long for Spool.", None),
+    "unsupported": ("Spool can't read this link.", None),
+    "empty": ("Spool found no video at this link.", None),
+    "unavailable": ("This video is private, removed, or needs a sign-in.", None),
+    "live": ("This is live now. Download it after it ends.", None),
+    "blocked": ("The site refused the download.", "retry"),  # update_engine when a newer engine exists
+    "network": ("Spool couldn't reach the site. Check your internet connection.", "retry"),
+    "no_ffmpeg": ("This quality needs a free helper to join video and audio.", "install_ffmpeg"),
+    "no_js": ("Spool couldn't set up what it needs for YouTube. Check your internet connection.", "retry"),
+    "interrupted": ("Spool was closed before this download finished.", "resume"),
+    "dest_unplugged": ("{name} isn't connected. Plug it in, or choose another folder.", "check_dest"),
+    "dest_missing": ("{name} doesn't exist. Choose another folder.", "check_dest"),
+    "dest_not_folder": ("{name} is a file, not a folder. Choose another folder.", "check_dest"),
+    "dest_denied": ("Spool isn't allowed to save to {name}. Choose another folder.", "check_dest"),
+    "dest_full": ("{name} is full. Free some space, or choose another folder.", "check_dest"),
+    "dest_not_responding": (
+        "{name} isn't answering. If macOS is asking whether Spool may use it, choose Allow.",
+        "check_dest",
     ),
+    "engine": ("The download failed.", "show_log"),
+    "engine_probe": ("Spool hit an error it doesn't recognise. Try again.", "retry"),
+    "engine_not_ready": ("Spool is still setting up. Try again in a few seconds.", None),
+    "not_found": ("Spool can't find that download.", None),
+    "gone": ("Spool can't find the file. It was moved or deleted.", None),
+}
+DEST_KINDS = {
+    "unplugged": "dest_unplugged",
+    "missing": "dest_missing",
+    "not_a_folder": "dest_not_folder",
+    "not_writable": "dest_denied",
+    "not_responding": "dest_not_responding",
 }
 
 
+def error(kind, name=None, probe=False):
+    """{kind, message, hint} for a kind. name is the folder's short label, for the destination kinds."""
+    words, hint = MESSAGES["engine_probe" if probe and kind == "engine" else kind]
+    return {"kind": kind, "message": words.format(name=name), "hint": hint}
+
+
+def problem(status, kind, name=None, probe=False):
+    e = error(kind, name, probe)
+    return Problem(status, kind, e["message"], e["hint"])
+
+
+def dest_message(check):
+    """The snapshot's dest, with the sentence for its problem."""
+    kind = DEST_KINDS.get(check["problem"])
+    return dict(check, message=kind and error(kind, check["display"])["message"])
+
+
 def dest_problem(check, status=None):
-    """Raise the plain-word problem for a destination check, if it has one."""
+    """Raise the problem for a destination check, if it has one."""
     if check["problem"]:
-        kind, words = DEST_PROBLEMS[check["problem"]]
-        raise Problem(status, kind, words.format(check["display"]), "check_dest")
+        raise problem(status, DEST_KINDS[check["problem"]], check["display"])
+
+
+def other(engine):
+    return next(e for e in RELEASES if e != engine)
+
+
+def make_folder(path):
+    """Create path when only its last name is missing and its parent takes writes. Otherwise leave it to the check."""
+    parent = os.path.dirname(path)
+    if not os.path.exists(path) and os.path.isdir(parent) and os.access(parent, os.W_OK):
+        try:
+            os.mkdir(path)
+        except OSError:
+            pass  # the destination check says what is wrong
 
 
 def key(job):
@@ -487,12 +600,10 @@ def parse(line):
 def link(url):
     """A link must be http or https with a host; it reaches the engine as data only."""
     if isinstance(url, str) and len(url) > LINK_LIMIT:
-        raise Problem(
-            422, "invalid_link", f"That link is too long. Spool takes links of up to {LINK_LIMIT:,} characters."
-        )
+        raise problem(422, "too_long")
     parts = urlsplit(url) if isinstance(url, str) else None
     if not parts or parts.scheme not in ("http", "https") or not parts.hostname or any(c.isspace() for c in url):
-        raise Problem(422, "invalid_link", "That is not a link Spool can use. Links start with http:// or https://.")
+        raise problem(422, "invalid_link")
     return url
 
 
@@ -520,6 +631,8 @@ def new_job(entry, preset, engine, dest):
         "state": "queued",
         "stage": None,
         "part": 0,
+        "progress": None,  # 0 to 1 across all parts, never decreasing
+        "what": None,  # "video" or "audio": what the current part carries
         "downloaded": None,
         "total": None,
         "speed": None,
@@ -534,36 +647,15 @@ def new_job(entry, preset, engine, dest):
     }
 
 
-ERRORS = [  # (kind, hint, plain words, lowercase pieces of engine messages); the first match wins
-    ("live", None, "This is live now. Download it after it ends.", ("this is live now.",)),
-    (  # yt-dlp warns first; whatever fails after it on YouTube fails for this reason
-        "engine",
-        "install_js_runtime",
-        "YouTube needs a JavaScript runtime such as deno, and none is installed. Install deno, then retry.",
-        ("no supported javascript runtime",),
-    ),
-    ("unsupported", "try_other_engine", "The engine cannot read this link.", ("unsupported url",)),
-    (
-        "no_ffmpeg",
-        "install_ffmpeg",
-        "This quality needs ffmpeg, which is not installed.",
-        (
-            "ffmpeg not found",
-            "ffprobe and ffmpeg not found",
-            "ffmpeg is not installed",
-            "ffprobe/avprobe and ffmpeg/avconv",
-        ),
-    ),
-    (  # before "unavailable": the bot check says "sign in" too, and updating the engine is its fix
-        "blocked",
-        "update_engine",
-        "The site refused the download. Updating the engine and retrying usually fixes this.",
-        ("http error 403", "not a bot", "http error 429", "too many requests"),
-    ),
+ERRORS = [  # (kind, lowercase pieces of engine messages); the first match wins. The words people read are MESSAGES.
+    ("live", ("this is live now.",)),
+    ("no_js", ("no supported javascript runtime",)),  # yt-dlp warns first; what fails after it fails for this
+    ("unsupported", ("unsupported url",)),
+    ("empty", ("found no video at this link",)),
+    ("no_ffmpeg", ("ffmpeg not found", "ffprobe and ffmpeg not found", "ffmpeg is not installed", "ffprobe/avprobe")),
+    ("blocked", ("http error 403", "not a bot", "http error 429", "too many requests")),  # the bot check says sign in
     (
         "unavailable",
-        None,
-        "This video is not available. It may be private, removed, members-only, age-restricted or blocked where you are.",
         (
             "video unavailable",
             "is unavailable",
@@ -584,23 +676,11 @@ ERRORS = [  # (kind, hint, plain words, lowercase pieces of engine messages); th
             "does not exist",
         ),
     ),
-    (
-        "dest_missing",
-        "check_dest",
-        "The destination folder is not there. Is the drive plugged in?",
-        ("destination folder is missing",),
-    ),
-    ("dest_full", "check_dest", "The destination is full. Free some space and retry.", ("no space left", "errno 28")),
-    (
-        "dest_denied",
-        "check_dest",
-        "Spool cannot write to the destination folder.",
-        ("permission denied", "read-only file system", "errno 13", "errno 30"),
-    ),
+    ("dest_missing", ("destination folder is missing",)),
+    ("dest_full", ("no space left", "errno 28")),
+    ("dest_denied", ("permission denied", "read-only file system", "errno 13", "errno 30")),
     (
         "network",
-        None,
-        "Spool could not reach the site. Check your internet connection.",
         (
             "unable to download webpage",
             "urlopen error",
@@ -615,28 +695,13 @@ ERRORS = [  # (kind, hint, plain words, lowercase pieces of engine messages); th
             "connection aborted",
         ),
     ),
-    # any other local file-system error: updating the engine would not help
-    ("engine", None, "Spool could not save the file. Show the log for the details.", ("[errno ", "winerror")),
 ]
 
 
 def classify(message):
-    """An engine's message -> (kind, plain words, hint). The engine's own words stay in the job's log."""
+    """An engine's message -> an error kind. The engine's own words stay in the job's log."""
     low = message.lower()
-    for kind, hint, words, pieces in ERRORS:
-        if any(p in low for p in pieces):
-            return kind, words, hint
-    line = last_error(message)
-    return "engine", f"The engine failed: {line}" if line else "The engine stopped unexpectedly.", "update_engine"
-
-
-def last_error(message):
-    """The engine's last error line without its prefixes and command-line advice."""
-    lines = [x.strip() for x in message.strip().splitlines() if x.strip()]
-    line = next((x for x in reversed(lines) if x.startswith("ERROR:")), lines[-1] if lines else "")
-    line = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*)?([\w-]+:\s+)?", "", line)
-    line = re.split(r";? please report this issue|\s+Use --|\s+See\s+https?://", line)[0].strip()
-    return line if line.endswith(".") or not line else line + "."
+    return next((kind for kind, pieces in ERRORS if any(p in low for p in pieces)), "engine")
 
 
 def remove_leftovers(job, keep):

@@ -61,7 +61,7 @@ def test_yt_dlp_probe_reads_real_heights_and_sizes(jobs):
 
 @pytest.mark.parametrize("engine, preset", [("yt-dlp", "best"), ("yt-dlp", "audio"), ("youtube-dl", "best")])
 def test_a_real_download_lands_with_its_final_path(jobs, engine, preset):
-    [job] = jobs.add([{"url": ZOO}], preset, engine)
+    [job], _ = jobs.add([{"url": ZOO}], preset, engine)
     done = finish(jobs, job["id"])
     assert done["state"] == "done", (done["error"], jobs.log(job["id"])[-2000:])
     assert done["title"] == "Me at the zoo"  # filled in from the engine

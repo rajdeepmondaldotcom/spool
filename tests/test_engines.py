@@ -49,17 +49,33 @@ def test_installs_come_from_the_tagged_release(tmp_path):
     ]
 
 
-def test_an_installed_engine_learns_the_latest_version_and_updates_beside_the_old_file(tmp_path):
+def test_an_installed_engine_updates_itself_at_launch_beside_the_old_file(tmp_path):
     install_fake_engines(tmp_path)
-    github = FakeGitHub()
+    github = FakeGitHub(delay=0.2)
     engines = Engines(tmp_path / "engines", fetch=github.fetch, resolve=github.resolve)
     engines.start()
-    status = settle(engines)
-    assert (status["yt-dlp"]["version"], status["yt-dlp"]["latest"]) == (INSTALLED, LATEST)
-    engines.update("yt-dlp")
     assert engines.status()["yt-dlp"]["busy"] == "updating"
+    status = settle(engines)
+    assert (status["yt-dlp"]["version"], status["yt-dlp"]["latest"], status["yt-dlp"]["error"]) == (
+        LATEST,
+        LATEST,
+        None,
+    )
+    assert (tmp_path / "engines" / "yt-dlp" / INSTALLED).exists()  # until the next launch deletes it
+    engines.update("yt-dlp")  # already the latest: nothing to fetch
     assert settle(engines)["yt-dlp"]["version"] == LATEST
-    assert (tmp_path / "engines" / "yt-dlp" / INSTALLED).exists()
+
+
+def test_a_failed_update_at_launch_keeps_the_old_engine_and_says_so_without_names(tmp_path):
+    install_fake_engines(tmp_path)
+    offline = FakeGitHub(offline=True)
+    engines = Engines(tmp_path / "engines", fetch=offline.fetch, resolve=offline.resolve)
+    engines.start()
+    status = settle(engines)["yt-dlp"]
+    assert (status["version"], status["error"]) == (
+        INSTALLED,
+        "Spool couldn't update its engine. Check your internet connection.",
+    )
 
 
 def test_a_checksum_mismatch_is_refused_and_the_old_engine_kept(tmp_path):
@@ -142,13 +158,16 @@ def test_an_update_right_after_launch_still_reaches_the_browser(tmp_path):
 
     httpd, url, jobs, engines = start(tmp_path, github=FakeGitHub())
     try:
+        settle(engines)  # the update at launch
         q = jobs.subscribe()
         q.get()
-        engines.update("yt-dlp")  # finishes within milliseconds, before any polling would look
+        engines.update("youtube-dl")  # already the latest: done within milliseconds, before any polling would look
+
         end = time.time() + 3
         while True:
             event, data = q.get(timeout=max(0.01, end - time.time()))
-            if event == "snapshot" and data["engines"]["yt-dlp"]["version"] == LATEST:
+            if event == "snapshot" and data["engines"]["youtube-dl"]["busy"] is None:
+                assert data["engines"]["yt-dlp"]["version"] == LATEST
                 break
     finally:
         httpd.shutdown()

@@ -67,25 +67,32 @@ def presets(url, ffmpeg=True):
     return {p["id"]: p["size"] for p in entry["presets"]}, [p["id"] for p in entry["presets"]]
 
 
+def best_detail(url, ffmpeg=True):
+    [entry] = last(run("probe", url, ffmpeg=ffmpeg))["entries"]
+    assert all(p["detail"] is None for p in entry["presets"][1:])
+    return entry["presets"][0]["detail"]
+
+
 def test_a_video_offers_best_its_real_heights_and_audio_with_size_estimates():
     sizes, order = presets("https://fake.test/video")
-    assert order == ["best", "1080", "720", "480", "360", "audio", "mp3"]
+    assert order == ["best", "720", "480", "360", "audio", "mp3"]  # 1080 is what Best gives: offered once
+    assert best_detail("https://fake.test/video") == "1080p"
     # yt-dlp's rule: largest short side, then H.264, then size: at 1080 the H.264 HLS stream (9000 kbit/s for 95 s)
     # outranks the smaller H.264 file; the AAC m4a outranks opus; at 360 the combined stream is merged with it too
     assert sizes == {
         "best": 9000 * 125 * 95 + 400_000,
-        "1080": 9000 * 125 * 95 + 400_000,
         "720": 1_500_000 + 400_000,
         "480": 800_000 + 400_000,
         "360": 600_000 + 400_000,
         "audio": 400_000,
-        "mp3": None,
+        "mp3": 95 * 128_000 // 8,  # the duration at the usual 128 kbit/s
     }
 
 
 def test_without_ffmpeg_only_streams_with_picture_and_sound_are_offered():
     sizes, order = presets("https://fake.test/video", ffmpeg=False)
-    assert order == ["best", "360", "audio"]
+    assert order == ["best", "audio"]  # Best is the one combined 360p stream
+    assert best_detail("https://fake.test/video", ffmpeg=False) == "360p"
     assert sizes["best"] == 600_000
     assert sizes["audio"] == 400_000
 
@@ -93,6 +100,7 @@ def test_without_ffmpeg_only_streams_with_picture_and_sound_are_offered():
 def test_an_audio_only_link_offers_no_heights():
     sizes, order = presets("https://fake.test/audio")
     assert order == ["best", "audio", "mp3"]
+    assert best_detail("https://fake.test/audio") is None
     assert sizes["audio"] == 500_000
 
 
@@ -104,13 +112,13 @@ def test_a_playlist_is_read_flat_with_the_generic_presets():
     first = info["entries"][0]
     assert first["thumbnail"].startswith("data:image/svg+xml")
     assert first["duration"] == 95
-    assert [(p["id"], p["size"]) for p in first["presets"]] == [
-        ("best", None),
-        ("1080", None),
-        ("720", None),
-        ("480", None),
-        ("audio", None),
-        ("mp3", None),
+    assert [(p["id"], p["detail"], p["size"]) for p in first["presets"]] == [
+        ("best", None, None),
+        ("1080", None, None),
+        ("720", None, None),
+        ("480", None, None),
+        ("audio", None, None),
+        ("mp3", None, None),
     ]
 
 
@@ -126,7 +134,8 @@ def test_mp3_is_extracted_when_asked(tmp_path):
 
 def test_a_size_is_estimated_from_the_bitrate_when_the_site_gives_none():
     sizes, order = presets("https://fake.test/hls")
-    assert order == ["best", "720", "audio", "mp3"]
+    assert order == ["best", "audio", "mp3"]
+    assert best_detail("https://fake.test/hls") == "720p"
     assert sizes["best"] == 800 * 1000 // 8 * 95
 
 
@@ -180,15 +189,14 @@ def test_without_ffmpeg_nothing_is_embedded(tmp_path, engine):
 
 def test_a_vertical_video_offers_its_classes_with_labels():
     [entry] = last(run("probe", "https://fake.test/vertical"))["entries"]
-    assert [(p["id"], p["label"]) for p in entry["presets"]] == [
-        ("best", "Best"),
-        ("1080", "1080p"),
-        ("720", "720p"),
-        ("audio", "Audio"),
-        ("mp3", "MP3"),
+    assert [(p["id"], p["label"], p["detail"]) for p in entry["presets"]] == [
+        ("best", "Best", "1080p"),
+        ("720", "720p", None),
+        ("audio", "Audio", None),
+        ("mp3", "MP3", None),
     ]
     sizes = {p["id"]: p["size"] for p in entry["presets"]}
-    assert sizes["1080"] == 2_800_000 + 400_000  # the 1080x1920 stream, not a lower one
+    assert sizes["best"] == 2_800_000 + 400_000  # the 1080x1920 stream, not a lower one
     assert sizes["720"] == 1_300_000 + 400_000
 
 
@@ -213,13 +221,15 @@ def test_yt_dlp_chooses_by_its_format_sorting_with_resolution_first():
 
 def test_a_4_3_video_is_classed_by_its_short_side():
     sizes, order = presets("https://fake.test/four-three")
-    assert order == ["best", "480", "360", "audio", "mp3"]
+    assert order == ["best", "360", "audio", "mp3"]
+    assert best_detail("https://fake.test/four-three") == "480p"
     assert sizes["360"] == 300_000 + 400_000  # the 480x360 stream, not the 640x480 one
 
 
 def test_the_top_class_wins_even_when_only_a_lower_class_is_h264():
     sizes, order = presets("https://fake.test/vp9-top")
-    assert sizes["best"] == sizes["1080"] == 2_500_000 + 400_000  # VP9 1080p, not H.264 720p
+    assert sizes["best"] == 2_500_000 + 400_000  # VP9 1080p, not H.264 720p
+    assert best_detail("https://fake.test/vp9-top") == "1080p"
     assert sizes["720"] == 1_500_000 + 400_000
 
 
@@ -279,4 +289,5 @@ def test_a_wide_screen_video_gets_the_class_above_its_short_side():
     ]
     sound = {"format_id": "a", "vcodec": "none", "acodec": "mp4a", "ext": "m4a", "filesize": 10}
     entry = worker.entry({"id": "x", "title": "Wide", "formats": [*video, sound]}, ffmpeg=True)
-    assert [p["id"] for p in entry["presets"]] == ["best", "1080", "720", "audio", "mp3"]
+    assert [p["id"] for p in entry["presets"]] == ["best", "720", "audio", "mp3"]
+    assert entry["presets"][0]["detail"] == "1080p"

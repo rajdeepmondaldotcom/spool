@@ -5,6 +5,8 @@ from . import version  # noqa: F401
 
 
 class YoutubeDL(_fake.YoutubeDL):
+    HOOK_INFO = True
+    NAME = "yt-dlp"
     METADATA_OPTIONS = {"add_chapters", "add_metadata", "add_infojson"}
     WHEN = {"pre_process": 0, "post_process": 1, "after_move": 2}
 

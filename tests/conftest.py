@@ -1,5 +1,5 @@
 import pytest
-from serve_fake import FakeGitHub, start
+from serve_fake import INSTALLED, FakeGitHub, start
 from support import Client
 
 
@@ -14,7 +14,8 @@ def away_from_the_repo(tmp_path, monkeypatch):
 
 @pytest.fixture
 def github():
-    return FakeGitHub()
+    """Nothing newer is published, so the engines Spool updates at launch stay as installed."""
+    return FakeGitHub(latest=INSTALLED)
 
 
 @pytest.fixture

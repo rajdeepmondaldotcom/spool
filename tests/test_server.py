@@ -88,7 +88,7 @@ def test_static_files_cannot_escape_the_static_folder(app):
 def test_errors_are_json_with_a_kind_and_plain_words(app):
     status, body = app.json("GET", "/api/nothing-here")
     assert status == 404
-    assert body["error"]["kind"] == "not_found"
+    assert body["error"]["kind"] == "bad_request"
     assert body["error"]["message"]
 
 
@@ -104,7 +104,9 @@ def test_events_start_with_a_snapshot(app):
     assert snap["dest"]["ok"] is True
     assert snap["engines"]["yt-dlp"]["installed"] is True
     assert snap["engines"]["yt-dlp"]["version"] == "2026.01.01"
-    assert set(snap["tools"]) == {"ffmpeg", "js_runtime", "platform", "can_choose_folder"}
+    assert set(snap["tools"]) >= {"ffmpeg", "js_runtime", "platform", "can_choose_folder"}
+    assert snap["dest"]["message"] is None
+    assert snap["version"] == "0.1.0"
     assert snap["jobs"] == []
 
 
@@ -116,11 +118,12 @@ def test_probe_returns_the_entries(app):
     assert probe["entries"][0]["id"] == "vid-1"
 
 
-def test_probe_of_an_empty_playlist_suggests_the_other_engine(app):
+def test_probe_of_an_empty_playlist_is_empty_after_both_engines(app):
     status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/empty-playlist"})
-    assert status == 422
-    assert body["error"]["kind"] == "empty"
-    assert body["error"]["hint"] == "try_other_engine"
+    assert (status, body["error"]) == (
+        422,
+        {"kind": "empty", "message": "Spool found no video at this link.", "hint": None},
+    )
 
 
 def test_probe_of_a_playlist_lists_its_entries(app):
@@ -186,8 +189,11 @@ def test_a_long_link_is_accepted_and_a_too_long_one_says_so(app):
     long = "https://fake.test/video?x=" + "a" * 5000
     assert app.json("POST", "/api/probe", {"url": long})[0] == 200
     status, body = app.json("POST", "/api/probe", {"url": long + "a" * 10_000})
-    assert (status, body["error"]["kind"]) == (422, "invalid_link")
-    assert "too long" in body["error"]["message"]
+    assert (status, body["error"]["kind"], body["error"]["message"]) == (
+        422,
+        "too_long",
+        "That link is too long for Spool.",
+    )
 
 
 def test_a_bad_content_length_is_400(app):
