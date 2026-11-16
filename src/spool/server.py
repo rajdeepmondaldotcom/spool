@@ -5,10 +5,9 @@ import json
 import mimetypes
 import queue
 import re
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 from . import system
 from .engines import Busy
@@ -55,9 +54,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             url = urlsplit(self.path)
             self.check_host()
-            if method == "GET" and url.path == "/" and "t" in parse_qs(url.query):
-                return self.token_handoff(parse_qs(url.query)["t"][0])
-            self.check_access(method)
+            self.check_access(method, url.path)
             route, args = self.route(method, url.path)
             route(*args)
         except Problem as p:
@@ -72,25 +69,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Host", "") not in (f"127.0.0.1:{port}", f"localhost:{port}"):  # DNS rebinding
             raise Problem(403, "forbidden", "This address is not Spool's.")
 
-    def token_handoff(self, given):
-        token = self.server.token
-        if not hmac.compare_digest(given.encode(), token.encode()):
-            raise Problem(403, "forbidden", "This link has an old or wrong key. Open the link Spool printed.")
-        self.send_response(303)
-        self.send_header("Location", "/")
-        self.send_header("Set-Cookie", f"spool={token}; HttpOnly; SameSite=Strict; Path=/")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def check_access(self, method):
-        token = self.server.token
-        cookie = SimpleCookie()
-        try:
-            cookie.load(self.headers.get("Cookie", ""))
-        except Exception:
-            pass
-        if "spool" not in cookie or not hmac.compare_digest(cookie["spool"].value.encode(), token.encode()):
-            raise Problem(403, "forbidden", "Open Spool from the link it printed when it started.")
+    def check_access(self, method, path):
+        # The token travels in a header: a cookie would reach every server on 127.0.0.1, whatever its port.
+        given = self.headers.get("X-Spool-Token", "")
+        if path.startswith("/api/") and not hmac.compare_digest(given.encode(), self.server.token.encode()):
+            raise Problem(401, "unauthorized", "Open Spool from the link it printed when it started.")
         if method != "GET":
             if self.headers.get("Origin") != f"http://{self.headers['Host']}":  # other websites
                 raise Problem(403, "forbidden", "Spool only takes changes from its own page.")
@@ -129,6 +112,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             while True:
                 try:
@@ -211,6 +195,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", CSP)
+        self.send_header("Referrer-Policy", "no-referrer")  # thumbnail requests must not carry Spool's address
         self.end_headers()
         self.wfile.write(data)
 

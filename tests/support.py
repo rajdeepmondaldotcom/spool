@@ -15,7 +15,7 @@ class Client:
 
     def __init__(self, base, token="fake-token"):
         self.base, self.token = base, token
-        self.headers = {"Cookie": f"spool={token}", "Origin": base}
+        self.headers = {"X-Spool-Token": token, "Origin": base}
 
     def request(self, method, path, body=None, headers=None):
         data = json.dumps(body).encode() if body is not None else None

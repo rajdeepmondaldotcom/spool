@@ -2,7 +2,7 @@
 
     uv run python tests/serve_fake.py --port 8765 [--fresh] [--no-ffmpeg]
 
-Prints the tokened URL. Links like https://fake.test/video drive every UI state; see fake_engine/_fake.py.
+Prints the link, with the token in its fragment (#t=fake-token); API calls send it as X-Spool-Token. Links like https://fake.test/video drive every UI state; see fake_engine/_fake.py.
 --fresh starts with no engines installed, so the first-run install is visible (it takes a few seconds).
 --no-ffmpeg hides ffmpeg from PATH.
 """
@@ -87,7 +87,7 @@ def start(data_dir, port=0, fresh=False, github=None):
     httpd = server.make_server(jobs, engines, token="fake-token", port=port)
     engines.start()
     threading.Thread(target=httpd.serve_forever, args=(0.05,), daemon=True).start()
-    return httpd, f"http://127.0.0.1:{httpd.server_address[1]}/?t=fake-token", jobs, engines
+    return httpd, f"http://127.0.0.1:{httpd.server_address[1]}/#t=fake-token", jobs, engines
 
 
 def main():

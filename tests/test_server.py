@@ -1,4 +1,5 @@
 import http.client
+import json
 from pathlib import Path
 
 from support import job_state
@@ -23,41 +24,46 @@ def host(app):
 # Access checks
 
 
+TOKEN = {"X-Spool-Token": "fake-token"}
+
+
 def test_a_foreign_host_is_refused(app):
-    status, _, _ = raw(app, "GET", "/", {"Host": "evil.test", "Cookie": "spool=fake-token"})
+    status, _, _ = raw(app, "GET", "/api/events", {"Host": "evil.test", **TOKEN})
     assert status == 403
+    assert raw(app, "GET", "/", {"Host": "evil.test"})[0] == 403
 
 
 def test_localhost_by_name_is_accepted(app):
     port = app.httpd.server_address[1]
-    status, _, _ = raw(app, "GET", "/", {"Host": f"localhost:{port}", "Cookie": "spool=fake-token"})
+    status, _, _ = raw(app, "GET", "/", {"Host": f"localhost:{port}"})
     assert status == 200
 
 
-def test_without_the_cookie_everything_is_refused(app):
-    for path in ("/", "/api/events", "/index.html"):
-        status, _, _ = raw(app, "GET", path, {"Host": host(app)})
-        assert status == 403, path
+def test_the_page_and_its_files_need_no_token(app):
+    for path in ("/", "/index.html"):
+        assert raw(app, "GET", path, {"Host": host(app)})[0] == 200, path
 
 
-def test_the_token_link_sets_the_cookie_and_redirects(app):
-    status, headers, _ = raw(app, "GET", "/?t=fake-token", {"Host": host(app)})
-    headers = dict(headers)
-    assert status == 303
-    assert headers["Location"] == "/"
-    assert headers["Set-Cookie"] == "spool=fake-token; HttpOnly; SameSite=Strict; Path=/"
+def test_every_api_request_needs_the_token_header(app):
+    for method, path in (("GET", "/api/events"), ("GET", "/api/jobs/x/log"), ("POST", "/api/probe")):
+        for headers in ({}, {"X-Spool-Token": "guess"}, {"Cookie": "spool=fake-token"}):
+            status, _, body = raw(app, method, path, {"Host": host(app), "Origin": f"http://{host(app)}", **headers})
+            assert status == 401, (method, path, headers)
+            assert json.loads(body)["error"]["kind"] == "unauthorized"
 
 
-def test_a_wrong_token_link_is_refused(app):
-    status, headers, _ = raw(app, "GET", "/?t=guess", {"Host": host(app)})
-    assert status == 403
-    assert "Set-Cookie" not in dict(headers)
+def test_spool_sets_no_cookies_and_sends_no_referrer(app):
+    for path in ("/", "/api/jobs/x/log"):
+        _, headers, _ = raw(app, "GET", path, {"Host": host(app), **TOKEN})
+        headers = dict(headers)
+        assert "Set-Cookie" not in headers
+        assert headers["Referrer-Policy"] == "no-referrer"
 
 
 def test_writes_need_our_own_origin(app):
     body = {"url": "https://fake.test/video"}
     assert app.json("POST", "/api/probe", body, {"Origin": "https://evil.test"})[0] == 403
-    status, _, _ = raw(app, "POST", "/api/probe", {"Host": host(app), "Cookie": "spool=fake-token"})
+    status, _, _ = raw(app, "POST", "/api/probe", {"Host": host(app), **TOKEN})
     assert status == 403
 
 

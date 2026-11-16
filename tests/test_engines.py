@@ -126,7 +126,7 @@ def test_until_the_first_install_finishes_probe_says_the_engine_is_not_ready(tmp
     from support import Client
 
     httpd, url, jobs, engines = start(tmp_path, fresh=True, github=FakeGitHub(delay=0.3))
-    client = Client(url.split("/?")[0])
+    client = Client(url.split("/#")[0])
     try:
         status, body = client.json("POST", "/api/probe", {"url": "https://fake.test/video"})
         assert (status, body["error"]["kind"]) == (503, "engine_not_ready")

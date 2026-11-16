@@ -38,7 +38,7 @@ def launch(data, *args):
 
 
 def url_in(line):
-    return re.search(r"http://127\.0\.0\.1:\d+/\?t=\S+", line).group(0)
+    return re.search(r"http://127\.0\.0\.1:\d+/#t=\S+", line).group(0)
 
 
 def stop(proc):
@@ -47,18 +47,46 @@ def stop(proc):
         proc.wait(10)
 
 
-def test_launch_prints_the_tokened_link_and_writes_a_private_lockfile(data):
+def test_launch_prints_the_link_with_the_token_in_the_fragment(data):
     proc, line = launch(data)
     try:
         url = url_in(line)
+        token = (data / "token").read_text().strip()
         lock = json.loads((data / "spool.lock").read_text())
-        assert lock["pid"] == proc.pid
-        assert url == f"http://127.0.0.1:{lock['port']}/?t={lock['token']}"
-        assert stat.S_IMODE((data / "spool.lock").stat().st_mode) == 0o600
-        client = Client(url.split("/?")[0], lock["token"])
-        assert client.request("GET", "/")[0] == 200
+        assert lock == {"port": lock["port"], "pid": proc.pid}
+        assert url == f"http://127.0.0.1:{lock['port']}/#t={token}"
+        assert stat.S_IMODE((data / "token").stat().st_mode) == 0o600
+        client = Client(url.split("/#")[0], token)
+        assert client.request("GET", "/api/jobs/x/log")[0] == 404  # past the token check
     finally:
         stop(proc)
+
+
+def test_the_token_and_the_default_port_survive_a_restart(data):
+    first, line = launch(data)
+    stop(first)
+    second, again = launch(data)
+    try:
+        assert url_in(again).split("#")[1] == url_in(line).split("#")[1]  # the same token
+        if ":7766/" in line:  # unless something else on this machine holds the default port
+            assert url_in(again) == url_in(line)
+    finally:
+        stop(second)
+
+
+def test_the_default_port_taken_by_something_else_falls_back_to_a_free_one(data):
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # the previous test's Spool may leave TIME_WAIT
+        try:
+            s.bind(("127.0.0.1", 7766))
+        except OSError:
+            pytest.skip("7766 is in use on this machine")
+        s.listen()
+        proc, line = launch(data)
+        try:
+            assert "Spool is running at" in line and ":7766/" not in line
+        finally:
+            stop(proc)
 
 
 def test_a_second_launch_points_at_the_running_one_and_exits(data):
@@ -73,7 +101,7 @@ def test_a_second_launch_points_at_the_running_one_and_exits(data):
 
 
 def test_a_stale_lockfile_is_ignored(data):
-    (data / "spool.lock").write_text(json.dumps({"port": 9, "pid": 999999, "token": "old"}))
+    (data / "spool.lock").write_text(json.dumps({"port": 9, "pid": 999999}))
     proc, line = launch(data)
     try:
         assert "already running" not in line
@@ -100,7 +128,7 @@ def test_a_chosen_port_is_used_and_a_taken_one_is_a_plain_error(data):
 def test_shutdown_stops_running_downloads_and_removes_the_lockfile(data):
     proc, line = launch(data)
     url = url_in(line)
-    client = Client(url.split("/?")[0], url.split("t=")[1])
+    client = Client(url.split("/#")[0], url.split("#t=")[1])
     entry = {"url": "https://fake.test/slow?delay=0.3", "id": "slow-1", "title": "Slow"}
     assert client.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})[0] == 201
     deadline = time.time() + 10
