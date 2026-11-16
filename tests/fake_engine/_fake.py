@@ -284,15 +284,16 @@ def scenario(url):
             **video(url, n, "Fake audio track", AUDIO_FORMATS),
             "id": f"aud-{n}",
         }, delay if delay is not None else 0.1
-    if name == "tube":  # YouTube; refuse=pieces: it refuses the second piece; stop=<n>: the worker dies at piece <n>
-        query = parse_qs(parts.query)
-        extra = {"extractor_key": "Youtube", "_refuse_pieces": query.get("refuse") == ["pieces"]}
-        extra["_stop"] = int(query.get("stop", ["0"])[0])
-        extra["_cut_old"] = query.get("cut") == ["old"]
-        extra["_throttle"] = query.get("throttle") == [
-            "piece"
-        ]  # the second piece trickles, once  # the worker dies half way through a stream fetched whole
-        return {**video(url, n, "Fake tube video", TUBE_FORMATS), "id": f"tube-{n}", **extra}, delay or 0
+    if name == "tube":  # YouTube, with faults chosen by the query (see pieces())
+        q = {k: v[0] for k, v in parse_qs(parts.query).items()}
+        extra = {"extractor_key": "Youtube", "_q": q, "_stop": int(q.get("stop", 0))}
+        extra["_cut_old"] = q.get("cut") == "old"  # the worker dies half way through a stream fetched whole
+        extra["_fail_merge"] = q.get("fail") == "merge"
+        formats = TUBE_FORMATS
+        if q.get("size") == "small":  # the site says the video stream is 5 MB shorter than it is
+            formats = [{**f, "filesize": f["filesize"] - 5_000_000, "_bytes": f["filesize"]} for f in formats[:1]]
+            formats += TUBE_FORMATS[1:]
+        return {**video(url, n, "Fake tube video", formats), "id": f"tube-{n}", **extra}, delay or 0
     if name == "slow":
         return {
             **video(url, n, "Fake slow video", SLOW_FORMATS),
@@ -397,6 +398,8 @@ class YoutubeDL:
 
     def __init__(self, params=None):
         self.params = params or {}
+        if self.params.get("logger"):
+            self.params["logger"].debug("[fake] a new engine object")  # each costs time, and may cost requests
         if "socket_timeout" not in self.params:  # youtube-dl would wait 10 minutes for a host that stops answering
             raise TypeError("the fake engine wants a socket_timeout")
         self.pps = []  # (when rank, post-processor) in the order the engine runs them
@@ -439,13 +442,6 @@ class YoutubeDL:
             info = {**info, "entries": info["entries"][: self.params["playlistend"]]}
         return info
 
-    def process_video_result(self, info, download=True):
-        """The engine's choice of streams for its format params, without downloading."""
-        parts = self.chosen(info)
-        return (
-            {**info, **parts[0]} if len(parts) == 1 else {**info, "requested_formats": parts, "ext": merged_ext(parts)}
-        )
-
     def needs_js(self, info):
         if info.get("_needs_js"):
             self.params["logger"].warning(
@@ -475,11 +471,15 @@ class YoutubeDL:
                 self.fail(str(exc))
             self.needs_js(info)
             if info.get("_type") != "playlist":
-                try:
-                    self.download_one(info, delay)
-                except ReExtractInfo:
-                    self.log("[fake] throttled: reading the video again")
-                    self.download_one(self.scenario(url)[0], delay)
+                for reads in range(1, 100):  # the engine reads the video again on every ReExtractInfo, without limit
+                    try:
+                        self.download_one(info, delay)
+                        break
+                    except ReExtractInfo:
+                        self.log("[fake] throttled: reading the video again")
+                        info = self.scenario(url)[0]
+                    if reads == 5:
+                        self.fail("ERROR: [fake] read the video again 5 times and would go on")
                 continue
             if self.NAME == "yt-dlp" and self.skipped(
                 {"playlist_count": len(info["entries"]), "playlist_id": info["id"]}
@@ -694,7 +694,9 @@ class YoutubeDL:
         if f.get("protocol") == "m3u8_native":
             self.log(f"[fake] pieces at once: {self.params.get('concurrent_fragment_downloads', 1)}")
         part = name + ".part"
-        total = f.get("filesize") or 1_000_000  # a stream with only a bitrate: any size will do
+        total = f.get("_bytes") or f.get("filesize") or 1_000_000  # only a bitrate: any size will do
+        if self.params.get("throttledratelimit"):
+            self.log(f"[fake] a stream fetched whole with a floor of {self.params['throttledratelimit']} B/s")
         done = os.path.getsize(part) if os.path.exists(part) else 0
         if done:
             self.log(f"[download] Resuming download at byte {done}")
@@ -739,10 +741,19 @@ class YoutubeDL:
 
     def pieces(self, info, f, name, about):
         """yt-dlp's DASH downloader: pieces by byte range, several at once, appended in order to <name>.part;
-        <name>.ytdl counts the pieces appended. A .part with no .ytdl is appended to from piece 0, as the engine does."""
-        part, ytdl = name + ".part", name + ".ytdl"
-        at_once = self.params.get("concurrent_fragment_downloads", 1)
+        <name>.ytdl counts the pieces appended. A .part with no .ytdl is appended to from piece 0, as the engine does,
+        and nothing checks the size. Faults, from the link's query: throttle=piece (the second piece trickles, once),
+        throttle=line (every piece is slow), refuse=pieces|limit (the second piece is refused, or limited),
+        ignore=range (every piece is the whole stream), stop=<n> (the worker dies at piece n; with between=1 after
+        appending it and before counting it)."""
+        q, part, ytdl = info["_q"], name + ".part", name + ".ytdl"
+        at_once, real = self.params.get("concurrent_fragment_downloads", 1), f.get("_bytes") or f["filesize"]
+        tries = self.params.get("fragment_retries")
+        pause = (self.params.get("retry_sleep_functions") or {}).get("fragment")
         self.log(f"[dashsegments] Total fragments: {len(f['fragments'])}; pieces at once: {at_once}")
+        self.log(
+            f"[fake] tries a piece {tries} more times, pausing {[pause(n=k) for k in range(tries)] if pause else 0}"
+        )
         start = json.load(open(ytdl))["downloader"]["current_fragment"]["index"] if os.path.exists(ytdl) else 0
         skip = self.params.get("skip_unavailable_fragments", True)
         with self.open(part, "ab") as out:
@@ -752,7 +763,7 @@ class YoutubeDL:
                 a, b = map(int, re.search(r"[?&]range=(\d+)-(\d+)", f["fragments"][i]["url"]).groups())
                 frag = f"{part}-Frag{i + 1}"
                 with open(frag + ".part", "wb") as piece:
-                    piece.write(data(a, min(b + 1, f["filesize"])))
+                    piece.write(data(0, real) if q.get("ignore") == "range" else data(a, min(b + 1, real)))
                 os.replace(frag + ".part", frag)
                 self.hook(  # bytes received count, appended or not; no total until the end, and the guess swings
                     info_dict=about,
@@ -764,23 +775,35 @@ class YoutubeDL:
                     filename=name,
                     tmpfilename=part,
                 )
-                if info.get("_throttle") and i == 1 and not os.path.exists(".fake-throttled"):
+                slow = q.get("throttle") == "line" or (
+                    q.get("throttle") == "piece" and i == 1 and not os.path.exists(".fake-throttled")
+                )
+                if slow:
                     open(".fake-throttled", "w").close()  # in the destination, the engine's current folder
                     os.remove(frag)
                     if self.params.get("throttledratelimit"):  # below it for 3 seconds: read the video again
                         raise ReExtractInfo()
-                    self.fail("ERROR: [fake] a piece came at 1 KB/s for minutes")
-                if info.get("_stop") == i + 1:
+                    if q.get("throttle") == "piece":
+                        self.fail("ERROR: [fake] a piece came at 1 KB/s for minutes")
+                    continue  # a slow line: it comes, slowly
+                if info.get("_stop") == i + 1 and not q.get("between"):
                     os._exit(9)  # killed, as a cancel or a crash would: the pieces stay on disk
-                if info.get("_refuse_pieces") and i == 1:  # the piece another connection had came for nothing
+                if q.get("refuse") and i == 1:
                     os.remove(frag)
+                    if i + 2 <= len(f["fragments"]):  # the piece another connection fetched meanwhile stays
+                        open(f"{part}-Frag{i + 2}", "wb").write(data(0, 1000))
                     if skip:
                         self.log(f"[download] Skipping fragment {i + 1} ...")  # a hole in the file, and success
                         continue
+                    if q["refuse"] == "limit":
+                        self.fail("ERROR: [download] Got error: HTTP Error 429: Too Many Requests")
                     self.fail(f"ERROR: fragment {i + 1} not found, unable to continue")
                 with open(frag, "rb") as piece:
                     out.write(piece.read())
+                    out.flush()
                 os.remove(frag)
+                if info.get("_stop") == i + 1:
+                    os._exit(9)  # killed between appending the piece and counting it
                 json.dump({"downloader": {"current_fragment": {"index": i + 1}}}, open(ytdl, "w"))
         os.remove(ytdl)
         os.replace(part, name)
