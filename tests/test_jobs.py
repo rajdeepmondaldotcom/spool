@@ -170,6 +170,22 @@ def test_jobs_survive_a_restart_and_a_job_caught_mid_download_becomes_interrupte
 # Plain-word errors
 
 
+def test_a_youtube_failure_without_a_javascript_runtime_says_so(app, events):
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/needs-js"})
+    assert (status, body["error"]["kind"], body["error"]["hint"]) == (422, "engine", "install_js_runtime")
+    assert "JavaScript" in body["error"]["message"]
+    assert body["error"]["message"].endswith("The engine said: Requested format is not available.")
+    job = app.json("POST", "/api/jobs", {"entries": [{"url": "https://fake.test/needs-js"}], "preset": "best"})
+    failed = wait_for(events, job[1]["jobs"][0]["id"], lambda d: d["state"] == "failed")
+    assert (failed["error"]["kind"], failed["error"]["hint"]) == ("engine", "install_js_runtime")
+
+
+def test_a_probe_that_fails_in_the_engine_carries_its_last_error_line_cleaned(app):
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/broken"})
+    assert (status, body["error"]["kind"], body["error"]["hint"]) == (422, "engine", "update_engine")
+    assert body["error"]["message"] == "The engine failed: Something new broke."
+
+
 def test_probe_errors_have_a_kind_and_plain_words(app):
     for url, kind in (
         ("https://fake.test/unavailable", "unavailable"),
@@ -222,6 +238,38 @@ def test_probe_errors_have_a_kind_and_plain_words(app):
         ("[Errno 63] File name too long: '/x/a very long name.mp4'", "engine", None),
         ("ERROR: unable to open for writing: [Errno 2] No such file or directory: '/x/T.part'", "engine", None),
         ("ERROR: Unable to download webpage: <urlopen error [Errno 61] Connection refused>", "network", None),
+        # from the tester's runs and the engines' own source
+        ("ERROR: [youtube] abc: This video is unavailable", "unavailable", None),
+        ("ERROR: [youtube] abc: Video unavailable", "unavailable", None),
+        (
+            "ERROR: [vimeo] 123: This video is only available for registered users. Use --cookies, "
+            "--cookies-from-browser, --username and --password, --netrc-cmd, or --netrc (vimeo) to provide account credentials",
+            "unavailable",
+            None,
+        ),
+        (
+            "ERROR: [instagram] abc: Requested content is not available, rate-limit reached or login required",
+            "unavailable",
+            None,
+        ),
+        ("ERROR: [twitter] 1: You need to log in to view this content", "unavailable", None),
+        ("ERROR: [patreon] 1: You need to be logged-in to access this", "unavailable", None),
+        (
+            "ERROR: [youtube] abc: Join this channel to get access to members-only content like this video, and other exclusive perks.",
+            "unavailable",
+            None,
+        ),
+        (
+            "No supported JavaScript runtime could be found. "
+            "ERROR: [youtube] KXItezz-BhA: Requested format is not available. Use --list-formats for a list of available formats",
+            "engine",
+            "install_js_runtime",
+        ),
+        (
+            "ERROR: Unable to rename file: [Errno 2] No such file or directory: '/x/out/race/Me at the zoo [jNQXAC9IVRw].m4a.part'",
+            "engine",
+            None,
+        ),
     ],
 )
 def test_engine_messages_map_to_kinds_and_hints(message, kind, hint):
@@ -300,3 +348,23 @@ def test_remove_never_touches_another_jobs_finished_file(app, events):
     wait_for(events, failed, lambda d: d["state"] == "failed")
     assert app.request("DELETE", f"/api/jobs/{failed}")[0] == 204
     assert [p.name for p in app.dest.iterdir()] == [os.path.basename(done["path"])]
+
+
+@pytest.mark.parametrize("engine", ["yt-dlp", "youtube-dl"])
+def test_a_live_stream_is_refused_while_it_is_live(app, events, engine):
+    job = app.json(
+        "POST", "/api/jobs", {"entries": [{"url": "https://fake.test/live"}], "preset": "best", "engine": engine}
+    )
+    failed = wait_for(events, job[1]["jobs"][0]["id"], lambda d: d["state"] in ("done", "failed"))
+    assert failed["error"] == {"kind": "live", "message": "This is live now. Download it after it ends.", "hint": None}
+    assert list(app.dest.iterdir()) == []
+
+
+def test_a_job_for_a_playlist_item_downloads_that_item_only(app, events):
+    entries = app.json("POST", "/api/probe", {"url": "https://fake.test/shared-playlist"})[1]["entries"]
+    job = app.json("POST", "/api/jobs", {"entries": [entries[1]], "preset": "best"})[1]["jobs"][0]
+    assert (job["url"], job["item"]) == ("https://fake.test/shared-playlist", 2)
+    done = wait_for(events, job["id"], lambda d: d["state"] == "done")
+    assert [p.name for p in app.dest.iterdir()] == [os.path.basename(done["path"])] == ["Shared item 2 [shared-2].mp4"]
+    other = app.json("POST", "/api/jobs", {"entries": [entries[0]], "preset": "best"})[1]["jobs"][0]
+    assert other["id"] != job["id"]

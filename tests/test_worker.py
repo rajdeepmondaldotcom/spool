@@ -224,3 +224,31 @@ def test_a_destination_deleted_just_before_the_engine_starts_is_not_recreated(tm
 def test_files_carry_the_download_time_not_the_upload_time(tmp_path):
     done = last(run("download", "https://fake.test/video?delay=0", dest=str(tmp_path), preset="best"))
     assert abs(os.path.getmtime(done["path"]) - time.time()) < 60
+
+
+# Entries with no link of their own
+
+
+def test_playlist_entries_that_share_one_link_are_items_of_the_probed_link():
+    url = "https://fake.test/shared-playlist"
+    entries = last(run("probe", url))["entries"]
+    assert [(e["url"], e["item"]) for e in entries] == [(url, 1), (url, 2), (url, 3)]
+
+
+def test_playlist_entries_with_their_own_links_are_not_items():
+    entries = last(run("probe", "https://fake.test/playlist"))["entries"]
+    assert [e["item"] for e in entries] == [None, None, None]
+
+
+def test_youtube_dl_youtube_entries_with_a_bare_id_get_their_watch_link():
+    entries = last(run("probe", "https://fake.test/ytdl-ids", engine="youtube-dl"))["entries"]
+    assert [(e["url"], e["item"]) for e in entries] == [
+        ("https://www.youtube.com/watch?v=abcdefghij1", None),
+        ("https://www.youtube.com/watch?v=abcdefghij2", None),
+    ]
+
+
+def test_an_item_downloads_only_that_entry(tmp_path):
+    events = run("download", "https://fake.test/shared-playlist?delay=0", dest=str(tmp_path), preset="best", item=2)
+    assert last(events)["event"] == "done"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["Shared item 2 [shared-2].mp4"]

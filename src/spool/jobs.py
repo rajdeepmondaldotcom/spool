@@ -3,6 +3,7 @@
 import json
 import os
 import queue
+import re
 import secrets
 import subprocess
 import sys
@@ -53,11 +54,14 @@ class Jobs:
         self._save()
         engines.on_change = self._snapshot_changed  # the event stream lives here, so engines report to it
         threading.Thread(target=self._tick, daemon=True).start()
+        threading.Thread(target=self._watch, daemon=True).start()
 
     # Reading
 
-    def snapshot(self):
-        dest = system.check_dest(self.settings["dest"])
+    def snapshot(self, dest=None):
+        """Pass dest when holding the lock: checking a destination can take CHECK_TIMEOUT, so never under it."""
+        if dest is None or dest["path"] != self.settings["dest"]:  # the setting changed since dest was checked
+            dest = system.check_dest(self.settings["dest"])
         with self.lock:
             jobs = [dict(j, file_exists=bool(j["path"]) and Path(j["path"]).exists()) for j in self.jobs]
             return {
@@ -70,9 +74,9 @@ class Jobs:
 
     def subscribe(self):
         """A queue of (event, data), starting with a snapshot. (None, None) means Spool is closing."""
-        q = queue.Queue()
+        q, dest = queue.Queue(), system.check_dest(self.settings["dest"])
         with self.lock:
-            q.put(("snapshot", self.snapshot()))
+            q.put(("snapshot", self.snapshot(dest)))
             self.subscribers.append(q)
         return q
 
@@ -91,6 +95,9 @@ class Jobs:
             raise Problem(422, "engine", "The engine stopped without an answer.", "update_engine")
         if result["event"] == "error":
             kind, message, hint = classify(result["message"])
+            line = last_error(result["message"])
+            if kind == "engine" and line and line not in message:  # a probe has no log to show, so say it here
+                message += f" The engine said: {line}"
             raise Problem(422, kind, message, hint)
         if not result["entries"]:
             other = "youtube-dl" if engine == "yt-dlp" else "yt-dlp"
@@ -214,7 +221,7 @@ class Jobs:
         with self.lock:
             self.settings.update(changes)
             self._save()
-            self._publish("snapshot", self.snapshot())
+        self._snapshot_changed()
         return {"settings": dict(self.settings), "dest": system.check_dest(self.settings["dest"])}
 
     def close(self):
@@ -292,7 +299,9 @@ class Jobs:
                     self._changed(job)
                     self._pump()
             return
-        spec = self._spec(job["engine"], mode="download", url=job["url"], dest=job["dest"], preset=job["preset"])
+        spec = self._spec(
+            job["engine"], mode="download", url=job["url"], dest=job["dest"], preset=job["preset"], item=job["item"]
+        )
         result = None
         with open(self.logs / f"{job['id']}.log", "a", encoding="utf-8") as log:
             log.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} {job['engine']} {job['preset']} {job['url']}\n")
@@ -387,16 +396,16 @@ class Jobs:
         write_atomic(self.state_file, json.dumps({"settings": self.settings, "jobs": self.jobs}).encode())
 
     def _snapshot_changed(self):
+        dest = system.check_dest(self.settings["dest"])
         with self.lock:
             if not self.closed:
-                self._publish("snapshot", self.snapshot())
+                self._publish("snapshot", self.snapshot(dest))
 
     def _machine(self):
         return dict(system.check_dest(self.settings["dest"]), free_bytes=None), system.tools()
 
     def _tick(self):
-        """Flush throttled job progress. Destination and tools have no events, so poll them once a second."""
-        last, n = self._machine(), 0
+        """Flush throttled job progress."""
         while not self.closed:
             time.sleep(TICK)
             with self.lock:
@@ -404,30 +413,40 @@ class Jobs:
                     if job["id"] in self.dirty:
                         self._publish("job", dict(job))
                 self.dirty.clear()
-            n += 1
-            if n % 4 == 0:  # the destination write test runs once a second, not every tick
-                now = self._machine()
-                if now != last:
-                    self._snapshot_changed()
-                last = now
+
+    def _watch(self):
+        """Destination and tools have no events, so poll them once a second, apart from progress: a check can hang."""
+        last = self._machine()
+        while not self.closed:
+            time.sleep(1)
+            now = self._machine()
+            if now != last:
+                self._snapshot_changed()
+            last = now
+
+
+DEST_PROBLEMS = {  # dest.problem -> (job error kind, plain words)
+    "unplugged": ("dest_unplugged", "The drive for {} is not plugged in."),
+    "missing": ("dest_missing", "The folder {} is not there."),
+    "not_a_folder": ("dest_not_folder", "{} is a file, not a folder."),
+    "not_writable": ("dest_denied", "Spool cannot write to {}."),
+    "not_responding": (
+        "dest_not_responding",
+        "The drive for {} is not answering. It may be asleep, or the system may be asking for permission.",
+    ),
+}
 
 
 def dest_problem(check, status=None):
     """Raise the plain-word problem for a destination check, if it has one."""
-    if check["problem"] in ("missing", "not_a_folder"):
-        raise Problem(
-            status,
-            "dest_missing",
-            f"The destination {check['display']} is not there. Is the drive plugged in?",
-            "check_dest",
-        )
-    if check["problem"] == "not_writable":
-        raise Problem(status, "dest_denied", f"Spool cannot write to {check['display']}.", "check_dest")
+    if check["problem"]:
+        kind, words = DEST_PROBLEMS[check["problem"]]
+        raise Problem(status, kind, words.format(check["display"]), "check_dest")
 
 
 def key(job):
     """Jobs with the same key would write the same file."""
-    return job["url"], job["preset"], job["dest"]
+    return job["url"], job["preset"], job["dest"], job["item"]
 
 
 def parse(line):
@@ -454,10 +473,11 @@ def new_job(entry, preset, engine, dest):
     thumb = entry.get("thumbnail")
     if not (isinstance(thumb, str) and thumb.startswith(("https://", "http://", "data:image/"))):
         thumb = None
-    duration = entry.get("duration")
+    duration, item = entry.get("duration"), entry.get("item")
     return {
         "id": secrets.token_hex(4),
         "url": link(entry.get("url")),
+        "item": item if type(item) is int and item > 0 else None,  # a playlist item of url, 1-based
         "entry_id": text(entry.get("id"), 200),
         "title": text(entry.get("title")) or entry["url"],
         "uploader": text(entry.get("uploader")),
@@ -484,6 +504,13 @@ def new_job(entry, preset, engine, dest):
 
 
 ERRORS = [  # (kind, hint, plain words, lowercase pieces of engine messages); the first match wins
+    ("live", None, "This is live now. Download it after it ends.", ("this is live now.",)),
+    (  # yt-dlp warns first; whatever fails after it on YouTube fails for this reason
+        "engine",
+        "install_js_runtime",
+        "YouTube needs a JavaScript runtime such as deno, and none is installed. Install deno, then retry.",
+        ("no supported javascript runtime",),
+    ),
     ("unsupported", "try_other_engine", "The engine cannot read this link.", ("unsupported url",)),
     (
         "no_ffmpeg",
@@ -496,16 +523,28 @@ ERRORS = [  # (kind, hint, plain words, lowercase pieces of engine messages); th
             "ffprobe/avprobe and ffmpeg/avconv",
         ),
     ),
+    (  # before "unavailable": the bot check says "sign in" too, and updating the engine is its fix
+        "blocked",
+        "update_engine",
+        "The site refused the download. Updating the engine and retrying usually fixes this.",
+        ("http error 403", "not a bot", "http error 429", "too many requests"),
+    ),
     (
         "unavailable",
         None,
-        "This video is not available. It may be private, removed, age-restricted or blocked where you are.",
+        "This video is not available. It may be private, removed, members-only, age-restricted or blocked where you are.",
         (
             "video unavailable",
+            "is unavailable",
             "private video",
             "is not available",
             "has been removed",
             "members-only",
+            "registered users",
+            "logged-in",
+            "log in",
+            "sign in",
+            "login required",
             "confirm your age",
             "age-restricted",
             "in your country",
@@ -513,12 +552,6 @@ ERRORS = [  # (kind, hint, plain words, lowercase pieces of engine messages); th
             "http error 404",
             "does not exist",
         ),
-    ),
-    (
-        "blocked",
-        "update_engine",
-        "The site refused the download. Updating the engine and retrying usually fixes this.",
-        ("http error 403", "sign in to confirm", "not a bot", "http error 429", "too many requests"),
     ),
     (
         "dest_missing",
@@ -551,12 +584,6 @@ ERRORS = [  # (kind, hint, plain words, lowercase pieces of engine messages); th
             "connection aborted",
         ),
     ),
-    (
-        "engine",
-        "install_js_runtime",
-        "The engine needs a JavaScript runtime such as deno for this site.",
-        ("javascript runtime", "js runtime"),
-    ),
     # any other local file-system error: updating the engine would not help
     ("engine", None, "Spool could not save the file. Show the log for the details.", ("[errno ", "winerror")),
 ]
@@ -568,8 +595,17 @@ def classify(message):
     for kind, hint, words, pieces in ERRORS:
         if any(p in low for p in pieces):
             return kind, words, hint
-    first = message.removeprefix("ERROR: ").strip().splitlines()[0] if message.strip() else ""
-    return "engine", f"The engine failed: {first}" if first else "The engine stopped unexpectedly.", "update_engine"
+    line = last_error(message)
+    return "engine", f"The engine failed: {line}" if line else "The engine stopped unexpectedly.", "update_engine"
+
+
+def last_error(message):
+    """The engine's last error line without its prefixes and command-line advice."""
+    lines = [x.strip() for x in message.strip().splitlines() if x.strip()]
+    line = next((x for x in reversed(lines) if x.startswith("ERROR:")), lines[-1] if lines else "")
+    line = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*)?([\w-]+:\s+)?", "", line)
+    line = re.split(r";? please report this issue|\s+Use --|\s+See\s+https?://", line)[0].strip()
+    return line if line.endswith(".") or not line else line + "."
 
 
 def remove_leftovers(job, keep):

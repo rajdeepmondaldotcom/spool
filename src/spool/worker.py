@@ -1,6 +1,6 @@
 """Worker: a child process that runs one engine call and reports JSON lines on stdout.
 
-Spec on stdin: {engine, engine_path, mode: "probe" | "download", url, ffmpeg, js_runtime?, dest?, preset?}.
+Spec on stdin: {engine, engine_path, mode: "probe" | "download", url, ffmpeg, js_runtime?, dest?, preset?, item?}.
 Events: {"event": "log" | "progress" | "meta" | "info" | "done" | "error", ...}. Standard library only; run with python -I.
 """
 
@@ -10,6 +10,7 @@ import sys
 from importlib import import_module
 
 OUT = sys.stdout
+LIVE = "This is live now."  # jobs.py maps these words to the error kind "live"
 
 
 def emit(**event):
@@ -18,7 +19,10 @@ def emit(**event):
 
 
 class Log:
+    no_js = False  # yt-dlp warned that YouTube has no JavaScript runtime to solve its challenge
+
     def debug(self, msg):
+        Log.no_js = Log.no_js or "No supported JavaScript runtime" in msg
         emit(event="log", line=msg)
 
     info = warning = error = debug
@@ -138,8 +142,12 @@ def entry(info, ffmpeg):
     if ffmpeg:
         presets.append(preset("mp3"))
     thumbnails = info.get("thumbnails") or [{}]
+    url = info.get("webpage_url") or info.get("url")
+    if info.get("ie_key") == "Youtube" and not str(url).startswith(("http://", "https://")):
+        url = f"https://www.youtube.com/watch?v={info.get('id') or url}"  # youtube-dl lists bare ids
     return {
-        "url": info.get("webpage_url") or info.get("url"),
+        "url": url,
+        "item": None,
         "id": info.get("id"),
         "title": info.get("title"),
         "uploader": info.get("uploader") or info.get("channel"),
@@ -155,8 +163,16 @@ def probe(engine, params, spec):
     with engine.YoutubeDL(params) as ydl:
         info = ydl.extract_info(spec["url"], download=False)
     if info.get("_type") == "playlist":
-        entries = [entry(e, spec["ffmpeg"]) for e in info.get("entries") or [] if e]
-        emit(event="info", kind="playlist", title=info.get("title"), entries=entries)
+        found = [(n, entry(e, spec["ffmpeg"])) for n, e in enumerate(info.get("entries") or [], 1) if e]
+        urls = [e["url"] for _, e in found]
+        for n, e in found:  # no link of its own: download it as item n of the probed link
+            if (
+                not str(e["url"]).startswith(("http://", "https://"))
+                or urls.count(e["url"]) > 1
+                or e["url"] == spec["url"]
+            ):
+                e.update(url=spec["url"], item=n)
+        emit(event="info", kind="playlist", title=info.get("title"), entries=[e for _, e in found])
     else:
         emit(event="info", kind="video", title=info.get("title"), entries=[entry(info, spec["ffmpeg"])])
 
@@ -199,15 +215,28 @@ def download(engine, module, params, spec):
             eta=d.get("eta"),
         )
 
+    live = []
+
+    def not_live(info, incomplete=False):
+        """The engines' match_filter: a live stream would record without end, so skip it and say why."""
+        if info.get("is_live") or info.get("live_status") == "is_live":
+            live.append(True)
+            return "Spool does not record live streams"
+        return None
+
     params.update(
+        match_filter=not_live,
         format=selector(spec["preset"], spec["ffmpeg"]),
         outtmpl=TITLE[module] + " [%(id)s]" + CLASS.get(spec["preset"], "") + ".%(ext)s",  # relative to dest
         updatetime=False,  # stamp files with the download time, not the upload time
         progress_hooks=[hook],
-        noplaylist=True,
         retries=10,
         fragment_retries=10,
     )
+    if spec.get("item"):
+        params["playlist_items"] = str(spec["item"])
+    else:
+        params["noplaylist"] = True
     params["postprocessors"] = []
     if spec["preset"] == "mp3":
         params["postprocessors"].append({"key": "FFmpegExtractAudio", "preferredcodec": "mp3"})
@@ -227,6 +256,8 @@ def download(engine, module, params, spec):
         else:
             ydl.add_post_processor(Capture())
         ydl.download([spec["url"]])
+    if live:
+        raise RuntimeError(LIVE)
     path = final.get("path")
     if not path or not os.path.exists(path):
         raise RuntimeError("The engine finished but Spool could not find the file it saved.")
@@ -252,5 +283,8 @@ if __name__ == "__main__":
     try:
         main()
     except BaseException as exc:  # report anything, including the engine's own exits
-        emit(event="error", message=str(exc) or type(exc).__name__)
+        message = str(exc) or type(exc).__name__
+        if Log.no_js:  # the real cause of what failed after the warning
+            message = "No supported JavaScript runtime could be found.\n" + message
+        emit(event="error", message=message)
         sys.exit(1)

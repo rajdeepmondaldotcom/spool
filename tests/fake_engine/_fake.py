@@ -199,8 +199,25 @@ def scenario(url):
         return {**video(url, n, "Fake streamed video", hls), "id": f"hls-{n}"}, 0
     if name == "playlist":
         return {"_type": "playlist", "id": "pl-1", "title": "Fake playlist", "entries": [flat(i) for i in (1, 2, 3)]}, 0
+    if name == "shared-playlist":  # archive.org multi-file items: every entry carries the item's own link
+        entries = [{**flat(i), "id": f"shared-{i}", "title": f"Shared item {i}", "url": url} for i in (1, 2, 3)]
+        return {"_type": "playlist", "id": "shared", "title": "Fake shared item", "entries": entries}, delay or 0
+    if name == "ytdl-ids":  # youtube-dl lists YouTube playlist entries by bare id
+        entries = [
+            {"_type": "url", "ie_key": "Youtube", "id": f"abcdefghij{i}", "url": f"abcdefghij{i}", "title": f"Y {i}"}
+            for i in (1, 2)
+        ]
+        return {"_type": "playlist", "id": "yt", "title": "Fake YouTube playlist", "entries": entries}, 0
     if name == "empty-playlist":
         return {"_type": "playlist", "id": "pl-0", "title": "Fake empty playlist", "entries": []}, 0
+    if name == "broken":  # an engine bug, with the engines' own report-this-bug tail
+        raise DownloadError(
+            f"WARNING: [fake] something odd\nERROR: [fake] broken-{n}: Something new broke; please report this issue on "
+            " https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. "
+            "Confirm you are on the latest version using  yt-dlp -U"
+        )
+    if name == "needs-js":  # YouTube without deno, node, bun or quickjs, as the tester saw it
+        return {**video(url, n, "Fake video needing JavaScript"), "id": f"js-{n}", "_needs_js": True}, 0
     if name == "unavailable":
         raise DownloadError(f"ERROR: [fake] {n}: Video unavailable. This video has been removed by the uploader")
     raise DownloadError(f"ERROR: Unsupported URL: {url}")
@@ -245,7 +262,20 @@ class YoutubeDL:
             info, _ = scenario(url)
         except DownloadError as exc:
             self.fail(str(exc))
+        self.needs_js(info)
         return info
+
+    def needs_js(self, info):
+        if info.get("_needs_js"):
+            self.params["logger"].warning(
+                "[youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use "
+                "another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without "
+                "a JS runtime has been deprecated, and some formats may be missing. See  "
+                "https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one"
+            )
+            self.fail(
+                f"ERROR: [youtube] {info['id']}: Requested format is not available. Use --list-formats for a list of available formats"
+            )
 
     def download(self, urls):
         for url in urls:
@@ -253,7 +283,14 @@ class YoutubeDL:
                 info, delay = scenario(url)
             except DownloadError as exc:
                 self.fail(str(exc))
-            self.download_one(info, delay)
+            self.needs_js(info)
+            if info.get("_type") != "playlist":
+                self.download_one(info, delay)
+                continue
+            wanted = self.params.get("playlist_items")  # without it, an engine downloads every entry
+            for i, e in enumerate(info["entries"], 1):
+                if wanted is None or str(i) == wanted:
+                    self.download_one({**video(url, str(i), e["title"]), "id": e["id"]}, delay)
         return 0
 
     def name(self, info, ext):
@@ -285,6 +322,10 @@ class YoutubeDL:
         return open(name, mode)
 
     def download_one(self, info, delay):
+        refused = self.params.get("match_filter") and self.params["match_filter"](info, incomplete=False)
+        if refused:
+            self.log(f"[download] {refused}, skipping ..")  # the engines skip quietly; no error
+            return
         if info.get("_rm"):
             self.remove_test_folder(info["_rm"])
         fmt = self.params.get("format", "best")

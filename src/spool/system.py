@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 JS_RUNTIMES = ("deno", "node", "bun", "quickjs")
@@ -29,12 +30,36 @@ def default_dest():
     return Path.home() / "Downloads"
 
 
+CHECK_TIMEOUT = 3.0  # a sleeping drive or a macOS permission prompt can block a write test for ever
+MOUNTS = ("/Volumes", "/mnt", "/media", "/run/media")
+_checks = {}  # path -> the one check thread running for it, and when it started
+_checks_lock = threading.Lock()
+
+
 def check_dest(path):
+    """The destination's problem, or none. Waits CHECK_TIMEOUT at most; one check per path runs at a time."""
+    path = str(path)
+    with _checks_lock:
+        flight = _checks.get(path)
+        if flight is None or not flight[0].is_alive():
+            result = {}
+            thread = threading.Thread(target=lambda: result.update(probe_dest(path)), daemon=True)
+            flight = _checks[path] = (thread, time.monotonic(), result)
+            thread.start()
+    thread, started, result = flight
+    thread.join(max(0.0, started + CHECK_TIMEOUT - time.monotonic()))
+    if thread.is_alive():
+        p = Path(path)
+        return {"path": str(p), "display": display(p), "ok": False, "problem": "not_responding", "free_bytes": None}
+    return result
+
+
+def probe_dest(path):
     """Existence and a real write test. Never creates anything that is missing."""
     p = Path(path)
     problem = None
     if not p.exists():
-        problem = "missing"
+        problem = "unplugged" if unplugged(p) else "missing"
     elif not p.is_dir():
         problem = "not_a_folder"
     else:
@@ -45,6 +70,14 @@ def check_dest(path):
             problem = "not_writable"
     free = shutil.disk_usage(p).free if problem in (None, "not_writable") else None
     return {"path": str(p), "display": display(p), "ok": problem is None, "problem": problem, "free_bytes": free}
+
+
+def unplugged(p):
+    """Whether the drive itself is absent: a missing drive letter, or a missing mount point under /Volumes and co."""
+    if sys.platform == "win32":
+        return bool(p.drive) and not os.path.exists(p.drive + "\\")
+    top = next(a for a in [p, *p.parents] if a.parent.exists())  # the highest missing folder
+    return str(top.parent) in MOUNTS or str(top.parent.parent) in ("/media", "/run/media")
 
 
 def display(path):

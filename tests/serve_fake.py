@@ -5,6 +5,9 @@
 Prints the link, with the token in its fragment (#t=fake-token); API calls send it as X-Spool-Token. Links like https://fake.test/video drive every UI state; see fake_engine/_fake.py.
 --fresh starts with no engines installed, so the first-run install is visible (it takes a few seconds).
 --no-ffmpeg hides ffmpeg from PATH.
+--dest-hangs makes every destination check hang, as a sleeping drive does, so the page shows "not_responding".
+Other fake links: /live (fails as "live"), /needs-js (hint "install_js_runtime"), /shared-playlist (entries that
+share one link, downloaded as items), /broken (an engine bug). A /Volumes/<no such drive>/... destination is "unplugged".
 """
 
 import argparse
@@ -95,6 +98,7 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--no-ffmpeg", action="store_true")
+    parser.add_argument("--dest-hangs", action="store_true")
     parser.add_argument("--data-dir", help="reuse a data folder (default: a new temp folder)")
     args = parser.parse_args()
     if args.no_ffmpeg:
@@ -102,6 +106,10 @@ def main():
         os.environ["PATH"] = os.pathsep.join(p for p in paths if not shutil.which("ffmpeg", path=p))
     data = args.data_dir or tempfile.mkdtemp(prefix="spool-fake-")
     httpd, url, jobs, _ = start(data, args.port, args.fresh)
+    if args.dest_hangs:
+        from spool import system
+
+        system.probe_dest = lambda path: threading.Event().wait()  # never answers
     print(f"Data folder: {data}", flush=True)
     print(url, flush=True)
     try:

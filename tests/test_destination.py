@@ -1,6 +1,7 @@
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -26,8 +27,8 @@ def test_settings_change_the_destination_engine_and_preset(app, tmp_path):
     assert body["settings"] == {"dest": str(folder), "engine": "youtube-dl", "preset": "720"}
     assert (body["dest"]["ok"], body["dest"]["problem"]) == (True, None)
     assert body["dest"]["free_bytes"] > 0
-    event, snap = events.next()
-    assert (event, snap["settings"]["dest"]) == ("snapshot", str(folder))
+    snap = events.until(lambda e, d: e == "snapshot" and d["settings"]["dest"] == str(folder))[-1][1]
+    assert snap["dest"]["path"] == str(folder)
     events.close()
 
 
@@ -162,3 +163,83 @@ def test_a_destination_that_vanishes_mid_download_is_named_as_missing(app, tmp_p
     failed = events.until(lambda e, d: e == "job" and d["id"] == job_id and d["state"] == "failed")[-1][1]
     events.close()
     assert (failed["error"]["kind"], failed["error"]["hint"]) == ("dest_missing", "check_dest")
+
+
+# Truer words for a destination problem
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS volumes")
+def test_a_drive_that_is_not_plugged_in_is_unplugged_not_missing(app):
+    status, body = app.json("PUT", "/api/settings", {"dest": "/Volumes/NoSuchDrive/Spool"})
+    assert (status, body["dest"]["problem"]) == (200, "unplugged")
+    status, body = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})
+    assert (status, body["error"]["kind"], body["error"]["hint"]) == (409, "dest_unplugged", "check_dest")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux mount points")
+@pytest.mark.parametrize(
+    "path", ["/media/nobody-here/T7/Spool", "/run/media/nobody-here/T7/Spool", "/mnt/no-such-drive/x"]
+)
+def test_an_absent_mount_point_is_unplugged(path):
+    assert system.check_dest(path)["problem"] == "unplugged"
+
+
+def test_a_missing_folder_on_a_present_drive_is_missing(app, tmp_path):
+    app.json("PUT", "/api/settings", {"dest": str(tmp_path / "gone")})
+    status, body = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})
+    assert (status, body["error"]["kind"]) == (409, "dest_missing")
+
+
+def test_a_file_as_destination_fails_as_not_a_folder(app, tmp_path):
+    (tmp_path / "file").write_text("x")
+    app.json("PUT", "/api/settings", {"dest": str(tmp_path / "file")})
+    status, body = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})
+    assert (status, body["error"]["kind"]) == (409, "dest_not_folder")
+
+
+# A destination check that never answers
+
+
+@pytest.fixture
+def hanging_drive(monkeypatch):
+    """The first write to the drive blocks forever, as a sleeping drive or a macOS permission prompt does."""
+    import threading
+
+    monkeypatch.setattr(system, "CHECK_TIMEOUT", 0.3)
+    release, started, real = threading.Event(), [], system.probe_dest
+
+    def stuck(path):
+        started.append(path)
+        release.wait()
+        return real(path)
+
+    monkeypatch.setattr(system, "probe_dest", stuck)
+    yield started, release
+    release.set()
+
+
+def test_a_destination_that_never_answers_is_not_responding_and_nothing_freezes(app, tmp_path, hanging_drive):
+    folder = tmp_path / "Asleep"
+    folder.mkdir()
+    t = time.time()
+    status, body = app.json("PUT", "/api/settings", {"dest": str(folder)})
+    assert (status, body["dest"]["problem"], body["dest"]["ok"]) == (200, "not_responding", False)
+    events = app.events()  # a new event stream still opens
+    assert events.next()[1]["dest"]["problem"] == "not_responding"
+    events.close()
+    status, body = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})
+    assert (status, body["error"]["kind"]) == (409, "dest_not_responding")
+    assert time.time() - t < 5
+    assert hanging_drive[0].count(str(folder)) == 1  # one stuck check, however often Spool asks
+
+
+def test_a_snapshot_goes_out_when_the_stuck_check_finally_answers(app, tmp_path, hanging_drive):
+    folder = tmp_path / "Asleep"
+    folder.mkdir()
+    app.json("PUT", "/api/settings", {"dest": str(folder)})
+    events = app.events()
+    events.next()
+    hanging_drive[1].set()  # the drive wakes up
+    seen = events.until(lambda e, d: e == "snapshot" and d["dest"]["ok"], timeout=10)
+    events.close()
+    assert seen[-1][1]["dest"]["problem"] is None
