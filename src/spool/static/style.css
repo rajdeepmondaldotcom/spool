@@ -287,7 +287,8 @@ progress:not([value])::-webkit-progress-bar { background: repeating-linear-gradi
 .stack p { font-size: 15px; }
 .folder-row { display: flex; flex-wrap: wrap; gap: var(--s2); }
 .folder-row input { flex: 1 1 14em; }
-.tools { font-size: 15px; }
+.tools, .helper { font-size: 15px; }
+.helper { margin-top: var(--s1); }
 .dialog-actions { display: flex; justify-content: flex-end; margin-top: var(--s5); }
 
 @media (max-width: 600px) {

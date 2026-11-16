@@ -268,10 +268,10 @@ function Deck({ snap, say, whenUpdated, field, openSettings, turning }) {
 function EngineInstall({ engine, name }) {
   if (engine.error && !engine.busy) return html`
     <div id="link-help" class="deck-message" role="alert">
-      <p><${Icon} d=${ICONS.alert} />${engine.error}</p>
+      <p><${Icon} d=${ICONS.alert} />${f.plain(engine.error)}</p>
       <button class="secondary on-deck" onClick=${() => api.updateEngine(name).catch(() => {})}>Try again</button>
     </div>`;
-  return html`<p id="link-help" class="help" role="status">Getting ${name}. This takes a few seconds.</p>`;
+  return html`<p id="link-help" class="help" role="status">Setting up Spool. This takes a few seconds.</p>`;
 }
 
 function ProbeError({ error, look, snap, whenUpdated, lookUp }) {
@@ -279,14 +279,15 @@ function ProbeError({ error, look, snap, whenUpdated, lookUp }) {
   const [message, fix, other] = f.failure(error, { engine: look.engine, dest: snap.settings.dest, newer: newerEngine(snap, look.engine), probe: true });
   const busy = snap.engines[look.engine]?.busy;
   const button = {
-    update_engine: [busy ? "Updating…" : "Update engine and retry", () => whenUpdated(look.engine, () => lookUp(look.url, look.engine))],
-    try_other_engine: [`Try with ${other}`, () => lookUp(look.url, other)],
+    update_engine: [busy ? "Updating…" : "Update and retry", () => whenUpdated(look.engine, () => lookUp(look.url, look.engine))],
+    try_other_engine: [f.tryOther(other), () => lookUp(look.url, other)],
     retry: ["Retry", () => lookUp(look.url, look.engine)],
   }[fix];
   return html`
     <div id="link-error" class="deck-message" role="alert">
       <p><${Icon} d=${ICONS.alert} />${message}</p>
       ${button && html`<button class="secondary on-deck" disabled=${!!busy} onClick=${button[1]}>${button[0]}</button>`}
+      ${fix === "install_js_runtime" && html`<${CopyCommand} command=${f.installCommand("deno", snap.tools.platform)} label="Copy install command" cls="secondary on-deck" />`}
     </div>`;
 }
 
@@ -367,9 +368,9 @@ function Tray({ data, preset, setPreset, picked, setPicked, dest, busy, error, d
 
 function FfmpegStrip({ snap }) {
   return html`
-    <aside class="strip" aria-label="ffmpeg">
+    <aside class="strip" aria-label="Missing tool">
       <div class="measure">
-        <p><${Icon} d=${ICONS.alert} />ffmpeg isn't installed, so only lower qualities are available.</p>
+        <p><${Icon} d=${ICONS.alert} />Higher qualities need one more tool, ffmpeg.</p>
         <${CopyCommand} command=${f.installCommand("ffmpeg", snap.tools.platform)} />
       </div>
     </aside>`;
@@ -486,8 +487,8 @@ function Row({ job, snap, say, whenUpdated, openSettings }) {
     try { setLogText(await api.log(job.id)); } catch (e) { say(e.message); }
   };
   const fixButton = {
-    update_engine: ["Update engine and retry", () => whenUpdated(job.engine, () => act(() => api.retry(job.id)))],
-    try_other_engine: [`Try with ${other || f.otherEngine(job.engine)}`, () => act(() => api.retry(job.id, other || f.otherEngine(job.engine)))],
+    update_engine: ["Update and retry", () => whenUpdated(job.engine, () => act(() => api.retry(job.id)))],
+    try_other_engine: [f.tryOther(other), () => act(() => api.retry(job.id, other))],
     check_dest: ["Change folder", () => openSettings(true)],
   }[fix];
   const copyFix = { install_ffmpeg: "ffmpeg", install_js_runtime: "deno" }[fix];
@@ -505,7 +506,7 @@ function Row({ job, snap, say, whenUpdated, openSettings }) {
             ${logText != null ? "Hide log" : "Show log"}</button>`}
           ${remove}
         </div>
-        ${logText != null && html`<pre class="log" id="log-${job.id}" tabindex="0" role="region" aria-label="Engine log">${logText || "The log is empty."}</pre>`}
+        ${logText != null && html`<pre class="log" id="log-${job.id}" tabindex="0" role="region" aria-label="Download log">${logText || "The log is empty."}</pre>`}
       </div>
     </li>`;
 }
@@ -515,23 +516,22 @@ function StatusBar({ snap, connected, openSettings }) {
   return html`
     <footer class="status">
       <div class="status-inner">
-        <span class="engine"><strong>${name}</strong> <span class="num">${snap.engines[name].version || ""}</span></span>
-        <span class="extra"><${EngineUpdate} name=${name} engine=${snap.engines[name]} /></span>
-        <span class="extra">${snap.tools.ffmpeg ? "ffmpeg found" : "ffmpeg missing"}</span>
+        <span><${EngineUpdate} name=${name} engine=${snap.engines[name]} bar=${true} /></span>
         ${!connected && html`<span class="reconnecting" role="status">Reconnecting…</span>`}
         <button class="link-button settings-button" onClick=${() => openSettings(false)}>Settings</button>
       </div>
     </footer>`;
 }
 
-function EngineUpdate({ name, engine }) {
-  if (engine.busy === "updating") return html`<span>Updating…</span>`;
-  if (engine.busy === "installing") return html`<span>Installing…</span>`;
+// The update control for one engine: in the status bar for the engine in use, and in Settings for each.
+function EngineUpdate({ name, engine, bar = false }) {
   const update = () => api.updateEngine(name).catch(() => {});
-  if (engine.error) return html`<span class="danger-text" title=${engine.error}>${engine.installed ? "Update failed" : "Install failed"}</span>
-    <button class="link-button" onClick=${update}>Try again</button>`;
-  if (!engine.installed) return html`<button class="link-button" onClick=${update}>Install<span class="visually-hidden"> ${name}</span></button>`;
-  if (engine.latest && engine.latest !== engine.version) return html`<button class="link-button" onClick=${update}>Update to ${engine.latest}<span class="visually-hidden"> for ${name}</span></button>`;
+  const which = html`<span class="visually-hidden"> ${f.engineName(name)} engine</span>`;
+  if (engine.busy === "updating") return html`<span>Updating…</span>`;
+  if (engine.busy === "installing" || (!engine.installed && !engine.error)) return html`<span>Setting up…</span>`;
+  if (engine.error) return html`<span class="danger-text">${engine.installed ? "Update failed" : "Setup failed"}</span>
+    <button class="link-button" onClick=${update}>Try again${!bar && which}</button>`;
+  if (engine.latest && engine.latest !== engine.version) return html`<button class="link-button" onClick=${update}>${bar ? "Update available" : html`Update${which}`}</button>`;
   return html`<span>${engine.latest ? "Up to date" : ""}</span>`;
 }
 
@@ -556,6 +556,7 @@ function SettingsDialog({ snap, handle }) {
   };
   const onSubmit = (e) => { e.preventDefault(); save({ dest: draft.trim() }); };
   const presets = PRESETS.filter((p) => p !== "mp3" || snap.tools.ffmpeg);
+  const missing = [!snap.tools.ffmpeg && "ffmpeg", !snap.tools.js_runtime && "deno"].filter(Boolean);
 
   return html`
     <dialog class="settings" ref=${dialog} aria-labelledby="settings-title">
@@ -566,9 +567,10 @@ function SettingsDialog({ snap, handle }) {
           <div class="engine-choice" key=${name}>
             <label><input type="radio" name="engine" value=${name} checked=${snap.settings.engine === name}
               disabled=${!e.installed} onChange=${() => save({ engine: name })} />
-              <strong>${name}</strong> <span class="dim num">${e.version || "Not installed"}</span></label>
+              <strong>${f.engineName(name)}</strong> <span class="dim num">${e.version || ""}</span></label>
             <span class="dim"><${EngineUpdate} name=${name} engine=${e} /></span>
           </div>`)}
+        <p class="dim helper">If a link fails on one, the other may work.</p>
       </fieldset>
       <label class="stack">Default quality
         <select value=${snap.settings.preset} onChange=${(e) => save({ preset: e.target.value })}>
@@ -586,8 +588,7 @@ function SettingsDialog({ snap, handle }) {
         <p id="folder-state" class=${snap.dest.ok && !error ? "dim" : "danger-text"} role="status" title=${snap.dest.path}>
           ${error || (snap.dest.ok ? `${snap.dest.display}, ${f.bytes(snap.dest.free_bytes)} free` : f.destProblem(snap.dest))}</p>
       </form>
-      <p class="tools dim">${snap.tools.ffmpeg ? "ffmpeg found" : "ffmpeg missing"}.
-        ${snap.tools.js_runtime ? ` JavaScript runtime: ${snap.tools.js_runtime}.` : " No JavaScript runtime found."}</p>
+      ${missing.length > 0 && html`<p class="tools dim">Missing tools: ${missing.join(", ")}.</p>`}
       <div class="dialog-actions"><button class="primary" onClick=${() => dialog.current.close()}>Done</button></div>
     </dialog>`;
 }

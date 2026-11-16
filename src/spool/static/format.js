@@ -46,29 +46,36 @@ export function percent(job) {
 
 export const otherEngine = (name) => (name === "yt-dlp" ? "youtube-dl" : "yt-dlp");
 
+// The engine ids stay in the API; people see only these names, and only where they choose between them.
+export const ENGINE_NAMES = { "yt-dlp": "Main", "youtube-dl": "Backup" };
+export const engineName = (id) => ENGINE_NAMES[id] || "Main";
+export const tryOther = (other) => (other === "youtube-dl" ? "Try the backup engine" : "Try the main engine");
+// Server and engine messages can name the program underneath; the page never does.
+export const plain = (text = "") => text.replace(/\b(yt[-_]dlp|youtube[-_]dl)\b/gi, "the engine");
+
 // Failure wording by error kind (design brief, "Words"). Returns the message and the fix button, if any.
 // `newer`: a newer engine exists, so updating is worth offering. `probe`: a probe has no log to point at.
 export function failure(error, { engine, dest, newer = false, probe = false }) {
   const other = otherEngine(engine);
-  if (error.hint === "install_js_runtime") return ["YouTube needs a JavaScript runtime with yt-dlp. Install deno, node or bun.", "install_js_runtime"];
+  if (error.hint === "install_js_runtime") return ["YouTube needs one more tool, deno.", "install_js_runtime"];
   switch (error.kind) {
     case "blocked": return ["The site refused this download. It often works on a second try.", newer ? "update_engine" : "retry"];
     case "live": return ["This is live now. Download it after it ends.", null];
     case "unavailable": return ["This video is private, removed, or needs a sign-in. Spool can't download it.", null];
-    case "unsupported": return [`${engine} can't read this link.`, "try_other_engine", other];
-    case "empty": return [`${engine} found nothing at this link.`, "try_other_engine", other];
+    case "unsupported": return ["Spool can't read this link.", "try_other_engine", other];
+    case "empty": return ["Nothing was found at this link.", "try_other_engine", other];
     case "network": return ["Couldn't reach the site. Check your connection.", "retry"];
     case "dest_unplugged": return [`${drive(dest)} isn't connected. Plug it in, or choose another folder.`, "check_dest"];
     case "dest_missing": return [`${folderName(dest)} doesn't exist. Choose another folder.`, "check_dest"];
     case "dest_not_folder": return [`${dest} is a file, not a folder.`, "check_dest"];
     case "dest_full": return [`${drive(dest)} is full. Free some space, or choose another folder.`, "check_dest"];
     case "dest_denied": return [`Spool isn't allowed to write to ${folderName(dest)}.`, "check_dest"];
-    case "no_ffmpeg": return ["This quality needs ffmpeg to join video and sound.", "install_ffmpeg"];
+    case "no_ffmpeg": return ["This quality needs ffmpeg to join picture and sound.", "install_ffmpeg"];
     case "interrupted": return ["Spool was closed before this finished.", "resume"];
     case "invalid_link": return ["That isn't a link Spool can use. Paste a link that starts with http or https.", null];
-    case "engine_not_ready": return [`${engine} isn't ready yet. Wait for it to finish installing.`, null];
-    case "engine": return probe ? [error.message || "The engine stopped with an error.", "retry"] : ["The engine stopped with an error. The log has the details.", "show_log"];
-    default: return [error.message || "Something went wrong.", "retry"];
+    case "engine_not_ready": return ["Spool is still setting up. Try again in a few seconds.", null];
+    case "engine": return probe ? [plain(error.message) || "Spool couldn't read this link.", "retry"] : ["The download stopped with an error. The log has the details.", "show_log"];
+    default: return [plain(error.message) || "Something went wrong.", "retry"];
   }
 }
 

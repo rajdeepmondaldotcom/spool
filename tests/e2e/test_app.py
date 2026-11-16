@@ -1,6 +1,7 @@
 """The main flows a person uses, through the real server and the fake engine."""
 
 import re
+import threading
 
 import pytest
 import serve_fake  # on the path through conftest
@@ -58,7 +59,7 @@ def test_a_refused_download_offers_the_engine_update_when_one_exists(app):
     expect(stopped.get_by_text("The site refused this download. It often works on a second try.")).to_be_visible(
         timeout=15000
     )
-    expect(stopped.get_by_role("button", name="Update engine and retry")).to_have_class("fill")
+    expect(stopped.get_by_role("button", name="Update and retry")).to_have_class("fill")
     expect(stopped.get_by_role("button", name="Retry", exact=True)).to_have_class("secondary")
     expect(stopped.get_by_role("button", name="Show log")).to_be_visible()
 
@@ -72,17 +73,17 @@ def test_a_refused_download_with_the_latest_engine_offers_retry(app, spool):
 
     stopped = app.get_by_role("region", name="Stopped")
     expect(stopped.get_by_role("button", name="Retry", exact=True)).to_have_class("fill", timeout=15000)
-    expect(stopped.get_by_role("button", name="Update engine and retry")).to_have_count(0)
+    expect(stopped.get_by_role("button", name="Update and retry")).to_have_count(0)
 
 
-def test_a_link_the_engine_cannot_read_offers_the_other_engine(app):
+def test_a_link_the_engine_cannot_read_offers_the_backup_engine(app):
     look_up(app, "https://fake.test/unsupported")
     error = app.get_by_role("alert")
-    expect(error).to_contain_text("yt-dlp can't read this link.")
-    expect(error.get_by_role("button", name="Try with youtube-dl")).to_be_visible()
+    expect(error).to_contain_text("Spool can't read this link.")
+    expect(error.get_by_role("button", name="Try the backup engine")).to_be_visible()
     field = app.get_by_label("Link to download")
     expect(field).to_have_attribute("aria-invalid", "true")
-    expect(field).to_have_accessible_description(re.compile("yt-dlp can't read this link."))
+    expect(field).to_have_accessible_description(re.compile("Spool can't read this link."))
 
 
 def test_a_live_stream_cannot_be_downloaded_yet(app):
@@ -177,7 +178,7 @@ def test_show_log_then_remove_a_failed_download(app):
     app.get_by_role("region", name="Fake refused video").get_by_role("button", name="Download").click()
     stopped = app.get_by_role("region", name="Stopped")
     stopped.get_by_role("button", name="Show log").click(timeout=15000)
-    expect(stopped.get_by_label("Engine log")).to_contain_text("403")
+    expect(stopped.get_by_label("Download log")).to_contain_text("403")
     stopped.get_by_role("button", name="Remove").click()
     expect(app.get_by_text("Nothing here yet. Paste a link above.")).to_be_visible()
 
@@ -195,9 +196,8 @@ def test_remove_a_finished_download_from_its_menu(app):
 
 def test_update_the_engine_from_the_status_bar(app):
     status = app.get_by_role("contentinfo")
-    status.get_by_role("button", name="Update to 2026.02.01 for yt-dlp").click()
+    status.get_by_role("button", name="Update available").click()
     expect(status.get_by_text("Up to date")).to_be_visible(timeout=15000)
-    expect(status.get_by_text("2026.02.01")).to_be_visible()
 
 
 def test_the_status_bar_says_when_the_event_stream_drops(app, spool):
@@ -247,7 +247,7 @@ def test_a_failed_row_fills_only_its_suggested_fix(app):
     look_up(app, "https://fake.test/403")
     app.get_by_role("region", name="Fake refused video").get_by_role("button", name="Download").click()
     stopped = app.get_by_role("region", name="Stopped")
-    fix = stopped.get_by_role("button", name="Update engine and retry")
+    fix = stopped.get_by_role("button", name="Update and retry")
     expect(fix).to_have_class("fill", timeout=15000)  # a newer engine exists in the fake
     expect(stopped.get_by_role("button", name="Retry", exact=True)).to_have_class("secondary")
     expect(stopped.get_by_role("button", name="Show log")).to_have_class("quiet")
@@ -274,22 +274,19 @@ def test_a_download_bigger_than_the_free_space_is_flagged(app):
 
 def test_ticking_one_entry_of_a_shared_link_item_leaves_the_others(app):
     # A multi-file item: every entry shares one link and differs only by its position.
-    def shared(route):
-        data = route.fetch().json()
-        for n, entry in enumerate(data["entries"], 1):
-            entry.update(url="https://fake.test/playlist", item=n)
-        route.fulfill(json=data)
-
-    app.route("**/api/probe", shared)
-    look_up(app, "https://fake.test/playlist")
-    tray = app.get_by_role("region", name="Fake playlist")
-    tray.get_by_role("checkbox", name=re.compile("Fake video 2")).uncheck()
-    expect(tray.get_by_text("2 of 3 selected")).to_be_visible()
-    expect(tray.get_by_role("checkbox", name=re.compile("Fake video 1"))).to_be_checked()
+    look_up(app, "https://fake.test/shared-playlist")
+    tray = app.get_by_role("region").filter(has=app.get_by_role("checkbox")).first
+    boxes = tray.get_by_role("checkbox")
+    expect(boxes.first).to_be_checked()
+    total = boxes.count()
+    boxes.nth(1).uncheck()
+    expect(tray.get_by_text(f"{total - 1} of {total} selected")).to_be_visible()
+    expect(boxes.first).to_be_checked()
 
     with app.expect_request("**/api/jobs") as sent:
-        tray.get_by_role("button", name="Download 2").click()
-    assert [e["item"] for e in sent.value.post_data_json["entries"]] == [1, 3]
+        tray.get_by_role("button", name=f"Download {total - 1}").click()
+    items = [e["item"] for e in sent.value.post_data_json["entries"]]
+    assert items == [n for n in range(1, total + 1) if n != 2]
 
 
 def test_a_probe_engine_error_shows_the_engines_own_words(app):
@@ -342,3 +339,83 @@ def test_a_tab_reconnects_after_spool_restarts(page, tmp_path):
         httpd.shutdown()
         httpd.server_close()
         jobs.close()
+
+
+NAMES = re.compile(r"yt[-_]dlp|youtube[-_]dl", re.I)
+
+
+def assert_no_engine_names(page, state):
+    shown = page.locator("body").inner_text() + page.locator("body").aria_snapshot()
+    shown += " ".join(
+        page.eval_on_selector_all(
+            "[title], [aria-label]", "els => els.map(e => e.title + ' ' + (e.getAttribute('aria-label') || ''))"
+        )
+    )
+    assert not NAMES.search(shown), f"{state}: {NAMES.search(shown).group()} is on the page"
+
+
+def test_the_page_never_names_the_programs_underneath(app):
+    assert_no_engine_names(app, "idle")
+    look_up(app, "https://fake.test/slow?delay=1")
+    expect(app.get_by_role("region", name="Fake slow video")).to_be_visible()
+    assert_no_engine_names(app, "preview")
+    app.get_by_role("region", name="Fake slow video").get_by_role("button", name="Download").click()
+    expect(app.get_by_role("progressbar")).to_be_visible(timeout=10000)
+    assert_no_engine_names(app, "running")
+    look_up(app, "https://fake.test/403")
+    app.get_by_role("region", name="Fake refused video").get_by_role("button", name="Download").click()
+    expect(app.get_by_role("region", name="Stopped")).to_be_visible(timeout=15000)
+    assert_no_engine_names(app, "failed")
+    look_up(app, "https://fake.test/unsupported")
+    expect(app.get_by_role("button", name="Try the backup engine")).to_be_visible()
+    assert_no_engine_names(app, "probe failed")
+    app.get_by_role("button", name="Settings").click()
+    dialog = app.get_by_role("dialog", name="Settings")
+    expect(dialog.get_by_role("radio", name=re.compile("^Main"))).to_be_checked()
+    expect(dialog.get_by_role("radio", name=re.compile("^Backup"))).to_be_visible()
+    expect(dialog.get_by_text("If a link fails on one, the other may work.")).to_be_visible()
+    assert_no_engine_names(app, "settings")
+
+
+def test_a_queued_live_stream_says_to_wait_and_offers_only_remove(app, spool):
+    spool[1].add([{"url": "https://fake.test/live", "title": "Fake live stream"}], "best")
+    stopped = app.get_by_role("region", name="Stopped")
+    expect(stopped.get_by_text("This is live now. Download it after it ends.")).to_be_visible(timeout=15000)
+    expect(stopped.get_by_role("button")).to_have_count(1)
+    expect(stopped.get_by_role("button", name="Remove")).to_be_visible()
+
+
+def test_a_link_that_needs_a_javascript_tool_offers_its_install_command(app, spool):
+    look_up(app, "https://fake.test/needs-js")
+    error = app.get_by_role("alert").filter(has_text="YouTube needs one more tool, deno.")
+    expect(error.get_by_role("button", name="Copy install command")).to_be_visible()
+
+    spool[1].add([{"url": "https://fake.test/needs-js", "title": "Fake video needing deno"}], "best")
+    stopped = app.get_by_role("region", name="Stopped")
+    expect(stopped.get_by_text("YouTube needs one more tool, deno.")).to_be_visible(timeout=15000)
+    expect(stopped.get_by_role("button", name="Copy install command")).to_have_class("fill")
+
+
+def test_an_unplugged_drive_says_to_plug_it_in(app, spool):
+    spool[1].update_settings({"dest": "/Volumes/NoSuchDrive/Spool"})
+    expect(
+        app.get_by_role("alert").filter(has_text="NoSuchDrive isn't connected. Plug it in, or choose another folder.")
+    ).to_be_visible()
+
+
+def test_a_drive_that_does_not_answer_blocks_download(app, monkeypatch):
+    from spool import system
+
+    release = threading.Event()
+    real = system.probe_dest
+    monkeypatch.setattr(system, "probe_dest", lambda path: (release.wait(), real(path))[1])  # asleep until released
+    try:
+        problem = app.get_by_role("alert").filter(
+            has_text="isn't answering. If macOS is asking whether Spool may use it"
+        )
+        expect(problem).to_be_visible(timeout=15000)
+        expect(problem.get_by_role("button", name="Try again")).to_be_visible()
+        look_up(app, VIDEO)
+        expect(app.get_by_role("region", name="Fake video 1").get_by_role("button", name="Download")).to_be_disabled()
+    finally:
+        release.set()

@@ -1,3 +1,5 @@
+import { plain } from "./format.js";
+
 // The HTTP contract (contract.md). Every call resolves to the parsed body or throws an Error with `kind`.
 
 // The launch link carries the token in its fragment (/#t=<token>), which never reaches a server or a Referer.
@@ -34,7 +36,7 @@ async function call(method, path, body) {
   const data = json ? await res.json() : await res.text();
   if (!res.ok) {
     const e = data?.error || {};
-    throw Object.assign(new Error(e.message || `Request failed (${res.status})`), { kind: e.kind, status: res.status });
+    throw Object.assign(new Error(plain(e.message) || `Request failed (${res.status})`), { kind: e.kind, hint: e.hint, status: res.status });
   }
   return data;
 }
