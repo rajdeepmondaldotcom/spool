@@ -154,7 +154,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(201, {"jobs": jobs, "existing": existing})
 
     def clear(self):
-        self.server.jobs.clear(self.body().get("state"))
+        self.server.jobs.clear(self.body().get("ids"))  # the rows the page showed, not whatever is done now
         self.send_bytes(204, b"", "application/json")
 
     def reveal_dest(self):
