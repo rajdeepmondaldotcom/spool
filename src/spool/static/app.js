@@ -36,6 +36,7 @@ function App() {
   const [connected, setConnected] = useState(true);
   const [said, setSaid] = useState("");
   const [signedOut, setSignedOut] = useState(false);
+  const [stopped, setStopped] = useState(false); // the person quit Spool from Settings
   const [away, setAway] = useState(new Set()); // rows taken off the screen; the server call waits for Undo's time
   const [undo, setUndo] = useState(null);
   const [flash, setFlash] = useState(new Set());
@@ -175,6 +176,11 @@ function App() {
       : running.length ? `${pct}% - Spool` : unseen ? "Finished - Spool" : "Spool";
   });
 
+  if (stopped) return html`
+    <main class="signed-out measure">
+      <h1 class="wordmark"><${Reel} />Spool</h1>
+      <p>Spool has stopped. To start it again, run <code>spool</code> in your terminal. It opens a new tab.</p>
+    </main>`;
   // A tab whose token Spool does not know (another machine's link, or a token that changed) can do nothing.
   if (signedOut) return html`
     <main class="signed-out measure">
@@ -221,7 +227,7 @@ function App() {
         <span>${undo.words}</span>
         <button class="link-button" ref=${undoButton} onClick=${putBack}>Undo</button>
       </div>`}
-    <${SettingsDialog} snap=${snap} handle=${settings} notify=${notify} running=${running.length} />
+    <${SettingsDialog} snap=${snap} handle=${settings} notify=${notify} running=${running.length} quitted=${() => setStopped(true)} />
     <div class="visually-hidden" role="status" aria-live="polite">${said}</div>`;
 }
 
@@ -727,7 +733,7 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
 }
 
 // handle.current.open(focusFolder) lets "Change folder" land on the folder field.
-function SettingsDialog({ snap, handle, notify, running }) {
+function SettingsDialog({ snap, handle, notify, running, quitted }) {
   const dialog = useRef(), folder = useRef();
   const [quitting, setQuitting] = useState(null); // null, "asking", or the sentence for why Spool did not quit
   const [draft, setDraft] = useState("");
@@ -756,8 +762,7 @@ function SettingsDialog({ snap, handle, notify, running }) {
   // A new tab with no way back to the site: a named window never matches from another site, and the handle
   // window.open returns would let that site navigate Spool's tab.
   const bookmark = `javascript:void(window.open(${JSON.stringify(`${location.origin}/#url=`)}+encodeURIComponent(location.href),"_blank","noopener"))`;
-  // After a quit the page shows what it shows for any Spool that stopped.
-  const quit = () => api.quit().then(() => dialog.current.close()).catch((e) => setQuitting(e.message));
+  const quit = () => api.quit().then(() => { dialog.current.close(); quitted(); }).catch((e) => setQuitting(e.message));
   // The question takes the Quit button's place, so focus moves to it and back.
   useLayoutEffect(() => {
     if (dialog.current.open) dialog.current.querySelector(quitting === "asking" ? ".quit-ask button" : ".quit")?.focus();

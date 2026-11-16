@@ -1342,3 +1342,21 @@ def test_a_finished_row_from_an_older_server_has_no_open(app):
     finished = group(app, "Finished")
     finished.get_by_role("button", name="More actions for Fake video 1").click(timeout=15000)
     expect(finished.locator(".menu").get_by_role("button")).to_have_text(["Download again", "Remove from list"])
+
+
+def test_after_quit_the_tab_says_spool_stopped_and_how_to_start_it(app, spool):
+    newer_server(app, spool)
+    add(spool, [("https://fake.test/slow?delay=60", "Fake slow video")])
+    expect(group(app, "Downloading").get_by_role("progressbar")).to_be_visible(timeout=10000)
+    app.get_by_role("button", name="Settings", exact=True).click()
+    dialog = app.get_by_role("dialog", name="Settings")
+    dialog.get_by_role("button", name="Quit Spool").click()
+    dialog.get_by_role("button", name="Quit now").click()
+    expect(
+        app.get_by_text("Spool has stopped. To start it again, run spool in your terminal. It opens a new tab.")
+    ).to_be_visible()
+    spool[1].close()  # the stream ends, as it does when Spool stops
+    app.wait_for_timeout(500)
+    expect(app.get_by_text("Reconnecting…")).to_have_count(0)
+    expect(app.get_by_label("Link to download")).to_have_count(0)
+    expect(app.get_by_role("button")).to_have_count(0)
