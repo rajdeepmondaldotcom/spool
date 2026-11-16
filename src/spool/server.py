@@ -77,14 +77,20 @@ class Handler(BaseHTTPRequestHandler):
         if method != "GET":
             if self.headers.get("Origin") != f"http://{self.headers['Host']}":  # other websites
                 raise Problem(403, "forbidden", "Spool only takes changes from its own page.")
-            length = int(self.headers.get("Content-Length") or 0)
+            length = self.length()
             if length and self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
                 raise Problem(415, "bad_request", "Spool only takes JSON.")
             if length > MAX_BODY:
                 raise Problem(413, "bad_request", "That request is too large.")
 
+    def length(self):
+        value = self.headers.get("Content-Length") or "0"
+        if not re.fullmatch(r"[0-9]{1,12}", value):
+            raise Problem(400, "bad_request", "Spool could not read that request.")
+        return int(value)
+
     def body(self):
-        length = int(self.headers.get("Content-Length") or 0)
+        length = self.length()
         try:
             data = json.loads(self.rfile.read(length)) if length else {}
         except ValueError:

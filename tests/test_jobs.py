@@ -457,10 +457,11 @@ def test_a_malformed_job_record_is_skipped(tmp_path):
     good = new_job({"url": "https://fake.test/video", "title": "Good"}, "best", "yt-dlp", str(tmp_path))
     good["state"] = "done"
     missing_key = {k: v for k, v in good.items() if k != "state"}
-    state = {"settings": {"dest": str(tmp_path)}, "jobs": [good, missing_key, "junk", None]}
+    state = {"settings": {"dest": 7, "engine": ["x"], "preset": {}}, "jobs": [good, missing_key, "junk", None]}
     (tmp_path / "state.json").write_text(json.dumps(state))
     jobs = Jobs(tmp_path, Engines(tmp_path / "engines"))
     try:
         assert [j["title"] for j in jobs.snapshot()["jobs"]] == ["Good"]
+        assert jobs.settings["engine"] == "yt-dlp" and isinstance(jobs.settings["dest"], str)
     finally:
         jobs.close()

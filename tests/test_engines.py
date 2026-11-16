@@ -176,3 +176,14 @@ def test_writes_at_the_same_instant_never_collide(tmp_path):
         t.join()
     assert errors == []
     assert [p.name for p in tmp_path.iterdir()] == ["state.json"]
+
+
+def test_older_engine_files_are_deleted_at_startup(tmp_path):
+    install_fake_engines(tmp_path)
+    folder = tmp_path / "engines" / "yt-dlp"
+    (folder / "2025.01.01").write_bytes(b"old engine")
+    (folder / "current.abc123.tmp").write_bytes(b"cut short")
+    engines = Engines(tmp_path / "engines", fetch=FakeGitHub().fetch, resolve=FakeGitHub().resolve)
+    engines.start()
+    assert sorted(p.name for p in folder.iterdir()) == [INSTALLED, "current"]
+    settle(engines)

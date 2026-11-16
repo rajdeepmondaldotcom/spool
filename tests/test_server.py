@@ -180,3 +180,27 @@ def test_two_jobs_run_at_once_and_the_third_waits(app):
     states = {j["title"]: j["state"] for j in app.jobs.snapshot()["jobs"]}
     assert states == {"Slow 1": "running", "Slow 2": "running", "Slow 3": "queued"}
     events.close()
+
+
+def test_a_long_link_is_accepted_and_a_too_long_one_says_so(app):
+    long = "https://fake.test/video?x=" + "a" * 5000
+    assert app.json("POST", "/api/probe", {"url": long})[0] == 200
+    status, body = app.json("POST", "/api/probe", {"url": long + "a" * 10_000})
+    assert (status, body["error"]["kind"]) == (422, "invalid_link")
+    assert "too long" in body["error"]["message"]
+
+
+def test_a_bad_content_length_is_400(app):
+    for length in ("abc", "-5", "1e3"):
+        headers = {"Host": host(app), "Origin": f"http://{host(app)}", "Content-Type": "application/json", **TOKEN}
+        status, _, body = raw(app, "POST", "/api/probe", {**headers, "Content-Length": length})
+        assert status == 400, length
+        assert json.loads(body)["error"]["kind"] == "bad_request"
+
+
+def test_settings_of_the_wrong_type_are_422(app):
+    for body in ({"engine": ["yt-dlp"]}, {"preset": {"a": 1}}, {"dest": None}, {"engine": None}):
+        status, reply = app.json("PUT", "/api/settings", body)
+        assert status == 422, body
+        assert reply["error"]["kind"].startswith("invalid_")
+    assert app.json("POST", "/api/probe", {"url": "https://fake.test/video", "engine": ["x"]})[0] == 422

@@ -18,6 +18,7 @@ from .engines import RELEASES, write_atomic
 WORKER = Path(__file__).with_name("worker.py")
 PRESETS = ("best", "2160", "1440", "1080", "720", "480", "360", "240", "audio", "mp3")
 AT_ONCE = 2
+LINK_LIMIT = 8192  # signed CDN links run to a few thousand characters
 RETRY_AFTER = 3  # seconds before the one automatic retry of a download refused before any bytes
 TICK = 0.25  # job progress goes out at most once a tick: four a second
 
@@ -37,8 +38,11 @@ class Jobs:
         self.logs.mkdir(exist_ok=True)
         saved = self._load()
         self.settings = {"dest": str(system.default_dest()), "engine": "yt-dlp", "preset": "best"}
-        valid = {"dest": lambda v: isinstance(v, str) and os.path.isabs(v), "engine": RELEASES.__contains__}
-        valid["preset"] = PRESETS.__contains__
+        valid = {
+            "dest": lambda v: isinstance(v, str) and os.path.isabs(v),
+            "engine": lambda v: isinstance(v, str) and v in RELEASES,
+            "preset": lambda v: isinstance(v, str) and v in PRESETS,
+        }
         self.settings.update({k: v for k, v in saved.get("settings", {}).items() if k in valid and valid[k](v)})
         keys = set(new_job({"url": "https://x.test"}, "best", "yt-dlp", "/")) - {"files", "item"}  # added later
         self.jobs = [  # newest first; a malformed record is dropped, not fatal
@@ -233,9 +237,9 @@ class Jobs:
             if not os.path.isabs(dest):
                 raise Problem(422, "invalid_dest", "The destination must be a full folder path.")
             changes["dest"] = os.path.normpath(dest)
-        if "engine" in changes and changes["engine"] not in RELEASES:
+        if "engine" in changes and not (isinstance(changes["engine"], str) and changes["engine"] in RELEASES):
             raise Problem(422, "invalid_engine", "That engine is not one Spool knows.")
-        if "preset" in changes and changes["preset"] not in PRESETS:
+        if "preset" in changes and not (isinstance(changes["preset"], str) and changes["preset"] in PRESETS):
             raise Problem(422, "invalid_preset", "That quality is not one Spool knows.")
         with self.lock:
             self.settings.update(changes)
@@ -262,7 +266,7 @@ class Jobs:
 
     def _engine(self, engine):
         engine = engine or self.settings["engine"]
-        if engine not in RELEASES:
+        if not (isinstance(engine, str) and engine in RELEASES):
             raise Problem(422, "invalid_engine", "That engine is not one Spool knows.")
         if not self.engines.path(engine):
             raise Problem(503, "engine_not_ready", f"{engine} is not installed yet.")
@@ -482,7 +486,11 @@ def parse(line):
 
 def link(url):
     """A link must be http or https with a host; it reaches the engine as data only."""
-    parts = urlsplit(url) if isinstance(url, str) and len(url) <= 4096 else None
+    if isinstance(url, str) and len(url) > LINK_LIMIT:
+        raise Problem(
+            422, "invalid_link", f"That link is too long. Spool takes links of up to {LINK_LIMIT:,} characters."
+        )
+    parts = urlsplit(url) if isinstance(url, str) else None
     if not parts or parts.scheme not in ("http", "https") or not parts.hostname or any(c.isspace() for c in url):
         raise Problem(422, "invalid_link", "That is not a link Spool can use. Links start with http:// or https://.")
     return url

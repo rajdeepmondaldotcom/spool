@@ -111,7 +111,10 @@ def choose_folder():
     if sys.platform != "darwin":
         raise NotImplementedError
     script = 'POSIX path of (choose folder with prompt "Choose where Spool saves downloads")'
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, check=False)
+    # without activating first, the dialog can open behind the browser
+    result = subprocess.run(
+        ["osascript", "-e", "tell me to activate", "-e", script], capture_output=True, text=True, check=False
+    )
     if result.returncode != 0:
         return None  # the user pressed Cancel (error -128)
     return result.stdout.strip().rstrip("/") or "/"

@@ -62,7 +62,13 @@ class Engines:
             }
 
     def start(self):
-        """In the background: install what is missing, then look up the latest versions."""
+        """Delete older engine files (no worker can be using one yet), then in the background install what is
+        missing and look up the latest versions."""
+        for name in RELEASES:
+            folder, keep = self.root / name, {self.version(name), "current"}
+            for f in folder.iterdir() if folder.is_dir() else ():
+                if f.name not in keep and f.is_file():
+                    f.unlink()
         for name in RELEASES:
             if self.version(name):
                 threading.Thread(target=self._check, args=(name,), daemon=True).start()
@@ -123,7 +129,7 @@ class Engines:
             raise ChecksumMismatch()
         folder = self.root / name
         folder.mkdir(parents=True, exist_ok=True)
-        # shortcut: old engine files are kept forever (a running worker may still read one); prune when disk use matters
+        # the old file stays until the next start: a running worker may still be reading it
         write_atomic(folder / tag, data)
         write_atomic(folder / "current", tag.encode())
 
