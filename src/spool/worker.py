@@ -1,7 +1,8 @@
 """Worker: a child process that runs one engine call and reports JSON lines on stdout.
 
 Spec on stdin: {engine, engine_path, mode: "probe" | "download", url, ffmpeg, js_runtime?, dest?, preset?, item?}.
-Events: {"event": "log" | "progress" | "meta" | "info" | "done" | "error", ...}. Standard library only; run with python -I.
+Events: {"event": "log" | "progress" | "meta" | "file" | "info" | "done" | "error", ...}; an error carries "kind"
+("live", "no_js" or "playlist") when the worker knows it. Standard library only; run with python -I.
 """
 
 import json
@@ -11,6 +12,13 @@ from importlib import import_module
 
 OUT = sys.stdout
 LIVE = "This is live now."  # jobs.py maps these words to the error kind "live"
+NO_JS_FAILS = ("requested format is not available", "only images are available")  # what a missing runtime causes
+
+
+class Failure(Exception):
+    def __init__(self, message, kind=None):
+        super().__init__(message)
+        self.kind = kind
 
 
 def emit(**event):
@@ -61,10 +69,10 @@ def ladder(preset, ffmpeg):
 
 
 # A file name holds 255 bytes (macOS) or 255 characters (exFAT), and the engines add " [id]" and ".f137.mp4.part".
-TITLE = {
-    "yt_dlp": "%(title).150B",
-    "youtube_dl": "%(title).50s",
-}  # youtube-dl has no byte precision; 50 chars <= 200 bytes
+NAME = {  # yt-dlp's spool_* fields are set by the Name step in download(); youtube-dl has no byte precision: 50 chars
+    "yt_dlp": "%(spool_title,title).150B [%(id)s]%(spool_class|)s",  # <= 200 bytes
+    "youtube_dl": "%(title).50s [%(id)s]",
+}
 HEIGHTS = (2160, 1440, 1080, 720, 480, 360, 240)
 FLAT_PRESETS = ("best", "1080", "720", "480", "audio")  # a flat playlist listing has no formats to read
 LABELS = {"best": "Best", "audio": "Audio", "mp3": "MP3"}
@@ -135,28 +143,32 @@ def estimate(formats, preset, ffmpeg, duration):
 
 
 def chosen(formats, n, ffmpeg, duration):
-    """The streams yt-dlp's rule picks for class n (None for Best): bv*+ba with ffmpeg, else b."""
+    """The streams yt-dlp's rule picks for class n (None for Best): bv*+ba with ffmpeg, else b. (None,) if none fit."""
     key = ranking(n, duration)
     audio = [f for f in formats if has(f, "acodec") and not has(f, "vcodec")]
     video = [f for f in formats if has(f, "vcodec")]
     if ffmpeg and video and audio:
-        return max(video, key=key), max(audio, key=key)
+        top = max(video, key=key)
+        return (top,) if has(top, "acodec") else (top, max(audio, key=key))  # the engine takes no second sound
     both = [f for f in formats if has(f, "acodec") and has(f, "vcodec")]
-    return (max(both or formats, key=key, default=None),)
+    whole = all(has(f, "vcodec") for f in formats) or all(has(f, "acodec") for f in formats)  # b's own fallback
+    return (max(both or (formats if whole else []), key=key, default=None),)
 
 
 def entry(info, ffmpeg):
-    if info.get("_type") in ("url", "url_transparent"):
-        presets = [preset(p) for p in FLAT_PRESETS]
+    if info.get("_type") in ("url", "url_transparent"):  # without ffmpeg a class is whatever one stream a site has
+        presets = [preset(p) for p in (FLAT_PRESETS if ffmpeg else ("best", "audio"))]
     else:
         formats = info.get("formats") or [info]  # a site with one stream puts it on the info itself
         playable = formats if ffmpeg else [f for f in formats if has(f, "acodec")]  # no merging without ffmpeg
         classes = {klass(f) for f in playable if has(f, "vcodec")}
         top = chosen(formats, None, ffmpeg, info.get("duration"))[0]
         best = klass(top) if top and has(top, "vcodec") else None  # Best's own class: offered once, as its detail
-        ids = ["best", *(str(h) for h in HEIGHTS if h in classes and h != best), "audio"] + ["mp3"] * bool(ffmpeg)
+        heights = [str(h) for h in HEIGHTS if h in classes and h != best]
+        ids = ["best"] * bool(top) + heights + ["audio"] + ["mp3"] * bool(ffmpeg)  # no Best when nothing fits
         presets = [preset(p, estimate(formats, p, ffmpeg, info.get("duration"))) for p in ids]
-        presets[0]["detail"] = best and f"{best}p"
+        if top:
+            presets[0]["detail"] = best and f"{best}p"
     if ffmpeg and presets[-1]["id"] != "mp3":
         presets.append(preset("mp3"))
     thumbnails = info.get("thumbnails") or [{}]
@@ -176,18 +188,20 @@ def entry(info, ffmpeg):
     }
 
 
-def where(d, n, spec):
-    """(progress across all parts, 0 to 1 or None; what the current part carries) for one progress hook call."""
+def where(d, n, spec, plan=()):
+    """(progress across all parts, 0 to 1 or None; what the current part carries) for one progress hook call.
+
+    plan: the parts yt-dlp chose, as its Name step saw them; each part's hook names only that part."""
     info = d.get("info_dict")
-    if info:  # yt-dlp: each part's info names every part the job will download
-        parts = info.get("requested_formats") or [info]
+    if info:
+        parts = info.get("requested_formats") or plan or [info]
         i = next((k for k, f in enumerate(parts) if f.get("format_id") == info.get("format_id")), max(n, 1) - 1)
+        i = min(i, len(parts) - 1)
         what = "video" if has(parts[i], "vcodec") else "audio" if has(parts[i], "acodec") else None
     else:  # shortcut: youtube-dl's hooks carry no info, so the preset's usual parts stand in; fine until a surprise
         parts = [{}] * (1 if spec["preset"] in AUDIO or not spec["ffmpeg"] else 2)
         i = min(max(n, 1), len(parts)) - 1
         what = "audio" if spec["preset"] in AUDIO or i == 1 else "video"
-    i = min(i, len(parts) - 1)
     done, total = d.get("downloaded_bytes"), d.get("total_bytes") or d.get("total_bytes_estimate")
     frac = 1.0 if d.get("status") == "finished" else min(1.0, done / total) if done is not None and total else None
     sizes = [bytes_of(f, (info or {}).get("duration")) for f in parts]
@@ -225,27 +239,53 @@ def download(engine, module, params, spec):
         e = entry(info, spec["ffmpeg"])
         emit(event="meta", **{k: e[k] for k in ("title", "uploader", "thumbnail", "duration")})
 
+    def here(name):  # the engine writes into dest, its current folder; getcwd() would resolve links and case
+        return os.path.join(spec["dest"], os.path.basename(name))
+
     class Capture(PostProcessor):
         def run(self, information):
             path = information.get("filepath")
-            final["path"] = path and os.path.abspath(path)
+            final["path"] = path and here(path)
             details(information)  # youtube-dl's hooks carry no info, so this is where it tells us
             return [], information
 
-    part = {"n": 0, "last": None}
+    plan = []
     seen = set()
+
+    def wrote(name):
+        if name not in seen:
+            seen.add(name)
+            emit(event="file", path=here(name))
+
+    class Name(PostProcessor):
+        """yt-dlp's step between choosing the streams and naming the file."""
+
+        def run(self, information):
+            plan[:] = information.get("requested_formats") or [information]
+            title = ydl.evaluate_outtmpl("%(title)s", information, sanitize=True)  # cleaned first: "|" takes 3 bytes
+            video = next((f for f in plan if has(f, "vcodec")), None)
+            got = video and klass(video)  # a class preset gives the best below it: name the file for what it got
+            information["spool_title"] = title.encode()[:150].decode(errors="ignore")
+            information["spool_class"] = (
+                f" {got}p" if got and spec["preset"] in CLASS else CLASS.get(spec["preset"], "")
+            )
+            base, ext = os.path.splitext(ydl.prepare_filename(information))
+            for e in {ext, ".mp3" if spec["preset"] == "mp3" else ext}:  # the merge and the metadata step write here
+                wrote(base + ".temp" + e)
+            return [], information
+
+    part = {"n": 0, "last": None}
 
     def hook(d):
         if d.get("status") == "downloading":  # only what this job writes; "already downloaded" is someone's file
-            for name in {d.get("filename"), d.get("tmpfilename")} - seen - {None}:
-                seen.add(name)
-                emit(event="file", path=os.path.abspath(name))
+            for name in {d.get("filename"), d.get("tmpfilename")} - {None}:
+                wrote(name)
         if part["n"] == 0 and d.get("info_dict"):
             details(d["info_dict"])  # yt-dlp tells us as soon as the first part starts
         if d.get("status") == "downloading" and part["last"] != "downloading":
             part["n"] += 1
         part["last"] = d.get("status")
-        progress, what = where(d, part["n"], spec)
+        progress, what = where(d, part["n"], spec, plan)
         emit(
             event="progress",
             status=d.get("status"),
@@ -258,19 +298,25 @@ def download(engine, module, params, spec):
             eta=d.get("eta"),
         )
 
-    live = []
+    refused = []
 
-    def not_live(info, incomplete=False):
-        """The engines' match_filter: a live stream would record without end, so skip it and say why."""
+    def wanted(info, incomplete=False):
+        """The engines' match_filter: one video per job, and no live stream, which would record without end."""
+        if not spec.get("item") and (info.get("playlist_index") is not None or "playlist_count" in info):
+            refused.append(Failure("This link is a list of videos.", "playlist"))  # a channel's tab, say
+            return "Spool saves one video per download"
         if info.get("is_live") or info.get("live_status") == "is_live":
-            live.append(True)
+            refused.append(Failure(LIVE, "live"))
             return "Spool does not record live streams"
         return None
 
+    # shortcut: youtube-dl has no step between choosing and naming, so its class is the preset's, even when a
+    # playlist entry has no such class; upgrade if youtube-dl gains one, or drop with youtube-dl
+    cls = "" if module == "yt_dlp" else CLASS.get(spec["preset"], "")
     params.update(
-        match_filter=not_live,
+        match_filter=wanted,
         **format_params(spec["preset"], spec["ffmpeg"], module),
-        outtmpl=TITLE[module] + " [%(id)s]" + CLASS.get(spec["preset"], "") + ".%(ext)s",  # relative to dest
+        outtmpl=NAME[module] + cls + ".%(ext)s",  # relative to dest
         updatetime=False,  # stamp files with the download time, not the upload time
         progress_hooks=[hook],
         retries=10,
@@ -295,12 +341,13 @@ def download(engine, module, params, spec):
         raise RuntimeError("The destination folder is missing.") from None
     with engine.YoutubeDL(params) as ydl:
         if module == "yt_dlp":
+            ydl.add_post_processor(Name(), when="video")
             ydl.add_post_processor(Capture(), when="after_move")
         else:
             ydl.add_post_processor(Capture())
         ydl.download([spec["url"]])
-    if live:
-        raise RuntimeError(LIVE)
+    if refused:
+        raise refused[0]
     path = final.get("path")
     if not path and not seen:
         raise RuntimeError("Spool found no video at this link.")  # an empty playlist, or an item past its end
@@ -312,11 +359,11 @@ def download(engine, module, params, spec):
 def main():
     spec = json.load(sys.stdin)
     module = "yt_dlp" if spec["engine"] == "yt-dlp" else "youtube_dl"
-    sys.path.insert(0, spec["engine_path"])
+    sys.path.insert(0, os.path.abspath(spec["engine_path"]))  # download() moves into dest; engines import late
     engine = import_module(module)
-    params = {"logger": Log(), "noprogress": True}
+    params = {"logger": Log(), "noprogress": True, "socket_timeout": 30}  # youtube-dl would wait 10 minutes
     if module == "yt_dlp" and spec.get("js_path"):  # Spool's own deno, outside PATH
-        params["js_runtimes"] = {"deno": {"path": spec["js_path"]}}
+        params["js_runtimes"] = {"deno": {"path": os.path.abspath(spec["js_path"])}}
     elif module == "yt_dlp" and spec.get("js_runtime") not in (None, "deno"):
         params["js_runtimes"] = {spec["js_runtime"]: {}}  # yt-dlp enables deno by itself
     if spec["mode"] == "probe":
@@ -330,8 +377,8 @@ if __name__ == "__main__":
     try:
         main()
     except BaseException as exc:  # report anything, including the engine's own exits
-        message = str(exc) or type(exc).__name__
-        if Log.no_js:  # the real cause of what failed after the warning
-            message = "No supported JavaScript runtime could be found.\n" + message
-        emit(event="error", message=message)
+        message, kind = str(exc) or type(exc).__name__, getattr(exc, "kind", None)
+        if Log.no_js and any(p in message.lower() for p in NO_JS_FAILS):  # the real cause of what failed
+            message, kind = "No supported JavaScript runtime could be found.\n" + message, "no_js"
+        emit(event="error", message=message, **({"kind": kind} if kind else {}))
         sys.exit(1)
