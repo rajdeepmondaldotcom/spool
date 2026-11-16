@@ -1,10 +1,12 @@
 """HTTP: access checks, routing, live events and static files. Holds no state of its own."""
 
+import contextlib
 import hmac
 import json
 import mimetypes
 import queue
 import re
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -15,7 +17,7 @@ from .jobs import Problem
 
 STATIC = Path(__file__).with_name("static")
 CSP = (
-    "default-src 'self'; img-src 'self' https: data:; style-src 'self'; script-src 'self'; connect-src 'self'; "
+    "default-src 'self'; img-src 'self' https: http: data:; style-src 'self'; script-src 'self'; connect-src 'self'; "
     "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 )
 MAX_BODY = 1_000_000
@@ -34,6 +36,8 @@ def make_server(jobs, engines, token, port=0):
 class Handler(BaseHTTPRequestHandler):
     server_version = "spool"
     sys_version = ""
+    timeout = 10  # an idle or silent connection lets its thread go; the event stream writes, it never reads
+    answered = False
 
     def log_message(self, *args):
         pass
@@ -59,8 +63,16 @@ class Handler(BaseHTTPRequestHandler):
             route(*args)
         except Problem as p:
             self.send_json(p.status, {"error": {"kind": p.kind, "message": p.message, "hint": p.hint}})
-        except (BrokenPipeError, ConnectionResetError):
+        except (ConnectionError, TimeoutError):  # the tab went away (ConnectionAbortedError on Windows)
             pass
+        except Exception:
+            traceback.print_exc()  # a bug: the terminal keeps the details, the page gets a sentence
+            if not self.answered:
+                self.send_json(500, {"error": {"kind": "internal", "message": INTERNAL, "hint": None}})
+
+    def send_response(self, *args):
+        self.answered = True
+        super().send_response(*args)
 
     # Access
 
@@ -146,7 +158,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(204, b"", "application/json")
 
     def reveal_dest(self):
-        self.server.jobs.reveal_dest()
+        with no_file_manager():
+            self.server.jobs.reveal_dest()
         self.send_bytes(204, b"", "application/json")
 
     def cancel(self, job_id):
@@ -163,7 +176,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(200, self.server.jobs.log(job_id).encode(), "text/plain")
 
     def reveal(self, job_id):
-        self.server.jobs.reveal(job_id)
+        with no_file_manager():
+            self.server.jobs.reveal(job_id)
         self.send_bytes(204, b"", "application/json")
 
     def settings(self):
@@ -212,6 +226,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+
+@contextlib.contextmanager
+def no_file_manager():
+    try:
+        yield
+    except NotImplementedError:
+        raise Problem(501, "not_supported", "Spool can't open folders on this system.") from None
+
+
+INTERNAL = "Something went wrong inside Spool. Try again."
 
 ROUTES = [
     ("GET", r"/api/events", "events"),

@@ -1,8 +1,12 @@
 import http.client
 import json
+import socket
+import time
 from pathlib import Path
 
 from support import job_state
+
+from spool import server, system
 
 
 def raw(app, method, path, headers):
@@ -14,7 +18,8 @@ def raw(app, method, path, headers):
         conn.putheader(k, v)
     conn.endheaders()
     r = conn.getresponse()
-    return r.status, r.getheaders(), r.read()
+    stream = r.getheader("Content-Type") == "text/event-stream"  # never ends: a broken check must fail, not hang
+    return r.status, r.getheaders(), b"" if stream else r.read()
 
 
 def host(app):
@@ -210,3 +215,78 @@ def test_settings_of_the_wrong_type_are_422(app):
         assert status == 422, body
         assert reply["error"]["kind"].startswith("invalid_")
     assert app.json("POST", "/api/probe", {"url": "https://fake.test/video", "engine": ["x"]})[0] == 422
+
+
+# Every request is answered, and an idle connection is let go
+
+
+def test_an_idle_connection_is_closed(app, monkeypatch):
+    assert 0 < server.Handler.timeout <= 30
+    monkeypatch.setattr(server.Handler, "timeout", 0.3)
+    with socket.create_connection(app.httpd.server_address, timeout=5) as s:
+        t = time.time()
+        assert s.recv(1) == b""  # closed by Spool, not by our 5 s timeout
+        assert time.time() - t < 3
+
+
+def test_a_bug_in_a_route_is_a_plain_sentence(app, monkeypatch):
+    monkeypatch.setattr(app.jobs, "log", lambda job_id: 1 / 0)
+    status, body = app.json("GET", "/api/jobs/x/log")
+    assert (status, body["error"]["kind"]) == (500, "internal")
+    assert body["error"]["message"]
+
+
+def test_a_tab_that_closes_mid_request_is_quiet(app, monkeypatch, capfd):
+    def aborted(job_id):
+        raise ConnectionAbortedError(10053, "An established connection was aborted")  # what Windows raises
+
+    monkeypatch.setattr(app.jobs, "log", aborted)
+    try:
+        app.request("GET", "/api/jobs/x/log")
+    except http.client.RemoteDisconnected:
+        pass
+    time.sleep(0.2)
+    assert "Traceback" not in capfd.readouterr().err
+
+
+def test_http_thumbnails_are_allowed(app):
+    img = next(d for d in server.CSP.split(";") if d.strip().startswith("img-src")).split()
+    assert {"'self'", "https:", "http:", "data:"} <= set(img)
+
+
+def test_the_folder_dialog_answers_a_path_a_cancel_or_a_plain_refusal(app, monkeypatch):
+    answers = iter(["/Volumes/T7/Spool", None])
+    monkeypatch.setattr(system, "choose_folder", lambda: next(answers))
+    assert app.json("POST", "/api/choose-folder") == (200, {"path": "/Volumes/T7/Spool"})
+    assert app.request("POST", "/api/choose-folder")[0] == 204
+
+    def refused():
+        raise NotImplementedError("Not authorized to send Apple events (-1743)")
+
+    monkeypatch.setattr(system, "choose_folder", refused)
+    status, body = app.json("POST", "/api/choose-folder")
+    assert (status, body["error"]["kind"]) == (501, "not_supported")
+
+
+def test_reveal_shows_the_finished_file_or_says_the_system_cannot(app, monkeypatch):
+    shown = []
+    monkeypatch.setattr(system, "reveal", shown.append)
+    monkeypatch.setattr(system, "open_folder", shown.append)
+    entry = {"url": "https://fake.test/video?delay=0", "id": "vid-1", "title": "Fake video 1"}
+    events = app.events()
+    events.next()
+    [job] = app.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})[1]["jobs"]
+    done = events.until(job_state("done"))[-1][1]
+    events.close()
+    assert app.request("POST", f"/api/jobs/{job['id']}/reveal")[0] == 204
+    assert app.request("POST", "/api/dest/reveal")[0] == 204
+    assert shown == [done["path"], str(app.dest)]
+
+    def none(path):
+        raise NotImplementedError
+
+    monkeypatch.setattr(system, "reveal", none)
+    monkeypatch.setattr(system, "open_folder", none)
+    for path in (f"/api/jobs/{job['id']}/reveal", "/api/dest/reveal"):
+        status, body = app.json("POST", path)
+        assert (status, body["error"]["kind"]) == (501, "not_supported"), path

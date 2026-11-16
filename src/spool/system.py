@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 
-JS_RUNTIMES = ("deno", "node", "bun", "quickjs")
+from .engines import JS_ON_PATH
 
 
 def data_dir():
@@ -36,15 +36,18 @@ _checks = {}  # path -> the one check thread running for it, and when it started
 _checks_lock = threading.Lock()
 
 
-def check_dest(path):
-    """The destination's problem, or none. Waits CHECK_TIMEOUT at most; one check per path runs at a time."""
+def check_dest(path, write=True):
+    """The destination's problem, or none. Waits CHECK_TIMEOUT at most; one check per path runs at a time.
+
+    write=False skips the real write test, for polling: it never wakes a sleeping drive or touches a synced folder."""
     path = str(path)
     with _checks_lock:
-        flight = _checks.get(path)
+        flight = _checks.get((path, write))
         if flight is None or not flight[0].is_alive():
             result = {}
-            thread = threading.Thread(target=lambda: result.update(probe_dest(path)), daemon=True)
-            flight = _checks[path] = (thread, time.monotonic(), result)
+            probe = probe_dest if write else quick_dest
+            thread = threading.Thread(target=lambda: result.update(probe(path)), daemon=True)
+            flight = _checks[(path, write)] = (thread, time.monotonic(), result)
             thread.start()
     thread, started, result = flight
     thread.join(max(0.0, started + CHECK_TIMEOUT - time.monotonic()))
@@ -56,19 +59,34 @@ def check_dest(path):
 
 def probe_dest(path):
     """Existence and a real write test. Never creates anything that is missing."""
-    p = Path(path)
-    problem = None
-    if not p.exists():
-        problem = "unplugged" if unplugged(p) else "missing"
-    elif not p.is_dir():
-        problem = "not_a_folder"
-    else:
-        try:
-            with tempfile.TemporaryFile(dir=p, prefix=".spool-write-test-"):
-                pass
-        except OSError:
-            problem = "not_writable"
-    free = shutil.disk_usage(p).free if problem in (None, "not_writable") else None
+    return probe(path, write=True)
+
+
+def quick_dest(path):
+    """Existence and the permission bits: nothing is written."""
+    return probe(path, write=False)
+
+
+def probe(path, write):
+    p, problem, free = Path(path), None, None
+    try:
+        if not p.exists():
+            problem = "unplugged" if unplugged(p) else "missing"
+        elif not p.is_dir():
+            problem = "not_a_folder"
+        elif not write:
+            problem = None if os.access(p, os.W_OK) else "not_writable"
+        else:
+            try:
+                with tempfile.TemporaryFile(dir=p, prefix=".spool-write-test-"):
+                    pass
+            except OSError:
+                problem = "not_writable"
+        free = shutil.disk_usage(p).free if problem in (None, "not_writable") else None
+    except PermissionError:  # a parent folder Spool may not enter
+        problem = "not_writable"
+    except OSError:  # a share that dropped answers with an input/output error
+        problem, free = "not_responding", None
     return {"path": str(p), "display": display(p), "ok": problem is None, "problem": problem, "free_bytes": free}
 
 
@@ -94,47 +112,60 @@ def display(path):
 
 def tools(js=None):
     """What the machine has. js: a JsRuntime, which also knows about Spool's own deno and its setup."""
-    found = next((name for name in JS_RUNTIMES if shutil.which(name)), None)
     return {
         "ffmpeg": bool(shutil.which("ffmpeg")),
-        **(js.tools() if js else {"js_runtime": found, "js_setup": None, "js_path": None}),
+        **(js.tools() if js else {"js_runtime": on_path(), "js_setup": None, "js_path": None}),
         "platform": sys.platform,
         "can_choose_folder": sys.platform == "darwin",
     }
 
 
+def on_path():
+    return next((name for name in JS_ON_PATH if shutil.which(name)), None)
+
+
 def choose_folder():
-    """The native folder dialog. Returns a path, or None if the user cancelled. NotImplementedError off macOS."""
+    """The native folder dialog. Returns a path, or None if the user cancelled.
+
+    NotImplementedError off macOS, and when the dialog can't open (over SSH, or automation not permitted)."""
     if sys.platform != "darwin":
         raise NotImplementedError
     script = 'POSIX path of (choose folder with prompt "Choose where Spool saves downloads")'
     # without activating first, the dialog can open behind the browser
-    result = subprocess.run(
-        ["osascript", "-e", "tell me to activate", "-e", script], capture_output=True, text=True, check=False
-    )
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", "tell me to activate", "-e", script], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        raise NotImplementedError from None
     if result.returncode != 0:
-        return None  # the user pressed Cancel (error -128)
+        if "(-128)" in result.stderr:  # the user pressed Cancel
+            return None
+        raise NotImplementedError(result.stderr.strip())
     return result.stdout.strip().rstrip("/") or "/"
 
 
 def reveal(path):
-    """Show the file in the file manager."""
+    """Show the file in the file manager. NotImplementedError when the machine has none (headless Linux, WSL)."""
     if sys.platform == "darwin":
-        subprocess.run(["open", "-R", path], check=False)
+        run(["open", "-R", path])
     elif sys.platform == "win32":
-        subprocess.run(["explorer", f"/select,{path}"], check=False)
+        # Explorer reads /select, itself: quoting the whole argument, as a list would, opens a default folder
+        run(f'explorer /select,"{path}"')
     else:  # shortcut: opens the folder without selecting the file; Linux file managers have no common select flag
-        subprocess.run(["xdg-open", os.path.dirname(path)], check=False)
+        run(["xdg-open", os.path.dirname(path)])
 
 
 def open_folder(path):
-    """Open a folder in the file manager."""
-    if sys.platform == "darwin":
-        subprocess.run(["open", path], check=False)
-    elif sys.platform == "win32":
-        subprocess.run(["explorer", path], check=False)
-    else:
-        subprocess.run(["xdg-open", path], check=False)
+    """Open a folder in the file manager. NotImplementedError when the machine has none."""
+    run(["open" if sys.platform == "darwin" else "explorer" if sys.platform == "win32" else "xdg-open", path])
+
+
+def run(args):
+    try:
+        subprocess.run(args, check=False)
+    except OSError:
+        raise NotImplementedError from None
 
 
 def spawn(args, **kwargs):
@@ -160,17 +191,22 @@ def kill(proc, grace=3.0):
         else:
             os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):  # gone, or only a zombie leader is left (macOS says EPERM)
         pass
 
 
 def kill_leftovers(proc):
-    """After a worker exits, stop anything it left running in its group."""
+    """Wait for a worker to exit, stop anything it left running in its group, then reap it.
+
+    Reaping last keeps the worker's pid, and so its group's number, from being reused by an unrelated process."""
     if sys.platform != "win32":  # shortcut: on Windows a stray grandchild outlives the worker; fix if one shows up
+        if proc.returncode is None:
+            os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+    proc.wait()
 
 
 def kill_soon(proc):
