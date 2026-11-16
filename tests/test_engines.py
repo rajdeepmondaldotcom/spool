@@ -225,7 +225,7 @@ def broken_engine_zip():
     return buf.getvalue()
 
 
-def test_a_release_that_cannot_load_is_never_made_current(tmp_path, capsys):
+def test_a_release_that_cannot_load_is_never_made_current(tmp_path):
     install_fake_engines(tmp_path)
     github = FakeGitHub()
     github.asset = broken_engine_zip()  # its checksum matches: only running it shows the fault
@@ -235,7 +235,7 @@ def test_a_release_that_cannot_load_is_never_made_current(tmp_path, capsys):
     assert (status["version"], status["error"]) == (INSTALLED, "Spool couldn't update its engine.")
     assert not (tmp_path / "engines" / "yt-dlp" / LATEST).exists()
     assert probe_with(engines.path("yt-dlp"), "yt-dlp")["event"] == "info"
-    assert "newer Python" in capsys.readouterr().err  # the cause is in the terminal, not only a vague sentence
+    assert "newer Python" in (tmp_path / "engines" / "update.log").read_text()  # the cause is kept somewhere
 
 
 def test_a_deleted_engine_file_is_installed_again(tmp_path):
@@ -256,7 +256,7 @@ def test_a_release_tag_that_is_not_a_version_is_refused(tmp_path, tag):
     engines.update("yt-dlp")
     status = settle(engines)["yt-dlp"]
     assert (status["installed"], status["error"]) == (False, "Spool couldn't update its engine.")
-    assert sorted(p.name for p in tmp_path.iterdir()) == []
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["update.log"]  # nothing installed, the cause kept
 
 
 def test_a_fetch_larger_than_the_limit_is_refused(monkeypatch):

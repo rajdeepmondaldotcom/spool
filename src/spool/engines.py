@@ -33,8 +33,11 @@ def http_get(url):
     return data
 
 
-def log(what, exc):
-    print(f"Spool couldn't {what}: {exc!r}", file=sys.stderr, flush=True)  # the cause, for whoever reads the terminal
+def log(folder, what, exc):
+    """Keep a failure's cause in folder/update.log: the page's sentence is plain, and the terminal names no program."""
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / "update.log", "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {what}: {exc!r}\n")
 
 
 def final_url(url):
@@ -118,7 +121,7 @@ class Engines:
             if tag != self.version(name):
                 self._install(name, tag)
         except Exception as exc:
-            log(f"update {name}", exc)
+            log(self.root, f"update {name}", exc)
             error = (
                 "The engine Spool downloaded didn't match its published checksum, so Spool kept the one it had."
                 if isinstance(exc, ChecksumMismatch)
@@ -231,7 +234,7 @@ class JsRuntime:
                 if old.is_dir() and old.name != tag and TAG.fullmatch(old.name):
                     shutil.rmtree(old, ignore_errors=True)
         except Exception as exc:  # offline, a bad download, an unknown platform: say so, and a later start tries again
-            log("fetch YouTube's helper", exc)
+            log(self.root, "fetch deno", exc)
             setup = None if self.tools()["js_path"] else "failed"
         with self.lock:
             self.setup, self.busy, self.checked = setup, False, True
