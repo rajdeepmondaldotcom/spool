@@ -3,6 +3,7 @@
 import hashlib
 import os
 import re
+import tempfile
 import threading
 import urllib.request
 from pathlib import Path
@@ -132,9 +133,14 @@ class ChecksumMismatch(Exception):
 
 
 def write_atomic(path, data):
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """Replace path with data in one step. The temp name is unique, so two writers never share it; mode 0600."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)  # our own temp file, never anything else
+        raise

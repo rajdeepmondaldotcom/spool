@@ -1,4 +1,7 @@
+import json
 import os
+import subprocess
+import sys
 import time
 
 import pytest
@@ -368,3 +371,96 @@ def test_a_job_for_a_playlist_item_downloads_that_item_only(app, events):
     assert [p.name for p in app.dest.iterdir()] == [os.path.basename(done["path"])] == ["Shared item 2 [shared-2].mp4"]
     other = app.json("POST", "/api/jobs", {"entries": [entries[0]], "preset": "best"})[1]["jobs"][0]
     assert other["id"] != job["id"]
+
+
+# Queue
+
+
+def workers():
+    """This process's worker children that are still alive (zombies are done)."""
+    out = subprocess.run(["ps", "-ax", "-o", "pid=,ppid=,stat=,command="], capture_output=True, text=True).stdout
+    rows = [line.split(None, 3) for line in out.splitlines()]
+    return [int(r[0]) for r in rows if r[1] == str(os.getpid()) and not r[2].startswith("Z") and "worker.py" in r[3]]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="ps")
+def test_a_job_cancelled_as_it_starts_never_downloads_and_two_at_most_run(app, events):
+    entry = {"url": "https://fake.test/slow?delay=0.2", "id": "slow-1", "title": "Slow"}
+    most = 0
+    for n in range(25):
+        job = app.json(
+            "POST",
+            "/api/jobs",
+            {"entries": [dict(entry, url=f"https://fake.test/slow/{n}?delay=0.2")], "preset": "best"},
+        )
+        assert app.json("POST", f"/api/jobs/{job[1]['jobs'][0]['id']}/cancel")[1]["state"] == "cancelled"
+        most = max(most, len(workers()))
+    end = time.time() + 10
+    while workers() and time.time() < end:
+        most = max(most, len(workers()))
+        time.sleep(0.05)
+    assert workers() == []
+    assert most <= 2
+    assert [j["state"] for j in app.jobs.snapshot()["jobs"]] == ["cancelled"] * 25
+
+
+@pytest.fixture
+def quick_retry(monkeypatch):
+    import spool.jobs
+
+    monkeypatch.setattr(spool.jobs, "RETRY_AFTER", 0.3)
+
+
+def test_a_refusal_before_any_bytes_is_retried_once_by_itself(app, events, quick_retry):
+    done = wait_for(events, add(app, "https://fake.test/403-once?delay=0"), lambda d: d["state"] in ("done", "failed"))
+    assert done["state"] == "done"
+    assert app.request("GET", f"/api/jobs/{done['id']}/log")[1].decode().count("\n--- ") + 1 == 2
+
+
+def test_a_refusal_that_persists_fails_after_one_retry(app, events, quick_retry):
+    failed = wait_for(events, add(app, "https://fake.test/403-start?delay=0"), lambda d: d["state"] == "failed")
+    assert failed["error"]["kind"] == "blocked"
+    assert app.request("GET", f"/api/jobs/{failed['id']}/log")[1].decode().count("--- ") == 2
+
+
+def test_a_refusal_after_bytes_arrived_is_not_retried(app, events, quick_retry):
+    failed = wait_for(events, add(app, "https://fake.test/403?delay=0"), lambda d: d["state"] == "failed")
+    assert app.request("GET", f"/api/jobs/{failed['id']}/log")[1].decode().count("--- ") == 1
+
+
+# A damaged state file
+
+
+@pytest.mark.parametrize(
+    "text", ['{"settings": {"dest": "/x"}, "jo', "", "[1, 2]", '{"settings": 7, "jobs": {}}', '{"jobs": [1]}x']
+)
+def test_a_damaged_state_file_is_moved_aside_and_spool_starts_fresh(tmp_path, capsys, text):
+    from spool.engines import Engines
+    from spool.jobs import Jobs
+
+    (tmp_path / "state.json").write_text(text)
+    jobs = Jobs(tmp_path, Engines(tmp_path / "engines"))
+    try:
+        assert jobs.snapshot()["jobs"] == []
+        [aside] = tmp_path.glob("state.json.broken-*")
+        assert aside.read_text() == text
+        out = capsys.readouterr().out
+        assert out.count("\n") == 1 and aside.name in out
+    finally:
+        jobs.close()
+
+
+def test_a_malformed_job_record_is_skipped(tmp_path):
+    from spool.engines import Engines
+    from spool.jobs import Jobs, new_job
+
+    good = new_job({"url": "https://fake.test/video", "title": "Good"}, "best", "yt-dlp", str(tmp_path))
+    good["state"] = "done"
+    missing_key = {k: v for k, v in good.items() if k != "state"}
+    state = {"settings": {"dest": str(tmp_path)}, "jobs": [good, missing_key, "junk", None]}
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    jobs = Jobs(tmp_path, Engines(tmp_path / "engines"))
+    try:
+        assert [j["title"] for j in jobs.snapshot()["jobs"]] == ["Good"]
+    finally:
+        jobs.close()

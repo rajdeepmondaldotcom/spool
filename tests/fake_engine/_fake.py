@@ -185,6 +185,13 @@ def scenario(url):
         }, delay if delay is not None else 0.5
     if name == "vanish":  # the destination is deleted after Spool checked it and before the engine writes
         return {**video(url, n), "_rm": parse_qs(parts.query)["rm"][0]}, delay or 0
+    if name in ("403-start", "403-once"):  # refused before any bytes: always, or only the first time
+        return {
+            **video(url, n, "Fake refused video"),
+            "id": f"refused-{n}",
+            "_refuse_at": 0,
+            "_once": name == "403-once",
+        }, 0
     if name == "403":
         return {**video(url, n, "Fake refused video"), "id": f"refused-{n}", "_refuse": True}, delay or 0
     if name == "live":
@@ -388,6 +395,11 @@ class YoutubeDL:
             while done < total:
                 if info.get("_refuse") and done >= step * 3:
                     self.fail("ERROR: unable to download video data: HTTP Error 403: Forbidden")
+                if info.get("_refuse_at") == done:
+                    marker = f".fake-refused-{info['id']}"  # in the destination, the engine's current folder
+                    if not (info["_once"] and os.path.exists(marker)):
+                        open(marker, "w").close()
+                        self.fail("ERROR: unable to download video data: HTTP Error 403: Forbidden")
                 chunk = min(step, total - done)
                 out.write(b"\0" * chunk)
                 out.flush()

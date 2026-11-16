@@ -10,7 +10,7 @@ import sys
 import webbrowser
 
 from . import server, system
-from .engines import Engines
+from .engines import Engines, write_atomic
 from .jobs import Jobs
 
 PORT = 7766  # fixed by default, so a tab or bookmark survives a restart
@@ -89,12 +89,8 @@ def running(lock, token):
 
 
 def write_private(path, text):
-    """Only this user may read it: the token in it opens Spool."""
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    """Only this user may read it: the token in it opens Spool. (write_atomic creates files with mode 0600.)"""
+    write_atomic(path, text.encode())
 
 
 def interrupt(*_):

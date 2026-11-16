@@ -24,6 +24,17 @@ def data(tmp_path):
     return tmp_path
 
 
+LAUNCHED = []
+
+
+@pytest.fixture(autouse=True)
+def stop_every_launch():
+    """Whatever a test does or fails to do, no Spool it started outlives it."""
+    yield
+    while LAUNCHED:
+        stop(LAUNCHED.pop())
+
+
 def launch(data, *args):
     # an unreachable proxy keeps the latest-version check off the network
     env = {**os.environ, "SPOOL_DATA_DIR": str(data), "HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": ""}
@@ -34,6 +45,7 @@ def launch(data, *args):
         stderr=subprocess.STDOUT,
         text=True,
     )
+    LAUNCHED.append(proc)
     line = proc.stdout.readline()
     return proc, line
 
@@ -45,7 +57,12 @@ def url_in(line):
 def stop(proc):
     if proc.poll() is None:
         proc.send_signal(signal.SIGTERM)
-        proc.wait(10)
+        try:
+            proc.wait(10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    proc.stdout.close()
 
 
 def test_launch_prints_the_link_with_the_token_in_the_fragment(data):
@@ -152,3 +169,30 @@ def test_tests_never_run_from_inside_the_repo(tmp_path):
     here = Path.cwd().resolve()
     assert here == tmp_path.resolve()
     assert Path(__file__).resolve().parents[1] not in (here, *here.parents)
+
+
+def test_a_damaged_state_file_does_not_stop_launch(data):
+    (data / "state.json").write_text('{"settings": {"dest": ')
+    proc, line = launch(data)
+    assert "started fresh" in line and "Traceback" not in line
+    assert "Spool is running at" in proc.stdout.readline()
+
+
+def test_two_launches_at_the_same_instant_both_come_up_cleanly(data):
+    (data / "state.json").unlink()
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-m", "spool", "--no-open", "--port", "0"],
+            env={**os.environ, "SPOOL_DATA_DIR": str(data), "HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": ""},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    LAUNCHED.extend(procs)
+    for proc in procs:
+        assert "Spool is" in proc.stdout.readline()
+    for proc in procs:
+        proc.send_signal(signal.SIGTERM)
+        assert "Traceback" not in proc.communicate(timeout=10)[0]

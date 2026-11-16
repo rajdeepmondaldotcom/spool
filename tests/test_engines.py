@@ -153,3 +153,26 @@ def test_an_update_right_after_launch_still_reaches_the_browser(tmp_path):
     finally:
         httpd.shutdown()
         jobs.close()
+
+
+def test_writes_at_the_same_instant_never_collide(tmp_path):
+    import threading
+
+    from spool.engines import write_atomic
+
+    errors = []
+
+    def write(n):
+        try:
+            for _ in range(50):
+                write_atomic(tmp_path / "state.json", str(n).encode())
+        except OSError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert [p.name for p in tmp_path.iterdir()] == ["state.json"]

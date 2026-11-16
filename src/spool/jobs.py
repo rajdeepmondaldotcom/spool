@@ -18,6 +18,7 @@ from .engines import RELEASES, write_atomic
 WORKER = Path(__file__).with_name("worker.py")
 PRESETS = ("best", "2160", "1440", "1080", "720", "480", "360", "240", "audio", "mp3")
 AT_ONCE = 2
+RETRY_AFTER = 3  # seconds before the one automatic retry of a download refused before any bytes
 TICK = 0.25  # job progress goes out at most once a tick: four a second
 
 
@@ -34,14 +35,15 @@ class Jobs:
         self.data, self.engines = Path(data_dir), engines
         self.state_file, self.logs = self.data / "state.json", self.data / "logs"
         self.logs.mkdir(exist_ok=True)
-        saved = json.loads(self.state_file.read_text()) if self.state_file.exists() else {}
-        self.settings = {
-            "dest": str(system.default_dest()),
-            "engine": "yt-dlp",
-            "preset": "best",
-            **saved.get("settings", {}),
-        }
-        self.jobs = saved.get("jobs", [])  # newest first
+        saved = self._load()
+        self.settings = {"dest": str(system.default_dest()), "engine": "yt-dlp", "preset": "best"}
+        valid = {"dest": lambda v: isinstance(v, str) and os.path.isabs(v), "engine": RELEASES.__contains__}
+        valid["preset"] = PRESETS.__contains__
+        self.settings.update({k: v for k, v in saved.get("settings", {}).items() if k in valid and valid[k](v)})
+        keys = set(new_job({"url": "https://x.test"}, "best", "yt-dlp", "/")) - {"files", "item"}  # added later
+        self.jobs = [  # newest first; a malformed record is dropped, not fatal
+            {"files": [], "item": None, **j} for j in saved.get("jobs", []) if isinstance(j, dict) and keys <= set(j)
+        ]
         self.lock = threading.RLock()
         self.procs = {}  # job id -> the worker running it
         self.dirty = set()
@@ -55,6 +57,23 @@ class Jobs:
         engines.on_change = self._snapshot_changed  # the event stream lives here, so engines report to it
         threading.Thread(target=self._tick, daemon=True).start()
         threading.Thread(target=self._watch, daemon=True).start()
+
+    def _load(self):
+        """The saved state. A damaged file is moved aside, not fatal: Spool starts fresh and says so."""
+        try:
+            saved = json.loads(self.state_file.read_bytes()) if self.state_file.exists() else {}
+            if not (
+                isinstance(saved, dict)
+                and isinstance(saved.get("settings", {}), dict)
+                and isinstance(saved.get("jobs", []), list)
+            ):
+                raise ValueError("not the shape Spool saves")
+            return saved
+        except ValueError:  # bad JSON, bad UTF-8 and the wrong shape
+            aside = self.state_file.with_name(f"state.json.broken-{time.strftime('%Y%m%d-%H%M%S')}")
+            os.replace(self.state_file, aside)
+            print(f"Spool could not read its saved state, so it started fresh; the old file is {aside}", flush=True)
+            return {}
 
     # Reading
 
@@ -227,7 +246,7 @@ class Jobs:
     def close(self):
         with self.lock:
             self.closed = True
-            procs = list(self.procs.values())
+            procs = [p for p in self.procs.values() if p]
             for q in self.subscribers:
                 q.put((None, None))
         for proc in procs:
@@ -273,42 +292,64 @@ class Jobs:
         return [e for e in map(parse, out.splitlines()) if e]
 
     def _pump(self):
-        """Start queued jobs, oldest first, while fewer than AT_ONCE run."""
-        running = sum(j["state"] == "running" for j in self.jobs)
+        """Start queued jobs, oldest first, while fewer than AT_ONCE slots are taken.
+
+        A slot is an entry in procs: taken here, freed when the job's thread ends, so a cancelled worker that is
+        still dying keeps its slot."""
         for job in reversed(self.jobs):
-            if running >= AT_ONCE or self.closed:
+            if len(self.procs) >= AT_ONCE or self.closed:
                 return
             if job["state"] == "queued" and job["id"] not in self.procs:
                 job.update(state="running", stage="starting")
                 self._changed(job)
-                running += 1
+                self.procs[job["id"]] = None  # no worker yet
                 threading.Thread(target=self._run, args=(job,), daemon=True).start()
 
     def _run(self, job):
+        """Run a job in the slot _pump reserved for it; the slot is freed only when its worker is gone."""
         try:
-            dest_problem(system.check_dest(job["dest"]))
+            error = None
+            for attempt in (1, 2):
+                dest_problem(system.check_dest(job["dest"]))
+                result = self._attempt(job)
+                if result is None or result["event"] == "done":
+                    break
+                kind, message, hint = classify(result["message"])
+                try:
+                    dest_problem(system.check_dest(job["dest"]))  # a drive unplugged mid-download says so
+                except Problem as p:
+                    kind, message, hint = p.kind, p.message, p.hint
+                error = {"kind": kind, "message": message, "hint": hint}
+                if not (attempt == 1 and kind == "blocked" and not job["downloaded"]):
+                    break
+                time.sleep(RETRY_AFTER)  # a refusal before any bytes usually passes
         except Problem as p:
-            with self.lock:
-                if job["state"] == "running":
-                    job.update(
-                        state="failed",
-                        stage=None,
-                        finished=time.time(),
-                        error={"kind": p.kind, "message": p.message, "hint": p.hint},
-                    )
-                    self._changed(job)
-                    self._pump()
-            return
+            result, error = {"event": "error"}, {"kind": p.kind, "message": p.message, "hint": p.hint}
+        with self.lock:
+            self.procs.pop(job["id"], None)
+            if self.closed:
+                return
+            if job["state"] == "running" and result is not None:  # else cancelled, and perhaps retried since
+                if result["event"] == "done":
+                    job.update(state="done", path=result["path"], size=result["size"], file_exists=True)
+                else:
+                    job.update(state="failed", error=error)
+                job.update(stage=None, speed=None, eta=None, finished=time.time())
+                self._changed(job)
+            self._pump()
+
+    def _attempt(self, job):
+        """One worker run: its last event, or None if the job was cancelled before it could start."""
         spec = self._spec(
             job["engine"], mode="download", url=job["url"], dest=job["dest"], preset=job["preset"], item=job["item"]
         )
-        result = None
+        result = {"event": "error", "message": ""}
         with open(self.logs / f"{job['id']}.log", "a", encoding="utf-8") as log:
-            log.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} {job['engine']} {job['preset']} {job['url']}\n")
-            log.flush()
-            with self.lock:
-                if self.closed:
-                    return
+            with self.lock:  # cancel takes this lock too: it either sees the worker, or the worker never starts
+                if self.closed or job["state"] != "running":
+                    return None
+                log.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} {job['engine']} {job['preset']} {job['url']}\n")
+                log.flush()
                 proc = system.spawn(
                     [sys.executable, "-I", str(WORKER)],
                     stdin=subprocess.PIPE,
@@ -336,25 +377,7 @@ class Jobs:
                     break  # a child the engine left behind may hold the pipe open; this was the last word
             proc.wait()
             system.kill_leftovers(proc)
-        with self.lock:
-            self.procs.pop(job["id"], None)
-            if self.closed:
-                return
-            if job["state"] != "running":  # cancelled while it ran, and perhaps retried since
-                self._pump()
-                return
-            if result and result["event"] == "done":
-                job.update(state="done", path=result["path"], size=result["size"], file_exists=True)
-            else:
-                kind, message, hint = classify(result["message"] if result else "")
-                try:
-                    dest_problem(system.check_dest(job["dest"]))  # a drive unplugged mid-download says so
-                except Problem as p:
-                    kind, message, hint = p.kind, p.message, p.hint
-                job.update(state="failed", error={"kind": kind, "message": message, "hint": hint})
-            job.update(stage=None, speed=None, eta=None, finished=time.time())
-            self._changed(job)
-            self._pump()
+        return result
 
     def _progress(self, job, event):
         with self.lock:
