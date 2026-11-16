@@ -531,12 +531,24 @@ def test_running_rows_come_before_waiting_ones_then_stopped_then_finished(app, s
     assert headings == ["Downloading", "Stopped", "Finished"]
 
 
+def vanish(jobs):
+    """Every event stream ends with no word, as when Spool crashes or the connection is lost."""
+    with jobs.lock:
+        for q in jobs.subscribers:
+            q.put((None, None))
+    end = time.time() + 5
+    while jobs.subscribers:
+        assert time.time() < end, "a stream did not end"
+        time.sleep(0.02)
+
+
 def test_running_rows_say_reconnecting_when_spool_drops(app, spool):
     download(app, "https://fake.test/slow?delay=2", "Fake slow video")
     row = group(app, "Downloading").get_by_role("listitem")
     expect(row.get_by_text("Downloading video")).to_be_visible(timeout=10000)
-    spool[1].close()  # ends every event stream
+    vanish(spool[1])
     expect(row.get_by_text("Reconnecting…")).to_be_visible()
+    expect(row).to_contain_text("Downloading video", timeout=5000)  # the next try finds Spool again
 
 
 def processing(spool, title, **step):
@@ -906,6 +918,7 @@ def test_a_tab_reconnects_after_spool_restarts(page, tmp_path):
     page.get_by_label("Link to download").wait_for()
     httpd.shutdown()
     httpd.server_close()
+    vanish(jobs)  # gone without a word, as from a crash
     jobs.close()
 
     httpd, url, jobs, _ = serve_fake.start(tmp_path, port=port)
@@ -1394,26 +1407,28 @@ def test_after_quit_the_tab_says_spool_stopped_and_how_to_start_it(app, spool):
 STOPPED = "Spool has stopped. To start it again, run spool in your terminal. It opens a new tab."
 
 
-def stream(page, spool, stopped):
-    """Every request for the event stream gets a snapshot and, when stopped, the `stopped` event; then the stream
-    ends. Returns the list of requests made."""
+def ending_stream(page, spool):
+    """Every request for the event stream gets a snapshot, then the stream ends with no word. Returns the requests."""
     made = []
 
     def answer(route):
         made.append(route.request.url)
-        body = f"event: snapshot\ndata: {json.dumps(spool[1].snapshot())}\n\n"
-        route.fulfill(content_type="text/event-stream", body=body + ("event: stopped\ndata: {}\n\n" if stopped else ""))
+        route.fulfill(
+            content_type="text/event-stream", body=f"event: snapshot\ndata: {json.dumps(spool[1].snapshot())}\n\n"
+        )
 
     page.context.route("**/api/events", answer)
     fresh_snapshot(page)
     return made
 
 
-def test_the_stopped_event_stops_every_tab_reconnecting(app, spool):
+def test_a_clean_stop_stops_every_tab_reconnecting(app, spool):
+    made = []
+    app.context.on("request", lambda r: "/api/events" in r.url and made.append(r))
     other = app.context.new_page()
     other.goto(spool[0])
     other.get_by_label("Link to download").wait_for()
-    made = stream(app, spool, stopped=True)
+    spool[1].close()  # a clean stop: every stream hears `stopped`
     expect(app.get_by_text(STOPPED)).to_be_visible()
     expect(other.get_by_text(STOPPED)).to_be_visible()  # it does not read the stream itself
     asked = len(made)
@@ -1423,8 +1438,40 @@ def test_the_stopped_event_stops_every_tab_reconnecting(app, spool):
     expect(other.get_by_text("Reconnecting…")).to_have_count(0)
 
 
+def test_a_stopped_tab_follows_the_tab_of_the_next_launch(page, context, tmp_path, monkeypatch):
+    from spool import server
+
+    httpd, url, jobs, _ = serve_fake.start(tmp_path)
+    port = httpd.server_address[1]
+    page.goto(url)
+    page.get_by_label("Link to download").wait_for()
+    jobs.close()
+    httpd.shutdown()
+    httpd.server_close()
+    expect(page.get_by_text(STOPPED)).to_be_visible()
+
+    made = []
+    page.on("request", lambda r: "/api/events" in r.url and made.append(r))
+    real = server.make_server
+    monkeypatch.setattr(server, "make_server", lambda *a, **k: real(*a, **{**k, "token": "next-launch"}))
+    httpd, url, jobs, _ = serve_fake.start(tmp_path, port=port)  # each launch has a new token
+    try:
+        page.wait_for_timeout(2500)
+        assert made == []  # a stopped tab never tries by itself
+        newer = context.new_page()
+        newer.goto(url.replace("fake-token", "next-launch"))
+        expect(newer.get_by_label("Link to download")).to_be_visible()
+        expect(page.get_by_label("Link to download")).to_be_visible()
+        jobs.add([{"url": VIDEO, "title": "Fake video 1"}], "best")
+        expect(group(page, "Finished").get_by_text("Fake video 1")).to_be_visible(timeout=15000)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        jobs.close()
+
+
 def test_a_stream_that_just_ends_keeps_reconnecting(app, spool):
-    made = stream(app, spool, stopped=False)
+    made = ending_stream(app, spool)
     app.wait_for_timeout(2500)
     assert len(made) >= 2
     expect(app.get_by_text(STOPPED)).to_have_count(0)
@@ -1438,6 +1485,6 @@ def test_after_quit_the_stream_is_not_asked_for_again(app, spool):
     app.get_by_role("dialog", name="Settings").get_by_role("button", name="Quit Spool").click()
     expect(app.get_by_text(STOPPED)).to_be_visible()
     asked = len(made)
-    spool[1].close()  # the stream ends without a word, as from a server that stopped before saying so
+    vanish(spool[1])  # the stream ends without a word, as from a server that stopped before saying so
     app.wait_for_timeout(2500)
     assert len(made) == asked
