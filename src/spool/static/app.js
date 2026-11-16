@@ -627,6 +627,7 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
   if (job.state === "running" || job.state === "queued") {
     const pct = f.percent(job);
     const running = job.state === "running";
+    const step = f.stepPercent(job);
     return html`
       <li class="${cls} active" data-job=${job.id}>
         <div class="counter num" aria-hidden="true">${running && pct != null ? html`${pct}<span>%</span>` : ""}</div>
@@ -638,7 +639,7 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
           <p class="meta dim">
             ${running ? html`<span>${f.stageWords(job)}</span>
               ${!connected ? html`<span class="reconnecting">Reconnecting…</span>`
-                : job.stage === "downloading" && html`<span class="num">${f.speed(job.speed)}</span><span class="num">${f.timeLeft(job.eta)}</span>`}`
+                : job.stage !== "starting" && html`${step != null && html`<span class="num">${step}%</span>`}<span class="num">${f.speed(job.speed)}</span><span class="num">${f.timeLeft(job.eta)}</span>`}`
               : html`<span><${Icon} d=${ICONS.wait} />Waiting</span>`}
           </p>
           ${why}

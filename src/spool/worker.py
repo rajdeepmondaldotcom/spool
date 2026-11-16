@@ -2,15 +2,20 @@
 
 Spec on stdin: {engine, engine_path, mode: "probe" | "download", url, ffmpeg, js_runtime?, dest?, preset?, item?}.
 Events: {"event": "log" | "progress" | "meta" | "file" | "info" | "done" | "error", ...}; an error carries "kind"
-("live", "no_js" or "playlist") when the worker knows it. Standard library only; run with python -I.
+("live", "no_js" or "playlist") when the worker knows it. A progress event's status is the engine's ("downloading",
+"finished"), or "processing" for how far a join, tags or MP3 step has written its file.
+Standard library only; run with python -I.
 """
 
 import json
 import os
 import sys
+import threading
+import time
 from importlib import import_module
 
 OUT = sys.stdout
+OUT_LOCK = threading.Lock()  # a step's progress is reported from a thread of its own
 LIVE = "This is live now."  # jobs.py maps these words to the error kind "live"
 NO_JS_FAILS = ("requested format is not available", "only images are available")  # what a missing runtime causes
 
@@ -22,8 +27,9 @@ class Failure(Exception):
 
 
 def emit(**event):
-    OUT.write(json.dumps(event, default=str) + "\n")
-    OUT.flush()
+    with OUT_LOCK:
+        OUT.write(json.dumps(event, default=str) + "\n")
+        OUT.flush()
 
 
 class Log:
@@ -232,6 +238,51 @@ def where(d, n, spec, plan=()):
     return (i + frac) / len(parts), what
 
 
+STEPS = {"Merger": "join", "Metadata": "tags", "ExtractAudio": "mp3"}  # yt-dlp's steps that write a whole file
+EVERY = 1.0  # seconds between a step's reports
+
+
+def output(what, info):
+    """(the file a step writes, its expected bytes or None), from the info its started hook carries."""
+    path = info["filepath"]
+    base, ext = os.path.splitext(path)
+    if what == "mp3":
+        return base + ".mp3", info.get("duration") and int(info["duration"] * MP3_RATE)  # its usual size
+    inputs = [f["filepath"] for f in info["requested_formats"]] if what == "join" else [path]
+    try:
+        total = sum(os.path.getsize(f) for f in inputs)
+    except OSError:
+        total = None
+    return base + ".temp" + ext, total
+
+
+def watch(what, out, total, part, stop):
+    """Report how much of out is written, now and then every EVERY seconds until stop is set."""
+    then, before = None, 0
+    while True:
+        try:
+            done = max(before, os.path.getsize(out))  # never backwards: the file is renamed when the step ends
+        except OSError:
+            done = before
+        now = time.monotonic()
+        speed = (done - before) / (now - then) if then is not None and now > then else None
+        eta = int((total - done) / speed) if speed and total and total > done else None
+        emit(
+            event="progress",
+            status="processing",
+            part=part,
+            progress=None,  # the job's progress is the download's; a step's own is downloaded / total
+            what=what,
+            downloaded=done,
+            total=total,
+            speed=speed,
+            eta=eta,
+        )
+        then, before = now, done
+        if stop.wait(EVERY):
+            return
+
+
 def probe(engine, params, spec):
     params.update(extract_flat="in_playlist", skip_download=True)
     with engine.YoutubeDL(params) as ydl:
@@ -294,7 +345,54 @@ def download(engine, module, params, spec):
                 wrote(base + ".temp" + e)
             return [], information
 
+    joined = []  # the join takes chapters and details from the audio part: no second pass over the joined file
+    plain = []  # that join failed: the second try joins the plain way and Details writes the tags after
+    merging = []  # the join started and has not finished
+
+    def tag_audio(d):
+        """Tag the small audio part and have the join copy its tags, instead of rewriting the joined file after.
+
+        Any failure leaves today's two passes: the Details step then writes them into the joined file."""
+        info = d["info_dict"]
+        i = next((k for k, f in enumerate(plan) if f.get("format_id") == info.get("format_id")), None)
+        if plain or i is None or len(plan) < 2 or has(info, "vcodec") or not has(info, "acodec"):
+            return
+        try:
+            wrote("{}.temp{}".format(*os.path.splitext(d["filename"])))
+            tags(dict(info, filepath=d["filename"]))
+        except Exception as exc:  # the engine's error, or a change in its insides
+            emit(event="log", line=f"[spool] details go in after the join: {exc!r}")
+            return
+        args = ydl.params.setdefault("postprocessor_args", {})
+        args["merger+ffmpeg_o"] = ["-map_metadata", str(i), "-map_chapters", str(i)]
+        joined.append(i)
+
+    def tags(info):
+        Metadata = import_module("yt_dlp.postprocessor.ffmpeg").FFmpegMetadataPP
+        return Metadata(ydl, add_metadata=True, add_chapters=True).run(info)
+
+    class Details(PostProcessor):
+        """yt-dlp's chapters-and-details step, unless the join already carried them."""
+
+        def run(self, information):
+            return ([], information) if joined else tags(information)
+
     part = {"n": 0, "last": None}
+    stepping = [threading.Event()]
+
+    def step(d):
+        """yt-dlp's postprocessor_hooks: one step runs at a time, from its started hook to its finished one."""
+        stepping[0].set()
+        what = STEPS.get(d.get("postprocessor"))
+        if what == "join":
+            merging[:] = [True] if d.get("status") == "started" else []
+        if d.get("status") == "started" and what:
+            try:
+                out, total = output(what, d["info_dict"])
+            except (KeyError, TypeError):  # a change in the engine's insides: no number, the job goes on
+                return
+            stepping[0] = threading.Event()
+            threading.Thread(target=watch, args=(what, out, total, part["n"], stepping[0]), daemon=True).start()
 
     def hook(d):
         if d.get("status") == "downloading":  # only what this job writes; "already downloaded" is someone's file
@@ -317,6 +415,8 @@ def download(engine, module, params, spec):
             speed=d.get("speed"),
             eta=d.get("eta"),
         )
+        if module == "yt_dlp" and spec["ffmpeg"] and d.get("status") == "finished" and d.get("info_dict"):
+            tag_audio(d)
 
     refused = []
 
@@ -339,6 +439,7 @@ def download(engine, module, params, spec):
         outtmpl=NAME[module] + cls + ".%(ext)s",  # relative to dest
         updatetime=False,  # stamp files with the download time, not the upload time
         progress_hooks=[hook],
+        **({"postprocessor_hooks": [step]} if module == "yt_dlp" else {}),
         retries=10,
         fragment_retries=10,
     )
@@ -349,12 +450,8 @@ def download(engine, module, params, spec):
     params["postprocessors"] = []
     if spec["preset"] == "mp3":
         params["postprocessors"].append({"key": "FFmpegExtractAudio", "preferredcodec": "mp3"})
-    if spec["ffmpeg"]:  # chapters and the video's details go into the file; youtube-dl's takes no options
-        params["postprocessors"].append(
-            {"key": "FFmpegMetadata", "add_chapters": True, "add_metadata": True}
-            if module == "yt_dlp"
-            else {"key": "FFmpegMetadata"}
-        )
+    if spec["ffmpeg"] and module != "yt_dlp":  # chapters and the video's details go into the file; yt-dlp's: Details
+        params["postprocessors"].append({"key": "FFmpegMetadata"})
     try:  # from inside dest, an engine cannot recreate it: a path relative to a deleted folder goes nowhere
         os.chdir(spec["dest"])
     except OSError:
@@ -362,10 +459,22 @@ def download(engine, module, params, spec):
     with engine.YoutubeDL(params) as ydl:
         if module == "yt_dlp":
             ydl.add_post_processor(Name(), when="video")
+            if spec["ffmpeg"]:  # after the MP3 step, which params added first
+                ydl.add_post_processor(Details(), when="post_process")
             ydl.add_post_processor(Capture(), when="after_move")
         else:
             ydl.add_post_processor(Capture())
-        ydl.download([spec["url"]])
+        try:
+            ydl.download([spec["url"]])
+        except Exception as exc:
+            if not (joined and merging):
+                raise
+            # the parts stay on disk, so the engine finds them and only joins again
+            emit(event="log", line=f"[spool] the join with the details failed, so Spool joined the plain way: {exc}")
+            ydl.params["postprocessor_args"].pop("merger+ffmpeg_o")
+            joined.clear()
+            plain.append(True)
+            ydl.download([spec["url"]])
     if refused:
         raise refused[0]
     path = final.get("path")

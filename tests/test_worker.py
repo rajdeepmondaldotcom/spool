@@ -48,6 +48,29 @@ def test_download_merges_two_parts_and_reports_the_final_file(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["Fake video 1 [vid-1].mp4"]
 
 
+def steps(events):
+    return [e for e in events if e["event"] == "progress" and e["status"] == "processing"]
+
+
+def test_the_join_reports_how_far_it_is_about_once_a_second(tmp_path):
+    events = run("download", "https://fake.test/video?delay=0&join=0.15", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    join = [e for e in steps(events) if e["what"] == "join"]
+    assert len(join) >= 3  # the join takes about 3 seconds
+    assert {e["total"] for e in join} == {3_400_000}  # the sum of the parts
+    written = [e["downloaded"] for e in join]
+    assert written == sorted(written) and 0 < written[-1] <= 3_400_000
+    assert any(e["speed"] for e in join) and any(e["eta"] is not None for e in join)
+    assert {e["what"] for e in steps(events)} == {"tags", "join"}  # the audio part's tags, then the join
+
+
+def test_the_mp3_step_reports_too(tmp_path):
+    events = run("download", "https://fake.test/video?delay=0", dest=str(tmp_path), preset="mp3")
+    assert last(events)["event"] == "done", last(events)
+    assert [e["what"] for e in steps(events)][:1] == ["mp3"]
+    assert steps(events)[0]["total"] == 95 * 128_000 // 8  # its usual size: the duration at 128 kbit/s
+
+
 def test_download_works_with_youtube_dl_too(tmp_path):
     done = last(
         run("download", "https://fake.test/video?delay=0", engine="youtube-dl", dest=str(tmp_path), preset="720")
@@ -162,19 +185,44 @@ def ran(events):
     return line.removeprefix("[fake] ran: ").split(", ")
 
 
+def logged(events, start):
+    return [e["line"] for e in events if e["event"] == "log" and e["line"].startswith(start)]
+
+
 @pytest.mark.parametrize("engine", ["yt-dlp", "youtube-dl"])
-@pytest.mark.parametrize(
-    "preset, with_ffmpeg",
-    [
-        ("best", ["FFmpegMetadata", "Capture"]),
-        ("audio", ["FFmpegMetadata", "Capture"]),
-        ("mp3", ["FFmpegExtractAudio", "FFmpegMetadata", "Capture"]),
-    ],
-)
-def test_chapters_and_metadata_are_embedded_when_ffmpeg_is_there(tmp_path, engine, preset, with_ffmpeg):
+@pytest.mark.parametrize("preset", ["best", "audio", "mp3"])
+def test_chapters_and_metadata_are_embedded_when_ffmpeg_is_there(tmp_path, engine, preset):
     events = run("download", "https://fake.test/video?delay=0", engine=engine, dest=str(tmp_path), preset=preset)
     assert last(events)["event"] == "done", last(events)
-    assert ran(events) == with_ffmpeg  # the final-path capture still runs last
+    assert logged(events, "[fake] details in the file: ") == ["[fake] details in the file: True"]
+    assert ran(events)[-1] == "Capture"  # the final-path capture still runs last
+
+
+def test_a_join_writes_the_big_file_once_taking_the_details_from_the_audio_part(tmp_path):
+    events = run("download", "https://fake.test/video?delay=0", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert logged(events, "[Metadata] ") == ['[Metadata] Adding metadata to "Fake video 1 [vid-1].f140.m4a"']
+    assert logged(events, "[fake] details in the file: ") == ["[fake] details in the file: True"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["Fake video 1 [vid-1].mp4"]
+
+
+@pytest.mark.parametrize(
+    "url, preset, final",
+    [
+        (
+            "video?fail=tags&delay=0",
+            "best",
+            "Fake video 1 [vid-1].mp4",
+        ),  # the part could not be tagged: two passes, as before
+        ("video?delay=0", "audio", "Fake video 1 [vid-1].m4a"),  # one part: nothing to join
+    ],
+)
+def test_otherwise_the_details_are_written_after(tmp_path, url, preset, final):
+    events = run("download", f"https://fake.test/{url}", dest=str(tmp_path), preset=preset)
+    assert last(events)["event"] == "done", last(events)
+    assert logged(events, "[Metadata] ")[-1] == f'[Metadata] Adding metadata to "{final}"'
+    assert logged(events, "[fake] details in the file: ") == ["[fake] details in the file: True"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [final]
 
 
 @pytest.mark.parametrize("engine", ["yt-dlp", "youtube-dl"])

@@ -101,6 +101,7 @@ Your downloaded files are not in that folder, and Spool does not delete them.
 | "This quality needs a free helper…" | Run the command from step 3 of Install, then press Try again. |
 | "… isn't connected." | Plug the drive in, or press Change and pick another folder. |
 | "This tab lost its link to Spool." | Run `spool` again. It opens a working tab. |
+| "Joining video and audio" takes a long time | The drive is slow, and the row shows its speed and the time left. A drive plugged straight into the computer with a fast cable finishes this in minutes. |
 | macOS asks whether Spool may use a removable volume | Choose Allow. It asks the first time you save to an external drive. |
 
 For anything else, press Show log on the failed download and [open an issue](https://github.com/rajdeepmondaldotcom/spool/issues) with what it says.

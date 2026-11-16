@@ -58,6 +58,35 @@ def test_youtube_dl_progress_rises_too(app, events):
     assert progress == sorted(progress) and progress[-1] == 1.0
 
 
+def test_the_join_says_how_far_it_is(app, events):
+    job = add(app, "https://fake.test/video?delay=0.02&join=0.15")["jobs"][0]
+    seen = finished(events, job["id"])
+    assert seen[-1][1]["state"] == "done"
+    mine = [d for e, d in seen if e == "job" and d["id"] == job["id"]]
+    join = [d for d in mine if d["stage"] == "processing" and d["what"] == "join"]
+    assert len(join) >= 2, [(d["stage"], d["what"]) for d in mine]
+    assert {d["total"] for d in join} == {3_400_000}
+    written = [d["downloaded"] for d in join]
+    assert written == sorted(written) and written[-1] > 0
+    assert any(d["speed"] for d in join)
+    progress = [d["progress"] for d in mine if d["progress"] is not None]
+    assert progress == sorted(progress)
+    assert all(d["what"] in ("join", "tags", "mp3", None) for d in mine if d["stage"] == "processing")
+
+
+def test_a_join_that_fails_with_the_tags_is_tried_once_more_the_plain_way(app, events):
+    job = add(app, "https://fake.test/video?delay=0&fail=join-args")["jobs"][0]
+    done = finished(events, job["id"])[-1][1]
+    assert done["state"] == "done", done["error"]
+    assert os.path.exists(done["path"])
+    log = app.request("GET", f"/api/jobs/{job['id']}/log")[1].decode().splitlines()
+    assert len([line for line in log if line.startswith("[download] Destination: ")]) == 2  # each part fetched once
+    assert len([line for line in log if line.startswith("[spool] ")]) == 1  # the quick way failed, the plain way ran
+    name = os.path.basename(done["path"])
+    assert f'[Metadata] Adding metadata to "{name}"' in log  # the second pass wrote the details
+    assert "[fake] details in the file: True" in log
+
+
 # Engines without choices
 
 
