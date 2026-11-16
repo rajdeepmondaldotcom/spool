@@ -315,3 +315,220 @@ def test_a_real_join_writes_the_big_file_once_with_chapters_and_details(jobs, tm
     parts = sum(e["total"] for e in events if e["event"] == "progress" and e["status"] == "finished")
     [join] = {e["total"] for e in steps if e["what"] == "join"}
     assert 0 <= join - parts < 64_000  # the join's expected size: its parts, the audio part with its new tags
+
+
+# YouTube in pieces, file types and channels, on the real engine
+
+FILM_ID = "SkVqJ1SGeL0"
+FILM_720 = "Caminandes 3： Llamigos [SkVqJ1SGeL0] 720p"  # Spool's name for it: yt-dlp widens the colon
+PICKS = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import yt_dlp
+presets = json.load(sys.stdin)
+with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+    info = ydl.extract_info(sys.argv[2], download=False, process=False)
+picks = {}
+for preset, params in presets.items():  # the engine's own choice for each preset, as a download makes it
+    with yt_dlp.YoutubeDL({"quiet": True, "simulate": True, **params}) as ydl:
+        chosen = ydl.process_ie_result(dict(info, formats=[dict(f) for f in info["formats"]]), download=False)
+    picks[preset] = "+".join(f["format_id"] for f in chosen.get("requested_formats") or [chosen])
+print(json.dumps({"formats": info["formats"], "picks": picks}, default=str))
+"""
+FILM_PRESETS = ["best", "1080", "720", "480", "360", "240"]
+
+
+@pytest.fixture(scope="module")
+def film(jobs):
+    presets = {p: format_params(p, True, "yt_dlp") for p in FILM_PRESETS}
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", PICKS, jobs.engines.path("yt-dlp"), FILM],
+        input=json.dumps(presets),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    ).stdout
+    return json.loads(out.splitlines()[-1])
+
+
+@pytest.mark.parametrize("preset", FILM_PRESETS)
+def test_on_a_real_video_spool_counts_the_streams_the_engine_picks_for_every_preset(film, preset):
+    from spool.worker import chosen
+
+    ours = chosen(film["formats"], None if preset == "best" else int(preset), True)
+    assert "+".join(f["format_id"] for f in ours) == film["picks"][preset]
+
+
+def logs(events, start):
+    return [e["line"] for e in events if e["event"] == "log" and e["line"].startswith(start)]
+
+
+def tags(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "json", str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return {k.lower(): v for k, v in json.loads(out)["format"]["tags"].items()}
+
+
+def plays(path):
+    return subprocess.run(["ffmpeg", "-v", "error", "-xerror", "-i", str(path), "-f", "null", "-"]).returncode == 0
+
+
+needs_ffmpeg = pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")), reason="needs ffmpeg")
+
+
+@pytest.fixture(scope="module")
+def film_720(jobs, tmp_path_factory):
+    """The film at 720p, fetched in pieces once: (its events, its size)."""
+    events = worker(jobs, tmp_path_factory.mktemp("film"), FILM, "720")
+    assert events[-1]["event"] == "done", events[-1]
+    return events
+
+
+@needs_ffmpeg
+def test_a_real_youtube_download_comes_in_pieces_with_the_streams_of_today(film, film_720):
+    assert logs(film_720, f"[info] {FILM_ID}: Downloading 1 format(s): ") == [
+        f"[info] {FILM_ID}: Downloading 1 format(s): {film['picks']['720']}"
+    ]
+    assert len(logs(film_720, "[dashsegments] Total fragments: ")) == 2  # the video, then the audio
+    path = film_720[-1]["path"]
+    assert os.path.basename(path) == FILM_720 + ".mp4"
+    assert plays(path)
+    found = tags(path)
+    assert found["title"] == "Caminandes 3: Llamigos" and found["artist"] and found["date"], found
+    progress = [e["progress"] for e in film_720 if e["event"] == "progress" and e["progress"] is not None]
+    assert progress == sorted(progress) and progress[-1] == 1.0
+
+
+def look(jobs, url):
+    """The worker's lookup event for a link."""
+    spec = jobs._spec("yt-dlp", mode="probe", url=url)
+    out = subprocess.run(
+        [sys.executable, "-I", str(WORKER)], input=json.dumps(spec), capture_output=True, text=True, timeout=120
+    ).stdout
+    return [json.loads(line) for line in out.splitlines() if line.startswith("{")][-1]
+
+
+@pytest.fixture(scope="module")
+def film_types(jobs):
+    return {p["id"]: p["ext"] for p in look(jobs, FILM)["entries"][0]["presets"]}
+
+
+@pytest.mark.parametrize("preset", ["720", "audio", "mp3"])
+def test_each_quality_saves_the_file_type_the_lookup_named(jobs, tmp_path, film_types, preset):
+    assert (film_types["best"], film_types["audio"], film_types["mp3"]) == ("mp4", "m4a", "mp3"), film_types
+    events = worker(jobs, tmp_path, FILM, preset)
+    assert events[-1]["event"] == "done", events[-1]
+    assert events[-1]["path"].endswith("." + film_types[preset])
+
+
+@needs_ffmpeg
+def test_a_real_download_killed_half_way_resumes_in_pieces(jobs, tmp_path, film_720):
+    spec = jobs._spec("yt-dlp", mode="download", url=FILM, dest=str(tmp_path), preset="720", item=None)
+    child = subprocess.Popen(
+        [sys.executable, "-I", str(WORKER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    child.stdin.write(json.dumps(spec))
+    child.stdin.close()
+    for line in child.stdout:
+        e = json.loads(line)
+        if e["event"] == "progress" and (e["progress"] or 0) >= 0.3:
+            break
+    child.kill()  # our own child
+    child.wait()
+    assert any(p.name.endswith(".ytdl") for p in tmp_path.iterdir())  # the pieces' own record of where they got
+    events = worker(jobs, tmp_path, FILM, "720")
+    assert events[-1]["event"] == "done", events[-1]
+    assert abs(events[-1]["size"] - film_720[-1]["size"]) < 4096  # the same file, give or take its date tags
+    assert plays(events[-1]["path"])
+
+
+ENGINE_PIECES = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import yt_dlp
+params = {"quiet": True, "format": "136", "outtmpl": sys.argv[3]}
+if sys.argv[4] == "pieces":
+    params["extractor_args"] = {"youtube": {"formats": ["dashy"], "skip": ["hls"]}}
+with yt_dlp.YoutubeDL(params) as ydl:
+    sys.exit(ydl.download([sys.argv[2]]))
+"""
+
+
+def engine_fetch(jobs, out, mode):
+    subprocess.run(
+        [sys.executable, "-I", "-c", ENGINE_PIECES, jobs.engines.path("yt-dlp"), FILM, str(out), mode],
+        check=True,
+        timeout=300,
+    )
+    return out.read_bytes()
+
+
+@needs_ffmpeg
+def test_a_part_left_by_one_connection_is_never_resumed_in_pieces(jobs, tmp_path, film_720):
+    whole = engine_fetch(jobs, tmp_path / "whole.mp4", "whole")  # the 720p video stream, one connection
+    # The danger: the engine's own pieces mode appends to such a .part from byte 0 and calls it a success
+    (tmp_path / "cut.mp4.part").write_bytes(whole[:3_000_000])
+    joined = engine_fetch(jobs, tmp_path / "cut.mp4", "pieces")
+    assert len(joined) == 3_000_000 + len(whole) and joined != whole
+    # Spool finishes it the old way instead
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / f"{FILM_720}.f136.mp4.part").write_bytes(whole[:3_000_000])  # no .ytdl beside it
+    events = worker(jobs, dest, FILM, "720")
+    assert events[-1]["event"] == "done", events[-1]
+    assert len(logs(events, "[dashsegments] Total fragments: ")) == 1  # only the audio came in pieces
+    assert abs(events[-1]["size"] - film_720[-1]["size"]) < 4096
+    assert plays(events[-1]["path"])
+
+
+def test_a_real_channel_lists_its_newest_100_uploads(jobs):
+    start = time.monotonic()
+    probe = look(jobs, "https://www.youtube.com/@BlenderOfficial")
+    assert time.monotonic() - start < 30
+    assert (probe["kind"], probe["title"], probe["truncated"]) == ("playlist", "Blender", True), probe
+    entries = probe["entries"]
+    assert len(entries) == 100 and len({e["id"] for e in entries}) == 100
+    assert all(e["url"] == f"https://www.youtube.com/watch?v={e['id']}" and e["item"] is None for e in entries)
+    assert all(e["title"] and e["duration"] for e in entries)
+
+
+THROTTLE = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import yt_dlp
+
+class Log:
+    reads = 0
+    def debug(self, msg):
+        pass
+    info = error = debug
+    def warning(self, msg):
+        if "Re-extracting" in msg:
+            Log.reads += 1
+            if Log.reads == 2:  # the next pieces come at their usual speed
+                ydl.params["throttledratelimit"] = None
+params = {"logger": Log(), "format": "136", "outtmpl": sys.argv[3], "concurrent_fragment_downloads": 4,
+          "skip_unavailable_fragments": False, "throttledratelimit": 10**12,  # every piece looks throttled
+          "extractor_args": {"youtube": {"formats": ["dashy"], "skip": ["hls"]}}}
+with yt_dlp.YoutubeDL(params) as ydl:
+    ydl.download([sys.argv[2]])
+print(Log.reads)
+"""
+
+
+def test_a_throttled_piece_makes_the_engine_read_the_video_again_and_go_on_whole(jobs, tmp_path):
+    whole = engine_fetch(jobs, tmp_path / "whole.mp4", "whole")
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", THROTTLE, jobs.engines.path("yt-dlp"), FILM, str(tmp_path / "t.mp4")],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=300,
+    ).stdout
+    assert out.split()[-1] == "2"
+    assert (tmp_path / "t.mp4").read_bytes() == whole
