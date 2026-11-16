@@ -45,6 +45,14 @@ def gone(proc, timeout=5):
     return False
 
 
+@pytest.fixture(autouse=True)
+def no_home_downloads(tmp_path, monkeypatch):
+    """A Jobs built here with no saved folder checks tmp_path, never the real Downloads (R17)."""
+    from spool import system
+
+    monkeypatch.setattr(system, "default_dest", lambda: tmp_path)
+
+
 @pytest.fixture
 def events(app):
     events = app.events()
@@ -85,8 +93,9 @@ def test_cancel_only_what_is_waiting_or_running(app, events):
 def test_retry_resumes_the_partial_file(app, events):
     job_id = add(app, "https://fake.test/slow?delay=0.1")
     wait_for(events, job_id, downloading)
+    proc = app.jobs.procs[job_id]
     app.json("POST", f"/api/jobs/{job_id}/cancel")
-    assert gone(app.jobs.procs[job_id]) if app.jobs.procs.get(job_id) else True
+    assert gone(proc)  # the retry resumes what the first run left, not a file still being written
     status, job = app.json("POST", f"/api/jobs/{job_id}/retry")
     assert (status, job["state"], job["error"]) == (200, "queued", None)
     done = wait_for(events, job_id, lambda d: d["state"] == "done")
@@ -105,7 +114,7 @@ def test_retry_can_switch_the_engine(app, events):
 def test_retry_refuses_a_job_that_is_still_going(app, events):
     job_id = add(app, "https://fake.test/slow?delay=0.3")
     assert app.json("POST", f"/api/jobs/{job_id}/retry")[0] == 409
-    assert app.json("POST", f"/api/jobs/{job_id}/retry", {"engine": "nope"})[0] in (409, 422)
+    assert app.json("POST", f"/api/jobs/{job_id}/retry", {"engine": "nope"})[0] == 409
     assert app.json("POST", "/api/jobs/nope/retry")[0] == 404
 
 
@@ -258,10 +267,47 @@ def test_probe_errors_have_a_kind_and_plain_words(app):
             "ERROR: Unable to rename file: [Errno 2] No such file or directory: '/x/out/race/Me at the zoo [jNQXAC9IVRw].m4a.part'",
             "engine",
         ),
+        (  # a title in a path is not the engine's verdict
+            "ERROR: unable to open for writing: [Errno 13] Permission denied: '/x/Why this video is unavailable [a].mp4.part'",
+            "dest_denied",
+        ),
+        (
+            "ERROR: Unable to rename file: [Errno 2] No such file or directory: '/x/HTTP Error 403 explained [a].m4a.part' -> '/x/HTTP Error 403 explained [a].m4a'",
+            "engine",
+        ),
+        (
+            'ERROR: [Errno 30] Read-only file system: "/Volumes/T7/Don\'t sign in [a].mp4.part"',
+            "dest_denied",
+        ),
+        (
+            "ERROR: [vimeo] 1: Requested format is not available. Use --list-formats for a list of available formats",
+            "engine",
+        ),
     ],
 )
 def test_engine_messages_map_to_kinds(message, kind):
     assert classify(message) == kind
+
+
+def test_a_kind_the_worker_names_is_used_as_is(app, events, monkeypatch, tmp_path):
+    import spool.jobs
+
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "import sys\n"
+        "sys.stdin.read()\n"
+        'print(\'{"event": "error", "message": "HTTP Error 403 in a list", "kind": "playlist"}\')\n'
+    )
+    monkeypatch.setattr(spool.jobs, "WORKER", worker)
+    job_id = app.json("POST", "/api/jobs", {"entries": [{"url": "https://fake.test/playlist"}], "preset": "best"})[1]
+    failed = wait_for(events, job_id["jobs"][0]["id"], lambda d: d["state"] in ("done", "failed"))
+    assert failed["error"] == {
+        "kind": "playlist",
+        "message": "This link is a list of videos. Paste it in the link field to choose from it.",
+        "hint": None,
+    }
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/playlist"})
+    assert (status, body["error"]["kind"]) == (422, "playlist")
 
 
 @pytest.mark.parametrize(
@@ -298,6 +344,7 @@ def test_engine_messages_map_to_kinds(message, kind):
         ("engine_not_ready", None, "Spool is still setting up. Try again in a few seconds.", None),
         ("not_found", None, "Spool can't find that download.", None),
         ("gone", None, "Spool can't find the file. It was moved or deleted.", None),
+        ("playlist", None, "This link is a list of videos. Paste it in the link field to choose from it.", None),
     ],
 )
 def test_every_error_is_the_sentence_in_the_plan(kind, name, message, hint):
@@ -338,8 +385,9 @@ def test_details_the_entry_supplied_are_never_overwritten(app, events):
 
 def test_two_presets_of_one_video_write_two_files(app, events):
     ids = [add(app, "https://fake.test/video?delay=0", preset) for preset in ("best", "720", "audio")]
-    done = [wait_for(events, i, lambda d: d["state"] == "done") for i in ids]
-    names = [os.path.basename(d["path"]) for d in done]
+    done = {}  # two run at once, so they may finish in either order: wait for all in one pass
+    events.until(lambda e, d: e == "job" and d["state"] == "done" and not done.update({d["id"]: d}) and len(done) == 3)
+    names = [os.path.basename(done[i]["path"]) for i in ids]
     assert names == ["Fake video 1 [vid-1].mp4", "Fake video 1 [vid-1] 720p.mp4", "Fake video 1 [vid-1].m4a"]
 
 
@@ -496,3 +544,169 @@ def test_a_malformed_job_record_is_skipped(tmp_path):
         assert jobs.settings["engine"] == "yt-dlp" and isinstance(jobs.settings["dest"], str)
     finally:
         jobs.close()
+
+
+# A job's thread never dies quietly
+
+
+def test_a_worker_that_fails_to_start_fails_its_job_and_frees_its_slot(app, events, monkeypatch):
+    from spool import system
+
+    spawn = system.spawn
+    calls = []
+
+    def once(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError(24, "Too many open files")
+        return spawn(*args, **kwargs)
+
+    monkeypatch.setattr(system, "spawn", once)
+    first = add(app, "https://fake.test/video?delay=0")
+    failed = wait_for(events, first, lambda d: d["state"] in ("done", "failed"))
+    assert (failed["state"], failed["error"]["kind"]) == ("failed", "engine")
+    assert "Too many open files" in app.request("GET", f"/api/jobs/{first}/log")[1].decode()
+    second = add(app, "https://fake.test/video/2?delay=0")
+    assert wait_for(events, second, lambda d: d["state"] in ("done", "failed"))["state"] == "done"
+    assert app.jobs.procs == {}
+
+
+def test_a_byte_that_is_not_utf8_from_the_worker_is_only_logged(app, events, monkeypatch, tmp_path):
+    import spool.jobs
+
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "import sys\n"
+        "sys.stdin.read()\n"
+        "sys.stdout.buffer.write(b'\\xff\\xfe ffmpeg noise\\n')\n"
+        'sys.stdout.buffer.write(b\'{"event": "error", "message": "ERROR: Unsupported URL: x"}\\n\')\n'
+    )
+    monkeypatch.setattr(spool.jobs, "WORKER", worker)
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/video"})
+    assert (status, body["error"]["kind"]) == (422, "unsupported")
+    job = app.json("POST", "/api/jobs", {"entries": [{"url": "https://fake.test/video"}], "preset": "best"})[1]
+    failed = wait_for(events, job["jobs"][0]["id"], lambda d: d["state"] in ("done", "failed"))
+    assert (failed["state"], failed["error"]["kind"]) == ("failed", "unsupported")
+    assert app.jobs.procs == {}
+
+
+# Twins and the queue
+
+
+def test_retry_refuses_while_the_same_download_runs_in_another_row(app, events):
+    first = add(app, "https://fake.test/slow?delay=0.1")
+    wait_for(events, first, downloading)
+    app.json("POST", f"/api/jobs/{first}/cancel")
+    second = add(app, "https://fake.test/slow?delay=0.1")
+    assert second != first
+    status, body = app.json("POST", f"/api/jobs/{first}/retry")
+    assert (status, body["error"]["kind"]) == (409, "conflict")
+
+
+def test_two_run_at_once_and_the_rest_wait(app, events):
+    for n in (1, 2, 3):
+        add(app, f"https://fake.test/slow/{n}?delay=0.3")
+    assert sorted(j["state"] for j in app.jobs.snapshot()["jobs"]) == ["queued", "running", "running"]
+
+
+def test_adding_many_videos_saves_the_list_once(app, events, monkeypatch):
+    saves = []
+    save = app.jobs._save
+    monkeypatch.setattr(app.jobs, "_save", lambda: saves.append(1) or save())
+    entries = [{"url": f"https://fake.test/slow/{n}?delay=0.3"} for n in range(100)]
+    assert app.json("POST", "/api/jobs", {"entries": entries, "preset": "best"})[0] == 201
+    assert len(saves) <= 1 + 2  # the list, then the two jobs that start
+
+
+def test_progress_never_goes_back(tmp_path):
+    from spool.engines import Engines
+    from spool.jobs import Jobs, new_job
+
+    jobs = Jobs(tmp_path, Engines(tmp_path / "engines"))
+    try:
+        job = dict(new_job({"url": "https://fake.test/video"}, "best", "yt-dlp", str(tmp_path)), state="running")
+        for p in (0.5, 0.3):
+            jobs._progress(
+                job,
+                {
+                    "status": "downloading",
+                    "progress": p,
+                    "part": 1,
+                    "downloaded": 1,
+                    "total": 2,
+                    "speed": None,
+                    "eta": None,
+                },
+            )
+        assert job["progress"] == 0.5
+    finally:
+        jobs.close()
+
+
+# Reading and watching never wait on the disk under the lock
+
+
+def test_a_snapshot_checks_files_outside_the_lock(tmp_path, monkeypatch):
+    import pathlib
+
+    from spool.engines import Engines
+    from spool.jobs import Jobs, new_job
+
+    path = str(tmp_path / "v.mp4")
+    done = dict(new_job({"url": "https://fake.test/video"}, "best", "yt-dlp", str(tmp_path)), state="done", path=path)
+    (tmp_path / "state.json").write_text(json.dumps({"jobs": [done]}))
+    jobs = Jobs(tmp_path, Engines(tmp_path / "engines"))
+    held = []
+    exists, path_exists = os.path.exists, pathlib.Path.exists
+    monkeypatch.setattr(
+        os.path, "exists", lambda p: (str(p) != path or not held.append(jobs.lock._is_owned())) and exists(p)
+    )
+    monkeypatch.setattr(
+        pathlib.Path, "exists", lambda p: (str(p) != path or not held.append(jobs.lock._is_owned())) and path_exists(p)
+    )
+    try:
+        jobs.snapshot()
+        jobs.subscribe()
+        jobs._snapshot_changed()
+        assert held and not any(held)
+    finally:
+        jobs.close()
+
+
+def test_with_no_page_open_nothing_checks_the_folder(tmp_path, monkeypatch):
+    from spool import system
+    from spool.engines import Engines
+    from spool.jobs import Jobs
+
+    jobs = Jobs(tmp_path, Engines(tmp_path / "engines"))
+    checks = []
+    check = system.check_dest
+    monkeypatch.setattr(system, "check_dest", lambda p: checks.append(p) or check(p))
+    try:
+        jobs._snapshot_changed()
+        time.sleep(1.3)
+        assert checks == []
+        q = jobs.subscribe()
+        jobs._snapshot_changed()
+        assert q.get(timeout=1)[0] == q.get(timeout=1)[0] == "snapshot"
+    finally:
+        jobs.close()
+
+
+# Links
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://fake.test/video",
+        "file:///etc/passwd",
+        "javascript://fake.test/%0aalert(1)",
+        "https://user:pw@youtube.com@evil.test/x",
+        "https://me@fake.test/video",
+        "http://[::1/x",
+    ],
+)
+def test_a_link_must_be_http_or_https_with_a_plain_host(app, url):
+    status, body = app.json("POST", "/api/probe", {"url": url})
+    assert (status, body["error"]["kind"]) == (422, "invalid_link")
