@@ -17,6 +17,8 @@ const REEL = "M2.00 16.00a14 14 0 1 0 28.00 0a14 14 0 1 0-28.00 0ZM13.10 7.60a2.
 const Reel = ({ turning }) => html`
   <svg class="reel ${turning ? "turning" : ""}" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path d=${REEL} /></svg>`;
 
+// Only a 0.2 server sends `update`, and only it can quit or open a file.
+const newer = (snap) => "update" in snap;
 const isEditable = (el) => el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
 const revealWord = (platform) => (platform === "darwin" ? "Show in Finder" : "Show in folder");
 const modKey = (platform) => (platform === "darwin" ? "Cmd" : "Ctrl");
@@ -219,7 +221,7 @@ function App() {
         <span>${undo.words}</span>
         <button class="link-button" ref=${undoButton} onClick=${putBack}>Undo</button>
       </div>`}
-    <${SettingsDialog} snap=${snap} handle=${settings} notify=${notify} />
+    <${SettingsDialog} snap=${snap} handle=${settings} notify=${notify} running=${running.length} />
     <div class="visually-hidden" role="status" aria-live="polite">${said}</div>`;
 }
 
@@ -471,7 +473,7 @@ function Tray({ data, preset, setPreset, picked, setPicked, dest, busy, error, d
     <label class="tile" key=${p.id}>
       <input type="radio" name="quality" value=${p.id} checked=${preset === p.id} onChange=${() => setPreset(p.id)} />
       <span class="tile-label">${p.label}${p.detail && html` <span class="detail">${p.detail}</span>`}</span>
-      ${!playlist && html`<span class="tile-size num">${p.size != null ? f.bytes(p.size) : "Size unknown"}</span>`}
+      ${!playlist && html`<span class="tile-size num">${p.size != null ? f.bytes(p.size) : "Size unknown"}${p.ext && html` <span class="ext">${p.ext.toUpperCase()}</span>`}</span>`}
     </label>`;
 
   return html`
@@ -482,7 +484,7 @@ function Tray({ data, preset, setPreset, picked, setPicked, dest, busy, error, d
           <div class="tray-title">
             <h2 id="tray-title" class="clamp" dir="auto" title=${data.title}>${data.title}</h2>
             <p class="dim">
-              ${playlist ? html`<span class="num">${total} videos</span>`
+              ${playlist ? html`<span class="num">${total} videos</span>${data.truncated && html`<span>Showing the newest ${total}.</span>`}`
                 : html`${first.uploader && html`<span dir="auto">${first.uploader}</span>`} <span class="num">${f.duration(first.duration)}</span>`}
             </p>
           </div>
@@ -639,6 +641,7 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
           <p class="meta dim">
             ${running ? html`<span>${f.stageWords(job)}</span>
               ${!connected ? html`<span class="reconnecting">Reconnecting…</span>`
+                : job.stage === "waiting" ? html`<span class="num">${f.tryingAgain(job.eta)}</span>`
                 : job.stage !== "starting" && html`${step != null && html`<span class="num">${step}%</span>`}<span class="num">${f.speed(job.speed)}</span><span class="num">${f.timeLeft(job.eta)}</span>`}`
               : html`<span><${Icon} d=${ICONS.wait} />Waiting</span>`}
           </p>
@@ -675,6 +678,7 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
           <button class="icon-button" popovertarget=${menuId} aria-label="More actions for ${job.title}" title="More actions">
             <${Icon} d=${ICONS.more} cls="bold" /></button>
           <div class="menu" id=${menuId} popover="auto" onToggle=${place}>
+            ${newer(snap) && job.file_exists && !gone && html`<button popovertarget=${menuId} popovertargetaction="hide" onClick=${() => act(() => api.open(job.id))}>Open</button>`}
             <button onClick=${() => act(() => api.retry(job.id))}>Download again</button>
             <button onClick=${removeIt}>Remove from list</button>
           </div>
@@ -723,14 +727,15 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
 }
 
 // handle.current.open(focusFolder) lets "Change folder" land on the folder field.
-function SettingsDialog({ snap, handle, notify }) {
+function SettingsDialog({ snap, handle, notify, running }) {
   const dialog = useRef(), folder = useRef();
+  const [quitting, setQuitting] = useState(null); // null, "asking", or the sentence for why Spool did not quit
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
   const [checking, setChecking] = useState(false);
   handle.current = {
     open(focusFolder) {
-      setDraft(snap.settings.dest); setError("");
+      setDraft(snap.settings.dest); setError(""); setQuitting(null);
       dialog.current.showModal();
       if (focusFolder) folder.current.focus();
     },
@@ -751,6 +756,12 @@ function SettingsDialog({ snap, handle, notify }) {
   // A new tab with no way back to the site: a named window never matches from another site, and the handle
   // window.open returns would let that site navigate Spool's tab.
   const bookmark = `javascript:void(window.open(${JSON.stringify(`${location.origin}/#url=`)}+encodeURIComponent(location.href),"_blank","noopener"))`;
+  // After a quit the page shows what it shows for any Spool that stopped.
+  const quit = () => api.quit().then(() => dialog.current.close()).catch((e) => setQuitting(e.message));
+  // The question takes the Quit button's place, so focus moves to it and back.
+  useLayoutEffect(() => {
+    if (dialog.current.open) dialog.current.querySelector(quitting === "asking" ? ".quit-ask button" : ".quit")?.focus();
+  }, [quitting]);
   const on = notifying();
   const blocked = canNotify() && Notification.permission === "denied";
 
@@ -780,13 +791,30 @@ function SettingsDialog({ snap, handle, notify }) {
         <p>Save from any page. Drag this to your bookmarks bar:</p>
         <p><a class="bookmarklet" href=${bookmark} onClick=${(e) => e.preventDefault()}>Save with Spool</a></p>
       </div>
+      ${snap.update && html`
+        <div class="stack bookmark">
+          <p>Spool ${snap.update.version} is ready.</p>
+          <${CopyCommand} command="uv tool upgrade spool-dl" platform=${snap.tools.platform} />
+          <p class="dim">When it finishes, quit Spool and start it again.</p>
+        </div>`}
       <p class="version dim">
         <span>Spool ${snap.version || ""}</span>
         ${busy ? html`<span role="status">Checking…</span>`
           : checking && !engineError ? html`<span role="status">Up to date</span>`
           : html`<button class="link-button" onClick=${check}>Check for updates</button>`}
       </p>
-      <div class="dialog-actions"><button class="secondary" onClick=${() => dialog.current.close()}>Done</button></div>
+      ${quitting === "asking" ? html`
+        <div class="dialog-actions quit-ask">
+          <p>Downloads running now stop. You can resume them next time.</p>
+          <button class="secondary" onClick=${quit}>Quit now</button>
+          <button class="quiet" onClick=${() => setQuitting(null)}>Keep running</button>
+        </div>`
+        : html`
+        ${quitting && html`<p class="danger-text" role="alert">${quitting}</p>`}
+        <div class="dialog-actions">
+          ${newer(snap) && html`<button class="quiet quit" onClick=${() => (running ? setQuitting("asking") : quit())}>Quit Spool</button>`}
+          <button class="secondary" onClick=${() => dialog.current.close()}>Done</button>
+        </div>`}
     </dialog>`;
 }
 

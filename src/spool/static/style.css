@@ -224,6 +224,7 @@ input[type="radio"], input[type="checkbox"] { width: 18px; height: 18px; margin:
 .tile-label { font: 700 20px/1.1 var(--condensed); }
 .tile-label .detail { font-weight: 700; color: var(--ink-2); }
 .tile-size { font-size: 14px; color: var(--ink-2); }
+.tile-size .ext { margin-left: var(--s1); }
 .more { margin-top: var(--s2); padding-inline: 0; }
 .note { margin-top: var(--s4); font-weight: 600; }
 .tray-error { margin-top: var(--s4); padding: var(--s2) var(--s3); background: var(--danger-bg); color: var(--danger); border-radius: var(--r-control); }
@@ -333,7 +334,9 @@ progress:not([value])::-webkit-progress-bar { background: repeating-linear-gradi
   text-decoration: none; cursor: grab;
 }
 .version { display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--s3); font-size: 15px; padding-top: var(--s4); border-top: 1px solid var(--rule); }
-.dialog-actions { display: flex; justify-content: flex-end; margin-top: var(--s5); }
+.dialog-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--s2); margin-top: var(--s5); }
+.dialog-actions .quit { margin-right: auto; }
+.quit-ask p { flex: 1 1 16em; font-size: 15px; }
 
 @media (max-width: 600px) {
   .link-row { flex-direction: column; }

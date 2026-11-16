@@ -17,13 +17,15 @@ export function duration(s) {
   return h ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
 }
 
-export function timeLeft(s) {
-  if (s == null) return "";
-  if (s < 60) return `${Math.max(1, Math.round(s))} s left`;
-  if (s < 3600) return `${Math.ceil(s / 60)} min left`;
+function span(s) {
+  if (s < 60) return `${Math.max(1, Math.round(s))} s`;
+  if (s < 3600) return `${Math.ceil(s / 60)} min`;
   const h = Math.floor(s / 3600), m = Math.ceil((s % 3600) / 60);
-  return m ? `${h} h ${m} min left` : `${h} h left`;
+  return m ? `${h} h ${m} min` : `${h} h`;
 }
+export const timeLeft = (s) => (s == null ? "" : `${span(s)} left`);
+// A download waiting to try again by itself: the seconds until the next try.
+export const tryingAgain = (s) => (s == null ? "Trying again soon" : `Trying again in ${span(s)}`);
 
 export function presetName(id) {
   if (id === "best") return "Best";
@@ -36,6 +38,7 @@ const AUDIO = new Set(["audio", "mp3"]);
 const STEPS = { join: "Joining video and audio", tags: "Writing chapters and details", mp3: "Converting to MP3" };
 
 export function stageWords(job) {
+  if (job.stage === "waiting") return job.note || ""; // the server's sentence for what happened
   if (job.stage === "processing") return STEPS[job.what] || (job.preset === "mp3" ? "Converting to MP3" : job.part > 1 ? "Joining video and audio" : "Finishing");
   if (job.stage === "downloading") return job.what === "audio" || AUDIO.has(job.preset) ? "Downloading audio" : "Downloading video";
   return "Starting";

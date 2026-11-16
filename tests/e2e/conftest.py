@@ -19,11 +19,11 @@ def spool(tmp_path, request):
     jobs.close()
 
 
-NATIVE = ("**/api/choose-folder", "**/api/dest/reveal", "**/api/jobs/*/reveal")
+NATIVE = ("**/api/choose-folder", "**/api/dest/reveal", "**/api/jobs/*/reveal", "**/api/jobs/*/open", "**/api/quit")
 
 
 def guard_native(page):
-    """Calls that would open a native folder dialog or the file manager never reach the server in a test, from this
+    """Calls that would open a native folder dialog, the file manager or a player, or stop Spool, never reach the server in a test, from this
     page or any other tab of its browser context. Returns the paths they called; a test sets page.chosen to answer
     choose-folder."""
     made = []
