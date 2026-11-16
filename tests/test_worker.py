@@ -48,6 +48,29 @@ def test_download_merges_two_parts_and_reports_the_final_file(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["Fake video 1 [vid-1].mp4"]
 
 
+def steps(events):
+    return [e for e in events if e["event"] == "progress" and e["status"] == "processing"]
+
+
+def test_the_join_reports_how_far_it_is_about_once_a_second(tmp_path):
+    events = run("download", "https://fake.test/video?delay=0&join=0.15", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    join = [e for e in steps(events) if e["what"] == "join"]
+    assert len(join) >= 3  # the join takes about 3 seconds
+    assert {e["total"] for e in join} == {3_400_000}  # the sum of the parts
+    written = [e["downloaded"] for e in join]
+    assert written == sorted(written) and 0 < written[-1] <= 3_400_000
+    assert any(e["speed"] for e in join) and any(e["eta"] is not None for e in join)
+    assert {e["what"] for e in steps(events)} == {"tags", "join"}  # the audio part's tags, then the join
+
+
+def test_the_mp3_step_reports_too(tmp_path):
+    events = run("download", "https://fake.test/video?delay=0", dest=str(tmp_path), preset="mp3")
+    assert last(events)["event"] == "done", last(events)
+    assert [e["what"] for e in steps(events)][:1] == ["mp3"]
+    assert steps(events)[0]["total"] == 95 * 128_000 // 8  # its usual size: the duration at 128 kbit/s
+
+
 def test_download_works_with_youtube_dl_too(tmp_path):
     done = last(
         run("download", "https://fake.test/video?delay=0", engine="youtube-dl", dest=str(tmp_path), preset="720")

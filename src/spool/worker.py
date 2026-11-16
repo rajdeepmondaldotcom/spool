@@ -2,15 +2,20 @@
 
 Spec on stdin: {engine, engine_path, mode: "probe" | "download", url, ffmpeg, js_runtime?, dest?, preset?, item?}.
 Events: {"event": "log" | "progress" | "meta" | "file" | "info" | "done" | "error", ...}; an error carries "kind"
-("live", "no_js" or "playlist") when the worker knows it. Standard library only; run with python -I.
+("live", "no_js" or "playlist") when the worker knows it. A progress event's status is the engine's ("downloading",
+"finished"), or "processing" for how far a join, tags or MP3 step has written its file.
+Standard library only; run with python -I.
 """
 
 import json
 import os
 import sys
+import threading
+import time
 from importlib import import_module
 
 OUT = sys.stdout
+OUT_LOCK = threading.Lock()  # a step's progress is reported from a thread of its own
 LIVE = "This is live now."  # jobs.py maps these words to the error kind "live"
 NO_JS_FAILS = ("requested format is not available", "only images are available")  # what a missing runtime causes
 
@@ -22,8 +27,9 @@ class Failure(Exception):
 
 
 def emit(**event):
-    OUT.write(json.dumps(event, default=str) + "\n")
-    OUT.flush()
+    with OUT_LOCK:
+        OUT.write(json.dumps(event, default=str) + "\n")
+        OUT.flush()
 
 
 class Log:
@@ -232,6 +238,51 @@ def where(d, n, spec, plan=()):
     return (i + frac) / len(parts), what
 
 
+STEPS = {"Merger": "join", "Metadata": "tags", "ExtractAudio": "mp3"}  # yt-dlp's steps that write a whole file
+EVERY = 1.0  # seconds between a step's reports
+
+
+def output(what, info):
+    """(the file a step writes, its expected bytes or None), from the info its started hook carries."""
+    path = info["filepath"]
+    base, ext = os.path.splitext(path)
+    if what == "mp3":
+        return base + ".mp3", info.get("duration") and int(info["duration"] * MP3_RATE)  # its usual size
+    inputs = [f["filepath"] for f in info["requested_formats"]] if what == "join" else [path]
+    try:
+        total = sum(os.path.getsize(f) for f in inputs)
+    except OSError:
+        total = None
+    return base + ".temp" + ext, total
+
+
+def watch(what, out, total, part, stop):
+    """Report how much of out is written, now and then every EVERY seconds until stop is set."""
+    then, before = None, 0
+    while True:
+        try:
+            done = max(before, os.path.getsize(out))  # never backwards: the file is renamed when the step ends
+        except OSError:
+            done = before
+        now = time.monotonic()
+        speed = (done - before) / (now - then) if then is not None and now > then else None
+        eta = int((total - done) / speed) if speed and total and total > done else None
+        emit(
+            event="progress",
+            status="processing",
+            part=part,
+            progress=None,  # the job's progress is the download's; a step's own is downloaded / total
+            what=what,
+            downloaded=done,
+            total=total,
+            speed=speed,
+            eta=eta,
+        )
+        then, before = now, done
+        if stop.wait(EVERY):
+            return
+
+
 def probe(engine, params, spec):
     params.update(extract_flat="in_playlist", skip_download=True)
     with engine.YoutubeDL(params) as ydl:
@@ -325,6 +376,19 @@ def download(engine, module, params, spec):
             return ([], information) if joined else tags(information)
 
     part = {"n": 0, "last": None}
+    stepping = [threading.Event()]
+
+    def step(d):
+        """yt-dlp's postprocessor_hooks: one step runs at a time, from its started hook to its finished one."""
+        stepping[0].set()
+        what = STEPS.get(d.get("postprocessor"))
+        if d.get("status") == "started" and what:
+            try:
+                out, total = output(what, d["info_dict"])
+            except (KeyError, TypeError):  # a change in the engine's insides: no number, the job goes on
+                return
+            stepping[0] = threading.Event()
+            threading.Thread(target=watch, args=(what, out, total, part["n"], stepping[0]), daemon=True).start()
 
     def hook(d):
         if d.get("status") == "downloading":  # only what this job writes; "already downloaded" is someone's file
@@ -371,6 +435,7 @@ def download(engine, module, params, spec):
         outtmpl=NAME[module] + cls + ".%(ext)s",  # relative to dest
         updatetime=False,  # stamp files with the download time, not the upload time
         progress_hooks=[hook],
+        **({"postprocessor_hooks": [step]} if module == "yt_dlp" else {}),
         retries=10,
         fragment_retries=10,
     )

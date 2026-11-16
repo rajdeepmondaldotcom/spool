@@ -310,3 +310,8 @@ def test_a_real_join_writes_the_big_file_once_with_chapters_and_details(jobs, tm
     assert [c["tags"]["title"] for c in probe["chapters"]] == ["One", "Two"]
     tags = {k.lower(): v for k, v in probe["format"]["tags"].items()}
     assert tags["title"] and tags["artist"] and tags["date"], tags
+    steps = [e for e in events if e["event"] == "progress" and e["status"] == "processing"]
+    assert [e["what"] for e in steps][:1] == ["tags"] and "join" in [e["what"] for e in steps]  # the engine's hooks
+    parts = sum(e["total"] for e in events if e["event"] == "progress" and e["status"] == "finished")
+    [join] = {e["total"] for e in steps if e["what"] == "join"}
+    assert 0 <= join - parts < 64_000  # the join's expected size: its parts, the audio part with its new tags

@@ -479,17 +479,17 @@ class Jobs:
             if event.get("progress") is not None:  # never backwards, whatever the engine reports
                 job["progress"] = max(job["progress"] or 0.0, min(1.0, event["progress"]))
             job["what"] = event.get("what")
-            if event["status"] == "downloading":
+            if event["status"] in ("downloading", "processing"):  # a part, or a join, tags or MP3 step on a file
                 job.update(
-                    stage="downloading",
+                    stage=event["status"],
                     part=event["part"],
                     downloaded=event["downloaded"],
                     total=event["total"],
                     speed=event["speed"],
                     eta=event["eta"],
                 )
-            elif event["status"] == "finished":
-                job.update(stage="processing", downloaded=event["total"], speed=None, eta=None)
+            elif event["status"] == "finished":  # a part is done; what comes next is not known yet
+                job.update(stage="processing", what=None, downloaded=event["total"], speed=None, eta=None)
             self.dirty.add(job["id"])
 
     def _details(self, job, event):
@@ -671,7 +671,7 @@ RUN = {  # a job's fields for one run, as it is before the run starts; Retry set
     "stage": None,
     "part": 0,
     "progress": None,  # 0 to 1 across all parts, never decreasing
-    "what": None,  # "video" or "audio": what the current part carries
+    "what": None,  # downloading: "video" or "audio", what the part carries; processing: "join", "tags", "mp3" or None
     "downloaded": None,
     "total": None,
     "speed": None,
