@@ -1,7 +1,10 @@
+import io
 import json
+import shutil
 import subprocess
 import sys
 import time
+import zipfile
 
 import pytest
 from serve_fake import INSTALLED, LATEST, FakeGitHub, install_fake_engines
@@ -204,7 +207,71 @@ def test_older_engine_files_are_deleted_at_startup(tmp_path):
     folder = tmp_path / "engines" / "yt-dlp"
     (folder / "2025.01.01").write_bytes(b"old engine")
     (folder / "current.abc123.tmp").write_bytes(b"cut short")
-    engines = Engines(tmp_path / "engines", fetch=FakeGitHub().fetch, resolve=FakeGitHub().resolve)
+    github = FakeGitHub(latest=INSTALLED)  # nothing newer, so no install races the listing below
+    engines = Engines(tmp_path / "engines", fetch=github.fetch, resolve=github.resolve)
     engines.start()
     assert sorted(p.name for p in folder.iterdir()) == [INSTALLED, "current"]
     settle(engines)
+
+
+# A new release is checked before it becomes current
+
+
+def broken_engine_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for module in ("yt_dlp", "youtube_dl"):
+            z.writestr(f"{module}/__init__.py", "raise ImportError('this release needs a newer Python')\n")
+    return buf.getvalue()
+
+
+def test_a_release_that_cannot_load_is_never_made_current(tmp_path, capsys):
+    install_fake_engines(tmp_path)
+    github = FakeGitHub()
+    github.asset = broken_engine_zip()  # its checksum matches: only running it shows the fault
+    engines = Engines(tmp_path / "engines", fetch=github.fetch, resolve=github.resolve)
+    engines.update("yt-dlp")
+    status = settle(engines)["yt-dlp"]
+    assert (status["version"], status["error"]) == (INSTALLED, "Spool couldn't update its engine.")
+    assert not (tmp_path / "engines" / "yt-dlp" / LATEST).exists()
+    assert probe_with(engines.path("yt-dlp"), "yt-dlp")["event"] == "info"
+    assert "newer Python" in capsys.readouterr().err  # the cause is in the terminal, not only a vague sentence
+
+
+def test_a_deleted_engine_file_is_installed_again(tmp_path):
+    install_fake_engines(tmp_path)
+    shutil.rmtree(tmp_path / "engines" / "yt-dlp" / INSTALLED)
+    github = FakeGitHub(latest=INSTALLED)
+    engines = Engines(tmp_path / "engines", fetch=github.fetch, resolve=github.resolve)
+    assert engines.status()["yt-dlp"]["installed"] is False
+    engines.start()
+    assert settle(engines)["yt-dlp"]["installed"] is True
+    assert probe_with(engines.path("yt-dlp"), "yt-dlp")["event"] == "info"
+
+
+@pytest.mark.parametrize("tag", [".", "..", "current", "latest", "\u0662\u0660\u0662\u0666.01.01"])
+def test_a_release_tag_that_is_not_a_version_is_refused(tmp_path, tag):
+    github = FakeGitHub(latest=tag)
+    engines = Engines(tmp_path, fetch=github.fetch, resolve=github.resolve)
+    engines.update("yt-dlp")
+    status = settle(engines)["yt-dlp"]
+    assert (status["installed"], status["error"]) == (False, "Spool couldn't update its engine.")
+    assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+
+def test_a_fetch_larger_than_the_limit_is_refused(monkeypatch):
+    from spool import engines
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(engines, "LIMIT", 10)
+    monkeypatch.setattr(engines.urllib.request, "urlopen", lambda url, timeout: Response(b"x" * 11))
+    with pytest.raises(ValueError):
+        engines.http_get("https://example.test/big")
+    monkeypatch.setattr(engines.urllib.request, "urlopen", lambda url, timeout: Response(b"x" * 10))
+    assert engines.http_get("https://example.test/small") == b"x" * 10
