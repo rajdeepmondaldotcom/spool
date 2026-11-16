@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 from serve_fake import install_fake_engines
@@ -145,3 +146,9 @@ def test_shutdown_stops_running_downloads_and_removes_the_lockfile(data):
     for pid in workers:  # each worker's whole group, the helper it started included
         with pytest.raises((ProcessLookupError, PermissionError)):
             os.killpg(pid, 0)
+
+
+def test_tests_never_run_from_inside_the_repo(tmp_path):
+    here = Path.cwd().resolve()
+    assert here == tmp_path.resolve()
+    assert Path(__file__).resolve().parents[1] not in (here, *here.parents)

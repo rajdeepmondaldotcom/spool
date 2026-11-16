@@ -3,6 +3,15 @@ from serve_fake import FakeGitHub, start
 from support import Client
 
 
+@pytest.fixture(autouse=True)
+def away_from_the_repo(tmp_path, monkeypatch):
+    """Every test runs from its own temp folder, so nothing that deletes "here" can reach the repo.
+
+    A fake engine once ran shutil.rmtree(os.getcwd()) with the repo as the current folder and deleted it.
+    """
+    monkeypatch.chdir(tmp_path)
+
+
 @pytest.fixture
 def github():
     return FakeGitHub()
