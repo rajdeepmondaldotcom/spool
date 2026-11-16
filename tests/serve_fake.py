@@ -4,7 +4,8 @@
 
 Prints the link, with the token in its fragment (#t=fake-token); API calls send it as X-Spool-Token. Links like https://fake.test/video drive every UI state; see fake_engine/_fake.py.
 --fresh starts with no engines installed, so the first-run install is visible (it takes a few seconds).
---no-ffmpeg hides ffmpeg from PATH.
+--no-ffmpeg runs as if ffmpeg were missing. Tools never come from this machine's PATH: by default ffmpeg and a
+JavaScript runtime (deno) are there, so every machine offers the same qualities.
 --dest-hangs makes every destination check hang, as a sleeping drive does, so the page shows "not_responding".
 Other fake links: /live (fails as "live"), /needs-js (hint "install_js_runtime"), /shared-playlist (entries that
 share one link, downloaded as items), /broken (an engine bug). A /Volumes/<no such drive>/... destination is "unplugged".
@@ -70,8 +71,10 @@ class FakeGitHub:
         return self.asset + (b"corrupted" if self.corrupt else b"")
 
 
-def start(data_dir, port=0, fresh=False, github=None):
-    """Start Spool on the fake engine in data_dir. Returns (httpd, url, jobs, engines)."""
+def start(data_dir, port=0, fresh=False, github=None, ffmpeg=True, js_runtime="deno"):
+    """Start Spool on the fake engine in data_dir. Returns (httpd, url, jobs, engines).
+
+    The tools are what the caller says, never what this machine's PATH has, so tests run the same everywhere."""
     os.environ["SPOOL_DATA_DIR"] = str(data_dir)
     from spool import server, system
     from spool.engines import Engines
@@ -82,7 +85,8 @@ def start(data_dir, port=0, fresh=False, github=None):
         install_fake_engines(data)
     github = github or FakeGitHub(delay=2.0 if fresh else 0.0)
     engines = Engines(data / "engines", fetch=github.fetch, resolve=github.resolve)
-    jobs = Jobs(data, engines)
+    tools = {"ffmpeg": ffmpeg, "js_runtime": js_runtime, "platform": sys.platform, "can_choose_folder": False}
+    jobs = Jobs(data, engines, tools=lambda: dict(tools))
     downloads = data / "downloads"
     if not (data / "state.json").exists() or not downloads.exists():
         downloads.mkdir(exist_ok=True)
@@ -101,11 +105,8 @@ def main():
     parser.add_argument("--dest-hangs", action="store_true")
     parser.add_argument("--data-dir", help="reuse a data folder (default: a new temp folder)")
     args = parser.parse_args()
-    if args.no_ffmpeg:
-        paths = os.environ.get("PATH", "").split(os.pathsep)
-        os.environ["PATH"] = os.pathsep.join(p for p in paths if not shutil.which("ffmpeg", path=p))
     data = args.data_dir or tempfile.mkdtemp(prefix="spool-fake-")
-    httpd, url, jobs, _ = start(data, args.port, args.fresh)
+    httpd, url, jobs, _ = start(data, args.port, args.fresh, ffmpeg=not args.no_ffmpeg)
     if args.dest_hangs:
         from spool import system
 

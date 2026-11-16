@@ -26,7 +26,15 @@ def downloading(d):
     return d["state"] == "running" and d["stage"] == "downloading"
 
 
-def gone(pid, timeout=5):
+def gone(proc, timeout=5):
+    """The worker and, off Windows, everything in its process group have exited."""
+    if sys.platform == "win32":  # no process groups to probe: only the worker itself is checked there
+        try:
+            proc.wait(timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+    pid = proc.pid
     end = time.time() + timeout
     while time.time() < end:
         try:
@@ -51,10 +59,10 @@ def events(app):
 def test_cancel_stops_the_whole_process_group_and_keeps_the_partial_file(app, events):
     job_id = add(app, "https://fake.test/slow?delay=0.3")
     wait_for(events, job_id, downloading)
-    pid = app.jobs.procs[job_id].pid
+    proc = app.jobs.procs[job_id]
     status, job = app.json("POST", f"/api/jobs/{job_id}/cancel")
     assert (status, job["state"], job["stage"]) == (200, "cancelled", None)
-    assert gone(pid)  # the worker and the helper it started
+    assert gone(proc)  # the worker and the helper it started
     assert [p.name for p in app.dest.iterdir()] == ["Fake slow video [slow-1].mp4.part"]
 
 
@@ -78,7 +86,7 @@ def test_retry_resumes_the_partial_file(app, events):
     job_id = add(app, "https://fake.test/slow?delay=0.1")
     wait_for(events, job_id, downloading)
     app.json("POST", f"/api/jobs/{job_id}/cancel")
-    assert gone(app.jobs.procs[job_id].pid) if job_id in app.jobs.procs else True
+    assert gone(app.jobs.procs[job_id]) if app.jobs.procs.get(job_id) else True
     status, job = app.json("POST", f"/api/jobs/{job_id}/retry")
     assert (status, job["state"], job["error"]) == (200, "queued", None)
     done = wait_for(events, job_id, lambda d: d["state"] == "done")

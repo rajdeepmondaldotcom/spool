@@ -81,20 +81,15 @@ def unplugged(p):
 
 
 def display(path):
-    """A short label, never more than three names plus "…": "T7 › Spool", "Movies › Spool", "… › parent › folder"."""
+    """The folder's short label: its last two names, "Movies › Spool", "T7 › Spool". Home and /Volumes are not names."""
     p, home = Path(path), Path.home()
-    parts = p.parts[1:]
-    if sys.platform == "darwin" and parts[:1] == ("Volumes",) and len(parts) > 1:
-        head, parts, keep = (parts[1],), parts[2:], 2
-    elif sys.platform == "win32" and p.drive:
-        head, keep = (p.drive,), 2
-    elif p.is_relative_to(home) and p != home:
-        head, parts, keep = (), p.relative_to(home).parts, 3
+    if p.is_relative_to(home) and p != home:  # first: on Windows home sits on a drive too
+        parts = p.relative_to(home).parts
+    elif sys.platform == "darwin" and p.parts[1:2] == ("Volumes",):
+        parts = p.parts[2:]
     else:
-        head, keep = (), 2
-    if len(parts) > keep:
-        parts = ("…", *parts[-2:])
-    return " › ".join((*head, *parts)) or str(p)
+        parts = p.parts[1:]
+    return " › ".join(parts[-2:]) or p.name or str(p)
 
 
 def tools():

@@ -223,6 +223,10 @@ def test_the_top_class_wins_even_when_only_a_lower_class_is_h264():
     assert sizes["720"] == 1_500_000 + 400_000
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows cannot delete a process's current folder, so this race cannot happen there and is not covered",
+)
 def test_a_destination_deleted_just_before_the_engine_starts_is_not_recreated(tmp_path):
     drive = tmp_path / "Drive"
     drive.mkdir()

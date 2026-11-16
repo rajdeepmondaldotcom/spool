@@ -32,8 +32,8 @@ class Problem(Exception):
 
 
 class Jobs:
-    def __init__(self, data_dir, engines):
-        self.data, self.engines = Path(data_dir), engines
+    def __init__(self, data_dir, engines, tools=system.tools):
+        self.data, self.engines, self.tools = Path(data_dir), engines, tools  # tools: what the machine has
         self.state_file, self.logs = self.data / "state.json", self.data / "logs"
         self.logs.mkdir(exist_ok=True)
         saved = self._load()
@@ -91,7 +91,7 @@ class Jobs:
                 "settings": dict(self.settings),
                 "dest": dest,
                 "engines": self.engines.status(),
-                "tools": system.tools(),
+                "tools": self.tools(),
                 "jobs": jobs,
             }
 
@@ -273,7 +273,7 @@ class Jobs:
         return engine
 
     def _spec(self, engine, **spec):
-        tools = system.tools()
+        tools = self.tools()
         return {
             "engine": engine,
             "engine_path": self.engines.path(engine),
@@ -429,7 +429,7 @@ class Jobs:
                 self._publish("snapshot", self.snapshot(dest))
 
     def _machine(self):
-        return dict(system.check_dest(self.settings["dest"]), free_bytes=None), system.tools()
+        return dict(system.check_dest(self.settings["dest"]), free_bytes=None), self.tools()
 
     def _tick(self):
         """Flush throttled job progress."""

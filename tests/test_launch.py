@@ -13,7 +13,10 @@ import pytest
 from serve_fake import install_fake_engines
 from support import Client
 
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="stops Spool with SIGTERM and checks process groups; launch and shutdown are not covered on Windows",
+)
 
 
 @pytest.fixture

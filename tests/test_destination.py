@@ -113,20 +113,21 @@ def test_a_drive_is_labelled_by_its_name():
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS volumes")
-def test_a_deep_folder_on_a_drive_keeps_the_drive_and_the_last_two():
-    assert system.display("/Volumes/T7/Media/Video/2026/Spool") == "T7 › … › 2026 › Spool"
+def test_a_deep_folder_on_a_drive_is_its_last_two_names():
+    assert system.display("/Volumes/T7/Media/Video/2026/Spool") == "2026 › Spool"
     assert system.display("/Volumes/T7") == "T7"
 
 
 def test_a_folder_in_home_is_labelled_without_the_home_part():
     assert system.display(Path.home() / "Downloads") == "Downloads"
     assert system.display(Path.home() / "Movies" / "Clips") == "Movies › Clips"
-    assert system.display(Path.home() / "a" / "b" / "c" / "d") == "… › c › d"
+    assert system.display(Path.home() / "a" / "b" / "c" / "d") == "c › d"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX paths")
 def test_anything_else_shows_its_parent_and_folder():
-    assert system.display("/var/folders/m3/9gfmvp/T/downloads") == "… › T › downloads"
+    assert system.display("/var/folders/m3/9gfmvp/T/downloads") == "T › downloads"
+    assert system.display("/") == "/"
     assert system.display("/srv/videos") == "srv › videos"
 
 
@@ -150,6 +151,10 @@ def test_reveal_needs_a_finished_file_that_still_exists(app):
     assert app.jobs.snapshot()["jobs"][0]["file_exists"] is False
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows cannot delete a folder holding an open file, so a vanishing folder is not covered there",
+)
 def test_a_destination_that_vanishes_mid_download_is_named_as_missing(app, tmp_path):
     folder = tmp_path / "Drive"
     folder.mkdir()

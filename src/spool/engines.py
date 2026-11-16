@@ -3,8 +3,10 @@
 import hashlib
 import os
 import re
+import sys
 import tempfile
 import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -146,7 +148,14 @@ def write_atomic(path, data):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        for wait in (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, None):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:  # Windows refuses while another writer is replacing the same file
+                if wait is None or sys.platform != "win32":
+                    raise
+                time.sleep(wait)
     except BaseException:
         os.unlink(tmp)  # our own temp file, never anything else
         raise
