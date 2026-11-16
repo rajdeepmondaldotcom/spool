@@ -11,7 +11,7 @@ import webbrowser
 from urllib.parse import quote
 
 from . import server, system
-from .engines import Engines, write_atomic
+from .engines import Engines, JsRuntime, write_atomic
 from .jobs import Jobs
 
 PORT = 7766  # fixed by default, so a tab or bookmark survives a restart
@@ -36,8 +36,8 @@ def main(argv=None):
             webbrowser.open(url + carrying(args.links))
         return
 
-    engines = Engines(data / "engines")
-    jobs = Jobs(data, engines)
+    engines, js = Engines(data / "engines"), JsRuntime(data / "tools")
+    jobs = Jobs(data, engines, tools=lambda: system.tools(js), setup=js.start)
     try:
         httpd = server.make_server(jobs, engines, token, PORT if args.port is None else args.port)
     except OSError as exc:
@@ -51,6 +51,7 @@ def main(argv=None):
     write_private(lock, json.dumps({"port": port, "pid": os.getpid()}))
     signal.signal(signal.SIGTERM, interrupt)
     engines.start()
+    js.start()
     print(f"Spool is running at {url}", flush=True)
     print("Press Ctrl+C to stop it.", flush=True)
     if not args.no_open:

@@ -104,7 +104,7 @@ def test_events_start_with_a_snapshot(app):
     assert snap["dest"]["ok"] is True
     assert snap["engines"]["yt-dlp"]["installed"] is True
     assert snap["engines"]["yt-dlp"]["version"] == "2026.01.01"
-    assert set(snap["tools"]) >= {"ffmpeg", "js_runtime", "platform", "can_choose_folder"}
+    assert set(snap["tools"]) == {"ffmpeg", "js_runtime", "js_setup", "platform", "can_choose_folder"}
     assert snap["dest"]["message"] is None
     assert snap["version"] == "0.1.0"
     assert snap["jobs"] == []

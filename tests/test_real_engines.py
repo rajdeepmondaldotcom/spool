@@ -172,3 +172,18 @@ def test_yt_dlp_picks_the_class_by_its_short_side_with_h264_only_as_a_tie_break(
 )
 def test_youtube_dl_ladders_pick_the_class(jobs, formats, preset, chosen):
     assert pick(jobs, "youtube-dl", "youtube_dl", formats, preset) == chosen
+
+
+def test_spool_fetches_a_working_deno_from_its_official_release(tmp_path):
+    from spool.engines import JsRuntime
+
+    helper = JsRuntime(tmp_path, which=lambda name: None)  # as if the machine had no runtime
+    helper.start()
+    end = time.time() + 300
+    while helper.tools()["js_setup"] == "installing":
+        assert time.time() < end
+        time.sleep(0.5)
+    tools = helper.tools()
+    assert (tools["js_runtime"], tools["js_setup"]) == ("deno", None), tools
+    out = subprocess.run([tools["js_path"], "--version"], capture_output=True, text=True, check=True).stdout
+    assert out.startswith("deno ")

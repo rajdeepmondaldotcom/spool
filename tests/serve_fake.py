@@ -7,8 +7,11 @@ Prints the link, with the token in its fragment (#t=fake-token); API calls send 
 --no-ffmpeg runs as if ffmpeg were missing. Tools never come from this machine's PATH: by default ffmpeg and a
 JavaScript runtime (deno) are there, so every machine offers the same qualities.
 --dest-hangs makes every destination check hang, as a sleeping drive does, so the page shows "not_responding".
-Other fake links: /live (fails as "live"), /needs-js (hint "install_js_runtime"), /shared-playlist (entries that
-share one link, downloaded as items), /broken (an engine bug). A /Volumes/<no such drive>/... destination is "unplugged".
+--js-setup installing|failed shows YouTube's helper being fetched, or failed (tools.js_runtime is then null).
+Other fake links: /live (fails as "live"), /needs-js (kind "no_js"), /shared-playlist (entries that share one link,
+downloaded as items), /broken (an engine bug), /ytdl-only (only the second engine reads it), /audio (a part with
+no video), /video (Best is its top class, 1080p; MP3 has a size). Adding a finished video again is an "existing" add.
+A /Volumes/<no such drive>/... destination is "unplugged" on macOS; on Linux use /media/<nobody>/<drive>/...
 """
 
 import argparse
@@ -71,7 +74,7 @@ class FakeGitHub:
         return self.asset + (b"corrupted" if self.corrupt else b"")
 
 
-def start(data_dir, port=0, fresh=False, github=None, ffmpeg=True, js_runtime="deno"):
+def start(data_dir, port=0, fresh=False, github=None, ffmpeg=True, js_runtime="deno", js_setup=None):
     """Start Spool on the fake engine in data_dir. Returns (httpd, url, jobs, engines).
 
     The tools are what the caller says, never what this machine's PATH has, so tests run the same everywhere."""
@@ -85,7 +88,14 @@ def start(data_dir, port=0, fresh=False, github=None, ffmpeg=True, js_runtime="d
         install_fake_engines(data)
     github = github or FakeGitHub(delay=2.0 if fresh else 0.0, latest=LATEST if fresh else INSTALLED)
     engines = Engines(data / "engines", fetch=github.fetch, resolve=github.resolve)
-    tools = {"ffmpeg": ffmpeg, "js_runtime": js_runtime, "platform": sys.platform, "can_choose_folder": False}
+    tools = {
+        "ffmpeg": ffmpeg,
+        "js_runtime": js_runtime,
+        "js_setup": js_setup,
+        "js_path": None,
+        "platform": sys.platform,
+        "can_choose_folder": False,
+    }
     jobs = Jobs(data, engines, tools=lambda: dict(tools))
     downloads = data / "downloads"
     if not (data / "state.json").exists() or not downloads.exists():
@@ -103,10 +113,14 @@ def main():
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--no-ffmpeg", action="store_true")
     parser.add_argument("--dest-hangs", action="store_true")
+    parser.add_argument(
+        "--js-setup", choices=("installing", "failed"), help="YouTube's helper is being fetched, or failed"
+    )
     parser.add_argument("--data-dir", help="reuse a data folder (default: a new temp folder)")
     args = parser.parse_args()
     data = args.data_dir or tempfile.mkdtemp(prefix="spool-fake-")
-    httpd, url, jobs, _ = start(data, args.port, args.fresh, ffmpeg=not args.no_ffmpeg)
+    js = {"js_runtime": None, "js_setup": args.js_setup} if args.js_setup else {}
+    httpd, url, jobs, _ = start(data, args.port, args.fresh, ffmpeg=not args.no_ffmpeg, **js)
     if args.dest_hangs:
         from spool import system
 

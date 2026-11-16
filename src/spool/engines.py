@@ -1,13 +1,17 @@
 """Engines are files Spool manages: fetched from the official release, checksum-verified, versioned, switched last."""
 
 import hashlib
+import io
 import os
+import platform
 import re
+import shutil
 import sys
 import tempfile
 import threading
 import time
 import urllib.request
+import zipfile
 from pathlib import Path
 
 RELEASES = {
@@ -129,6 +133,73 @@ class Engines:
 
 class ChecksumMismatch(Exception):
     pass
+
+
+DENO = "https://github.com/denoland/deno/releases"
+DENO_TARGETS = {  # (sys.platform, machine) -> the release's target name
+    ("darwin", "arm64"): "aarch64-apple-darwin",
+    ("darwin", "x86_64"): "x86_64-apple-darwin",
+    ("linux", "x86_64"): "x86_64-unknown-linux-gnu",
+    ("linux", "aarch64"): "aarch64-unknown-linux-gnu",
+    ("win32", "AMD64"): "x86_64-pc-windows-msvc",
+}
+JS_ON_PATH = ("deno", "node", "bun")
+
+
+class JsRuntime:
+    """YouTube's JavaScript runtime: one on PATH if the machine has it, else deno fetched from its official release
+    the way the engines are (temp file, published SHA-256, switched last)."""
+
+    def __init__(self, root, fetch=http_get, resolve=final_url, which=shutil.which):
+        self.root, self.fetch, self.resolve, self.which = Path(root) / "deno", fetch, resolve, which
+        self.lock = threading.Lock()
+        self.setup = None  # None, "installing" or "failed"
+
+    def tools(self):
+        """{js_runtime, js_setup, js_path}: js_path is Spool's own deno, None for a runtime on PATH."""
+        on_path = next((name for name in JS_ON_PATH if self.which(name)), None)
+        current = self.root / "current"
+        own = self.root / current.read_text().strip() / exe() if not on_path and current.exists() else None
+        with self.lock:
+            return {"js_runtime": on_path or (own and "deno"), "js_setup": self.setup, "js_path": own and str(own)}
+
+    def start(self):
+        """Fetch deno in the background if nothing else will do. Safe to call often: one fetch at a time."""
+        with self.lock:
+            if self.setup == "installing":
+                return
+            self.setup = "installing"
+        if self.tools()["js_runtime"]:
+            with self.lock:
+                self.setup = None
+            return
+        threading.Thread(target=self._install, daemon=True).start()
+
+    def _install(self):
+        try:
+            tag = self.resolve(f"{DENO}/latest").rstrip("/").rsplit("/", 1)[-1]
+            asset = f"deno-{DENO_TARGETS[(sys.platform, platform.machine())]}.zip"
+            if not TAG.fullmatch(tag):
+                raise ValueError(f"unexpected release tag {tag!r}")
+            expected = self.fetch(f"{DENO}/download/{tag}/{asset}.sha256sum").decode().split()[0]
+            data = self.fetch(f"{DENO}/download/{tag}/{asset}")
+            if hashlib.sha256(data).hexdigest() != expected.lower():
+                raise ChecksumMismatch()
+            program = zipfile.ZipFile(io.BytesIO(data)).read(exe())  # the one file, never a path from the archive
+            folder = self.root / tag
+            folder.mkdir(parents=True, exist_ok=True)
+            write_atomic(folder / exe(), program)
+            os.chmod(folder / exe(), 0o700)
+            write_atomic(self.root / "current", tag.encode())
+            setup = None
+        except Exception:  # offline, a bad download, an unknown platform: say so, and a later start tries again
+            setup = "failed"
+        with self.lock:
+            self.setup = setup
+
+
+def exe():
+    return "deno.exe" if sys.platform == "win32" else "deno"
 
 
 def write_atomic(path, data):

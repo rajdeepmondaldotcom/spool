@@ -315,7 +315,9 @@ def main():
     sys.path.insert(0, spec["engine_path"])
     engine = import_module(module)
     params = {"logger": Log(), "noprogress": True}
-    if module == "yt_dlp" and spec.get("js_runtime") not in (None, "deno"):
+    if module == "yt_dlp" and spec.get("js_path"):  # Spool's own deno, outside PATH
+        params["js_runtimes"] = {"deno": {"path": spec["js_path"]}}
+    elif module == "yt_dlp" and spec.get("js_runtime") not in (None, "deno"):
         params["js_runtimes"] = {spec["js_runtime"]: {}}  # yt-dlp enables deno by itself
     if spec["mode"] == "probe":
         probe(engine, params, spec)

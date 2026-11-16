@@ -92,10 +92,12 @@ def display(path):
     return " › ".join(parts[-2:]) or p.name or str(p)
 
 
-def tools():
+def tools(js=None):
+    """What the machine has. js: a JsRuntime, which also knows about Spool's own deno and its setup."""
+    found = next((name for name in JS_RUNTIMES if shutil.which(name)), None)
     return {
         "ffmpeg": bool(shutil.which("ffmpeg")),
-        "js_runtime": next((name for name in JS_RUNTIMES if shutil.which(name)), None),
+        **(js.tools() if js else {"js_runtime": found, "js_setup": None, "js_path": None}),
         "platform": sys.platform,
         "can_choose_folder": sys.platform == "darwin",
     }

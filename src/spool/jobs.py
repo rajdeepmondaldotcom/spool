@@ -36,8 +36,9 @@ class Problem(Exception):
 
 
 class Jobs:
-    def __init__(self, data_dir, engines, tools=system.tools):
-        self.data, self.engines, self.tools = Path(data_dir), engines, tools  # tools: what the machine has
+    def __init__(self, data_dir, engines, tools=system.tools, setup=lambda: None):
+        # tools: what the machine has; setup: fetch YouTube's helper again if the last try failed
+        self.data, self.engines, self.tools, self.setup = Path(data_dir), engines, tools, setup
         self.state_file, self.logs = self.data / "state.json", self.data / "logs"
         self.logs.mkdir(exist_ok=True)
         saved = self._load()
@@ -95,7 +96,7 @@ class Jobs:
                 "settings": dict(self.settings),
                 "dest": dest_message(dest),
                 "engines": self.engines.status(),
-                "tools": self.tools(),
+                "tools": {k: v for k, v in self.tools().items() if k != "js_path"},
                 "version": VERSION,
                 "jobs": jobs,
             }
@@ -118,6 +119,7 @@ class Jobs:
     def probe(self, url, engine=None):
         """Read a link with the engine in settings, then the other when the first can't read it or finds nothing."""
         url, first = link(url), self._engine(engine)
+        self.setup()
         order = [first] if engine else [first, other(first)]
         for n, name in enumerate(order):
             try:
@@ -186,6 +188,7 @@ class Jobs:
             if job["state"] in ("queued", "running"):
                 raise Problem(409, "conflict", "This download is still going.")
             engine = self._engine(engine or job["engine"])
+            self.setup()
             job.update(
                 engine=engine,
                 state="queued",
@@ -329,6 +332,7 @@ class Jobs:
             "engine_path": self.engines.path(engine),
             "ffmpeg": tools["ffmpeg"],
             "js_runtime": tools["js_runtime"],
+            "js_path": tools.get("js_path"),
             **spec,
         }
 
