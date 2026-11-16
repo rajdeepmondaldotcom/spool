@@ -1,0 +1,176 @@
+import http.client
+from pathlib import Path
+
+from support import job_state
+
+
+def raw(app, method, path, headers):
+    """A request with exactly these headers (urllib always sends its own Host)."""
+    host, port = app.httpd.server_address
+    conn = http.client.HTTPConnection(host, port, timeout=10)
+    conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+    for k, v in headers.items():
+        conn.putheader(k, v)
+    conn.endheaders()
+    r = conn.getresponse()
+    return r.status, r.getheaders(), r.read()
+
+
+def host(app):
+    return f"127.0.0.1:{app.httpd.server_address[1]}"
+
+
+# Access checks
+
+
+def test_a_foreign_host_is_refused(app):
+    status, _, _ = raw(app, "GET", "/", {"Host": "evil.test", "Cookie": "spool=fake-token"})
+    assert status == 403
+
+
+def test_localhost_by_name_is_accepted(app):
+    port = app.httpd.server_address[1]
+    status, _, _ = raw(app, "GET", "/", {"Host": f"localhost:{port}", "Cookie": "spool=fake-token"})
+    assert status == 200
+
+
+def test_without_the_cookie_everything_is_refused(app):
+    for path in ("/", "/api/events", "/index.html"):
+        status, _, _ = raw(app, "GET", path, {"Host": host(app)})
+        assert status == 403, path
+
+
+def test_the_token_link_sets_the_cookie_and_redirects(app):
+    status, headers, _ = raw(app, "GET", "/?t=fake-token", {"Host": host(app)})
+    headers = dict(headers)
+    assert status == 303
+    assert headers["Location"] == "/"
+    assert headers["Set-Cookie"] == "spool=fake-token; HttpOnly; SameSite=Strict; Path=/"
+
+
+def test_a_wrong_token_link_is_refused(app):
+    status, headers, _ = raw(app, "GET", "/?t=guess", {"Host": host(app)})
+    assert status == 403
+    assert "Set-Cookie" not in dict(headers)
+
+
+def test_writes_need_our_own_origin(app):
+    body = {"url": "https://fake.test/video"}
+    assert app.json("POST", "/api/probe", body, {"Origin": "https://evil.test"})[0] == 403
+    status, _, _ = raw(app, "POST", "/api/probe", {"Host": host(app), "Cookie": "spool=fake-token"})
+    assert status == 403
+
+
+def test_writes_with_a_body_must_be_json(app):
+    status, _, _ = app.request("POST", "/api/probe", None, {"Content-Type": "text/plain", "Content-Length": "2"})
+    assert status == 415
+
+
+def test_the_page_is_served_with_a_strict_content_security_policy(app):
+    status, raw_body, headers = app.request("GET", "/")
+    assert status == 200
+    assert b"<html" in raw_body.lower()
+    assert headers["Content-Security-Policy"].startswith("default-src 'self'")
+    assert "Access-Control-Allow-Origin" not in headers
+
+
+def test_static_files_cannot_escape_the_static_folder(app):
+    assert app.request("GET", "/../__init__.py")[0] == 404
+    assert app.request("GET", "/%2e%2e/__init__.py")[0] == 404
+
+
+def test_errors_are_json_with_a_kind_and_plain_words(app):
+    status, body = app.json("GET", "/api/nothing-here")
+    assert status == 404
+    assert body["error"]["kind"] == "not_found"
+    assert body["error"]["message"]
+
+
+# Live events, probe and download
+
+
+def test_events_start_with_a_snapshot(app):
+    events = app.events()
+    event, snap = events.next()
+    events.close()
+    assert event == "snapshot"
+    assert snap["settings"] == {"dest": str(app.dest), "engine": "yt-dlp", "preset": "best"}
+    assert snap["dest"]["ok"] is True
+    assert snap["engines"]["yt-dlp"]["installed"] is True
+    assert snap["engines"]["yt-dlp"]["version"] == "2026.01.01"
+    assert set(snap["tools"]) == {"ffmpeg", "js_runtime", "platform", "can_choose_folder"}
+    assert snap["jobs"] == []
+
+
+def test_probe_returns_the_entries(app):
+    status, probe = app.json("POST", "/api/probe", {"url": "https://fake.test/video"})
+    assert status == 200
+    assert probe["engine"] == "yt-dlp"
+    assert probe["kind"] == "video"
+    assert probe["entries"][0]["id"] == "vid-1"
+
+
+def test_probe_of_an_empty_playlist_suggests_the_other_engine(app):
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/empty-playlist"})
+    assert status == 422
+    assert body["error"]["kind"] == "empty"
+    assert body["error"]["hint"] == "try_other_engine"
+
+
+def test_probe_of_a_playlist_lists_its_entries(app):
+    status, probe = app.json("POST", "/api/probe", {"url": "https://fake.test/playlist", "engine": "youtube-dl"})
+    assert status == 200
+    assert probe["engine"] == "youtube-dl"
+    assert (probe["kind"], probe["title"], len(probe["entries"])) == ("playlist", "Fake playlist", 3)
+
+
+def test_probe_refuses_a_link_that_is_not_http(app):
+    for url in ("file:///etc/passwd", "javascript:alert(1)", "https://", "not a link", 42):
+        status, body = app.json("POST", "/api/probe", {"url": url})
+        assert status == 422, url
+        assert body["error"]["kind"] == "invalid_link"
+
+
+def test_a_job_downloads_with_live_progress_to_the_destination(app):
+    events = app.events()
+    events.next()
+    status, probe = app.json("POST", "/api/probe", {"url": "https://fake.test/video?delay=0.02"})
+    status, body = app.json("POST", "/api/jobs", {"entries": probe["entries"], "preset": "best"})
+    assert status == 201
+    [job] = body["jobs"]
+    assert job["state"] == "queued"
+    seen = events.until(job_state("done"))
+    events.close()
+    states = [d["state"] for e, d in seen if e == "job"]
+    assert states[0] == "queued" and "running" in states and states[-1] == "done"
+    assert any(d.get("stage") == "downloading" and d["downloaded"] for e, d in seen if e == "job")
+    done = seen[-1][1]
+    assert done["path"] == str(app.dest / "Fake video 1 [vid-1].mp4")
+    assert done["size"] == 3_400_000
+    assert done["file_exists"] is True
+    assert Path(done["path"]).exists()
+
+
+def test_job_events_are_throttled_to_four_a_second(app):
+    events = app.events()
+    events.next()
+    # 20 progress steps over about one second
+    entry = {"url": "https://fake.test/video?delay=0.05", "id": "vid-1", "title": "Fake video 1"}
+    app.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})
+    seen = events.until(job_state("done"))
+    events.close()
+    progress = [d for e, d in seen if e == "job" and d["state"] == "running"]
+    assert 2 <= len(progress) <= 8
+
+
+def test_two_jobs_run_at_once_and_the_third_waits(app):
+    events = app.events()
+    events.next()
+    entries = [
+        {"url": f"https://fake.test/slow/{n}?delay=0.2", "id": f"slow-{n}", "title": f"Slow {n}"} for n in (1, 2, 3)
+    ]
+    app.json("POST", "/api/jobs", {"entries": entries, "preset": "best"})
+    events.until(lambda e, d: e == "job" and d["state"] == "running" and d["stage"] == "downloading")
+    states = {j["title"]: j["state"] for j in app.jobs.snapshot()["jobs"]}
+    assert states == {"Slow 1": "running", "Slow 2": "running", "Slow 3": "queued"}
+    events.close()

@@ -1,0 +1,164 @@
+import os
+import shutil
+import sys
+from pathlib import Path
+
+import pytest
+from support import job_state
+
+from spool import system
+
+
+def entry(url="https://fake.test/video?delay=0"):
+    return {"url": url, "id": "vid-1", "title": "Fake video 1"}
+
+
+# Settings
+
+
+def test_settings_change_the_destination_engine_and_preset(app, tmp_path):
+    folder = tmp_path / "Videos"
+    folder.mkdir()
+    events = app.events()
+    events.next()
+    status, body = app.json("PUT", "/api/settings", {"dest": str(folder), "engine": "youtube-dl", "preset": "720"})
+    assert status == 200
+    assert body["settings"] == {"dest": str(folder), "engine": "youtube-dl", "preset": "720"}
+    assert (body["dest"]["ok"], body["dest"]["problem"]) == (True, None)
+    assert body["dest"]["free_bytes"] > 0
+    event, snap = events.next()
+    assert (event, snap["settings"]["dest"]) == ("snapshot", str(folder))
+    events.close()
+
+
+def test_a_missing_destination_is_saved_with_its_problem_and_never_created(app, tmp_path):
+    gone = tmp_path / "Unplugged" / "Spool"
+    status, body = app.json("PUT", "/api/settings", {"dest": str(gone)})
+    assert status == 200
+    assert (body["dest"]["ok"], body["dest"]["problem"], body["dest"]["free_bytes"]) == (False, "missing", None)
+    assert not gone.parent.exists()
+    assert app.jobs.snapshot()["settings"]["dest"] == str(gone)
+
+
+def test_a_file_is_not_a_folder(app, tmp_path):
+    (tmp_path / "file").write_text("x")
+    assert app.json("PUT", "/api/settings", {"dest": str(tmp_path / "file")})[1]["dest"]["problem"] == "not_a_folder"
+
+
+@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0, reason="permissions differ")
+def test_a_read_only_folder_is_not_writable(app, tmp_path):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        assert app.json("PUT", "/api/settings", {"dest": str(locked)})[1]["dest"]["problem"] == "not_writable"
+        status, body = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})
+        assert (status, body["error"]["kind"], body["error"]["hint"]) == (409, "dest_denied", "check_dest")
+    finally:
+        locked.chmod(0o700)
+
+
+@pytest.mark.parametrize(
+    "body, kind",
+    [
+        ({"dest": "relative/path"}, "invalid_dest"),
+        ({"dest": 7}, "invalid_dest"),
+        ({"engine": "ffmpeg"}, "invalid_engine"),
+        ({"preset": "4k"}, "invalid_preset"),
+        ({"colour": "red"}, "invalid_setting"),
+    ],
+)
+def test_bad_settings_are_refused_with_the_reason(app, body, kind):
+    status, reply = app.json("PUT", "/api/settings", body)
+    assert (status, reply["error"]["kind"]) == (422, kind)
+
+
+# Checks before downloading
+
+
+def test_a_download_to_a_missing_destination_is_refused_up_front(app, tmp_path):
+    app.json("PUT", "/api/settings", {"dest": str(tmp_path / "nowhere")})
+    status, body = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})
+    assert (status, body["error"]["kind"], body["error"]["hint"]) == (409, "dest_missing", "check_dest")
+    assert app.jobs.snapshot()["jobs"] == []
+
+
+def test_the_destination_is_checked_again_when_the_job_starts(app, tmp_path):
+    folder = tmp_path / "Drive"
+    folder.mkdir()
+    app.json("PUT", "/api/settings", {"dest": str(folder)})
+    events = app.events()
+    events.next()
+    # two slow jobs fill both slots, so the third waits while its drive is unplugged
+    app.json(
+        "POST",
+        "/api/jobs",
+        {"entries": [entry(f"https://fake.test/slow/{n}?delay=0.1") for n in (1, 2)], "preset": "best"},
+    )
+    third = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})[1]["jobs"][0]
+    shutil.rmtree(folder)
+    seen = events.until(lambda e, d: e == "job" and d["id"] == third["id"] and d["state"] == "failed", timeout=20)
+    events.close()
+    assert seen[-1][1]["error"]["kind"] == "dest_missing"
+    assert not folder.exists()
+
+
+# Display label
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS volumes")
+def test_a_drive_is_labelled_by_its_name():
+    assert system.display("/Volumes/T7/Spool") == "T7 › Spool"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS volumes")
+def test_a_deep_folder_on_a_drive_keeps_the_drive_and_the_last_two():
+    assert system.display("/Volumes/T7/Media/Video/2026/Spool") == "T7 › … › 2026 › Spool"
+    assert system.display("/Volumes/T7") == "T7"
+
+
+def test_a_folder_in_home_is_labelled_without_the_home_part():
+    assert system.display(Path.home() / "Downloads") == "Downloads"
+    assert system.display(Path.home() / "Movies" / "Clips") == "Movies › Clips"
+    assert system.display(Path.home() / "a" / "b" / "c" / "d") == "… › c › d"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX paths")
+def test_anything_else_shows_its_parent_and_folder():
+    assert system.display("/var/folders/m3/9gfmvp/T/downloads") == "… › T › downloads"
+    assert system.display("/srv/videos") == "srv › videos"
+
+
+# Folder chooser and reveal
+
+
+def test_choose_folder_is_501_without_a_native_dialog(app, monkeypatch):
+    monkeypatch.setattr(system.sys, "platform", "linux")
+    assert app.json("POST", "/api/choose-folder")[0] == 501
+
+
+def test_reveal_needs_a_finished_file_that_still_exists(app):
+    events = app.events()
+    events.next()
+    job = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})[1]["jobs"][0]
+    done = events.until(job_state("done"))[-1][1]
+    events.close()
+    os.remove(done["path"])
+    assert app.json("POST", f"/api/jobs/{job['id']}/reveal")[0] == 410
+    assert app.json("POST", "/api/jobs/nope/reveal")[0] == 404
+    assert app.jobs.snapshot()["jobs"][0]["file_exists"] is False
+
+
+def test_a_destination_that_vanishes_mid_download_is_named_as_missing(app, tmp_path):
+    folder = tmp_path / "Drive"
+    folder.mkdir()
+    app.json("PUT", "/api/settings", {"dest": str(folder)})
+    events = app.events()
+    events.next()
+    job = app.json("POST", "/api/jobs", {"entries": [entry("https://fake.test/slow?delay=0.1")], "preset": "best"})
+    job_id = job[1]["jobs"][0]["id"]
+    events.until(lambda e, d: e == "job" and d["id"] == job_id and d["stage"] == "downloading")
+    shutil.rmtree(folder)
+    failed = events.until(lambda e, d: e == "job" and d["id"] == job_id and d["state"] == "failed")[-1][1]
+    events.close()
+    assert (failed["error"]["kind"], failed["error"]["hint"]) == ("dest_missing", "check_dest")
