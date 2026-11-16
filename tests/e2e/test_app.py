@@ -96,8 +96,9 @@ def test_escape_cancels_a_lookup_and_ignores_the_late_answer(app):
     app.keyboard.press("Escape")
     expect(app.get_by_role("button", name="Get details")).to_be_enabled()
     expect(app.get_by_label("Link to download")).to_be_focused()
-    held[0].continue_()
-    app.wait_for_timeout(1000)
+    with app.expect_response("**/api/probe") as late:
+        held[0].continue_()
+    late.value.finished()
     expect(app.get_by_role("region", name="Fake video 1")).to_have_count(0)
 
 
@@ -598,7 +599,7 @@ def test_remove_takes_the_row_off_at_once_and_undo_puts_it_back(app, spool):
     add(spool, [("https://fake.test/403", "Fake refused video")])
     stopped = group(app, "Stopped")
     stopped.get_by_role("button", name="Remove from list").click(timeout=15000)
-    undo = app.get_by_role("button", name="Undo")
+    undo = app.get_by_role("button", name="Undo", exact=True)
     expect(undo).to_be_focused()
     expect(app.get_by_role("status").filter(has_text="Removed.")).to_be_visible()
     expect(app.get_by_text("Downloads show up here. Paste a link above to start.")).to_be_visible()
@@ -619,7 +620,7 @@ def test_remove_a_finished_download_from_its_menu(app):
     expect(finished.get_by_role("button", name="Download again")).to_be_visible()
     finished.get_by_role("button", name="Remove from list").click()
     expect(app.get_by_text("Downloads show up here. Paste a link above to start.")).to_be_visible()
-    expect(app.get_by_role("button", name="Undo")).to_be_focused()
+    expect(app.get_by_role("button", name="Undo", exact=True)).to_be_focused()
 
 
 def test_finished_shows_ten_then_show_all_and_clear_list_keeps_the_files(app, spool, tmp_path):
@@ -630,16 +631,17 @@ def test_finished_shows_ten_then_show_all_and_clear_list_keeps_the_files(app, sp
     finished.get_by_role("button", name="Show all 12").click()
     expect(finished.get_by_role("listitem")).to_have_count(12)
 
+    clear_by_ids(app, spool)
     files = sorted(p.name for p in (tmp_path / "downloads").iterdir())
     finished.get_by_role("button", name="Clear list").click()
     expect(app.get_by_role("status").filter(has_text="Cleared 12.")).to_be_visible()
-    expect(app.get_by_role("button", name="Undo")).to_be_focused()
+    expect(app.get_by_role("button", name="Undo", exact=True)).to_be_focused()
     expect(finished).to_have_count(0)
-    app.get_by_role("button", name="Undo").click()
+    app.get_by_role("button", name="Undo", exact=True).click()
     expect(group(app, "Finished").get_by_role("listitem")).to_have_count(12)
 
     group(app, "Finished").get_by_role("button", name="Clear list").click()
-    expect(app.get_by_role("button", name="Undo")).to_be_hidden(timeout=7000)
+    expect(app.get_by_role("button", name="Undo", exact=True)).to_be_hidden(timeout=7000)
     expect(app.get_by_text("Downloads show up here. Paste a link above to start.")).to_be_visible()
     assert not [j for j in spool[1].snapshot()["jobs"] if j["state"] == "done"]
     assert sorted(p.name for p in (tmp_path / "downloads").iterdir()) == files
@@ -682,8 +684,8 @@ def test_the_folder_line_opens_the_folder_and_changes_it(app, spool, tmp_path):
     expect(line).to_contain_text("free")
     name = line.get_by_role("button", name=dest["display"])
     expect(name).to_have_attribute("title", dest["path"])
-    name.click()
-    app.wait_for_timeout(200)
+    with app.expect_request("**/api/dest/reveal"):
+        name.click()
     assert app.native == ["dest/reveal"]
 
     line.get_by_role("button", name="Change").click()  # the test server has no native folder dialog
@@ -814,7 +816,8 @@ def test_a_link_in_the_address_waits_in_the_field(page, spool):
     expect(field).to_have_value(VIDEO)
     expect(field).to_be_focused()
     expect(page).to_have_url(re.compile(r"/$"))
-    page.wait_for_timeout(500)
+    with page.expect_request("**/api/settings"):  # a request sent after any lookup would have been
+        page.evaluate("fetch('/api/settings', {method: 'PUT', headers: {'X-Spool-Token': 'fake-token'}})")
     assert probes == []  # any page can open this address, so Spool never fetches the link by itself
     page.evaluate("location.hash = '#url=' + encodeURIComponent('https://fake.test/video/2 https://fake.test/audio')")
     expect(field).to_have_value("https://fake.test/video/2 https://fake.test/audio")
@@ -838,7 +841,9 @@ def test_a_first_run_that_cannot_fetch_the_engine_says_so(page, tmp_path):
     try:
         page.goto(url)
         strip = page.get_by_role("complementary", name="Engine")
-        expect(strip).to_contain_text("Spool couldn't set up its engine.", timeout=15000)
+        expect(strip.get_by_role("alert")).to_be_visible(timeout=15000)
+        errors = {e["error"] for e in jobs.snapshot()["engines"].values()} - {None}
+        expect(strip.get_by_role("alert")).to_have_text(errors.pop())  # the server's sentence
         expect(strip.get_by_role("button", name="Try again")).to_be_visible()
         expect(page.get_by_text("Setting up Spool.")).to_have_count(0)
         assert_no_program_names(page, "engine strip")
@@ -859,10 +864,266 @@ def test_a_tab_reconnects_after_spool_restarts(page, tmp_path):
 
     httpd, url, jobs, _ = serve_fake.start(tmp_path, port=port)
     try:
-        page.wait_for_timeout(2500)
-        look_up(page, VIDEO)  # the token kept from the first load still works
-        expect(page.get_by_role("region", name="Fake video 1")).to_be_visible()
+        jobs.add([{"url": VIDEO, "title": "Fake video 1"}], "best")  # reaches the page only through a new stream
+        expect(group(page, "Finished").get_by_text("Fake video 1")).to_be_visible(timeout=15000)
+        look_up(page, "https://fake.test/video/2")  # the token kept from the first load still works
+        expect(page.get_by_role("region", name="Fake video 2")).to_be_visible()
     finally:
         httpd.shutdown()
         httpd.server_close()
         jobs.close()
+
+
+# Review round: each test below went red on the page as it was at 93de052
+
+
+def clear_by_ids(page, spool):
+    """POST /api/jobs/clear {"ids"} as agreed with the server: only the rows the tab took off are cleared.
+    shortcut: emulated here until the server takes ids; drop this once it does."""
+    sent = []
+
+    def handle(route):
+        ids = route.request.post_data_json["ids"]
+        sent.append(ids)
+        for i in ids:
+            spool[1].remove(i)
+        route.fulfill(status=204)
+
+    page.route("**/api/jobs/clear", handle)
+    return sent
+
+
+def test_a_large_playlist_is_added_in_one_go(app):
+    def many(route):
+        response = route.fetch()
+        body = response.json()
+        body["entries"] = [dict(body["entries"][0], url=f"https://fake.test/video/{n}", id=f"v{n}") for n in range(150)]
+        route.fulfill(response=response, json=body)
+
+    app.route("**/api/probe", many)
+    look_up(app, "https://fake.test/playlist")
+    with app.expect_request("**/api/jobs") as sent:
+        tray(app, "Fake playlist").get_by_role("button", name="Download 150").click()
+    assert "presets" not in sent.value.post_data
+    expect(app.get_by_role("status").filter(has_text="Added 150 downloads.")).to_be_visible()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows cannot delete a folder holding an open file")
+def test_a_download_stopped_by_an_unplugged_drive_can_be_tried_again(app, spool, tmp_path):
+    import shutil
+
+    drive = tmp_path / "Drive"
+    drive.mkdir()
+    spool[1].update_settings({"dest": str(drive)})
+    jobs = add(spool, [(f"https://fake.test/slow/{n}?delay=0.2", f"Slow {n}") for n in (1, 2)])
+    server_job(spool, "Slow 1", "running")
+    server_job(spool, "Slow 2", "running")
+    shutil.rmtree(drive)  # the drive is unplugged mid-download
+    stopped = group(app, "Stopped")
+    expect(stopped.get_by_role("listitem")).to_have_count(2, timeout=15000)
+    assert {j["error"]["hint"] for j in spool[1].snapshot()["jobs"]} == {"check_dest"}
+    expect(stopped.get_by_role("button", name="Change folder")).to_have_count(2)
+    drive.mkdir()  # plugged back in
+    stopped.get_by_role("button", name="Try again").first.click()
+    expect(group(app, "Downloading").get_by_role("listitem")).to_have_count(1)
+    group(app, "Stopped").get_by_role("button", name="Try again").click()
+    expect(group(app, "Finished").get_by_role("listitem")).to_have_count(2, timeout=30000)
+    assert len(jobs) == 2
+
+
+def test_eight_tabs_all_keep_working_and_a_hidden_one_hears_the_finish(page, spool):
+    tabs = [page] + [page.context.new_page() for _ in range(7)]
+    for tab in tabs:
+        tab.goto(spool[0])
+        expect(tab.get_by_label("Link to download")).to_be_visible()
+    look_up(tabs[-1], VIDEO)
+    expect(tray(tabs[-1], "Fake video 1")).to_be_visible()
+    add(spool, [("https://fake.test/video/5", "Fake video 5")])
+    for tab in tabs:
+        expect(group(tab, "Finished").get_by_text("Fake video 5")).to_be_visible(timeout=15000)
+    tabs[0].close()  # the tab holding the stream goes; another takes over
+    add(spool, [("https://fake.test/video/6", "Fake video 6")])
+    for tab in tabs[1:]:
+        expect(group(tab, "Finished").get_by_text("Fake video 6")).to_be_visible(timeout=15000)
+
+
+def test_a_refused_token_never_replaces_the_kept_one(page, spool):
+    origin = spool[0].split("#")[0]
+    page.goto(spool[0])
+    expect(page.get_by_label("Link to download")).to_be_visible()
+    page.goto("about:blank")  # a new load, not a fragment change
+    page.goto(origin + "#t=x")  # any website can open this address
+    expect(page.get_by_text("This tab lost its link to Spool.", exact=False)).to_be_visible()
+    page.goto("about:blank")
+    page.goto(origin)
+    expect(page.get_by_label("Link to download")).to_be_visible()
+
+
+def test_clear_sends_only_the_rows_it_took_off(app, spool):
+    sent = clear_by_ids(app, spool)
+    add(spool, [("https://fake.test/video/1", "Fake video 1")])
+    finished = group(app, "Finished")
+    expect(finished.get_by_role("listitem")).to_have_count(1, timeout=15000)
+    cleared = [j["id"] for j in spool[1].snapshot()["jobs"]]
+    finished.get_by_role("button", name="Clear list").click()
+    add(spool, [("https://fake.test/video/2", "Fake video 2")])
+    server_job(spool, "Fake video 2", "done")  # finishes inside Undo's five seconds
+    expect(app.get_by_role("button", name="Undo", exact=True)).to_be_hidden(timeout=7000)
+    expect(group(app, "Finished").get_by_text("Fake video 2")).to_be_visible()
+    assert sent == [cleared]
+    assert [j["title"] for j in spool[1].snapshot()["jobs"]] == ["Fake video 2"]
+
+
+def test_a_removed_row_that_another_tab_starts_again_comes_back(app, spool):
+    add(spool, [("https://fake.test/slow?delay=0.3", "Fake slow video")])
+    finished = group(app, "Finished")
+    finished.get_by_role("button", name="More actions for Fake slow video").click(timeout=15000)
+    finished.get_by_role("button", name="Remove from list").click()
+    job = server_job(spool, "Fake slow video", "done")
+    spool[1].retry(job["id"])  # another tab chose Download again
+    expect(app.get_by_role("listitem").filter(has_text="Fake slow video")).to_be_visible()  # running, or done again
+    expect(app.get_by_role("button", name="Undo", exact=True)).to_be_hidden()
+
+
+def test_focus_left_on_the_page_stays_there(app, spool):
+    add(spool, [("https://fake.test/broken", "Fake broken video")])
+    stopped = group(app, "Stopped")
+    stopped.get_by_role("button", name="Show log").click(timeout=15000)
+    app.mouse.click(5, app.viewport_size["height"] - 5)  # blank space
+    assert app.evaluate("document.activeElement === document.body")
+    add(spool, [("https://fake.test/video/3", "Fake video 3")])
+    expect(group(app, "Finished").get_by_text("Fake video 3")).to_be_visible(timeout=15000)
+    assert app.evaluate("document.activeElement === document.body")
+
+
+def test_a_link_from_the_address_is_selected_so_a_paste_replaces_it(page, spool):
+    page.goto(spool[0] + "&url=" + "https%3A%2F%2Ffake.test%2Fvideo%2F7")
+    field = page.get_by_label("Link to download")
+    expect(field).to_have_value("https://fake.test/video/7")
+    expect(field).to_be_focused()
+    assert field.evaluate("e => [e.selectionStart, e.selectionEnd]") == [0, len("https://fake.test/video/7")]
+    with page.expect_request("**/api/probe") as sent:
+        page.keyboard.insert_text("https://fake.test/video/2")  # what a paste puts in the field
+        page.evaluate("document.getElementById('link').dispatchEvent(new Event('paste', {bubbles: true}))")
+    assert sent.value.post_data_json["url"] == "https://fake.test/video/2"
+
+
+def test_cmd_enter_on_a_playlist_opens_the_preview(app):
+    requests = []
+    app.on("request", lambda r: r.url.endswith("/api/jobs") and requests.append(r))
+    field = app.get_by_label("Link to download")
+    field.fill("https://fake.test/playlist")
+    field.press("ControlOrMeta+Enter")
+    expect(tray(app, "Fake playlist")).to_be_visible()
+    assert requests == []
+
+
+def test_a_row_action_that_fails_says_why_on_the_row(app, spool):
+    add(spool, [("https://fake.test/broken", "Fake broken video")])
+    stopped = group(app, "Stopped")
+    app.route(
+        "**/api/jobs/*/retry",
+        lambda route: route.fulfill(
+            status=409, json={"error": {"kind": "engine_not_ready", "message": "The server's words.", "hint": None}}
+        ),
+    )
+    stopped.get_by_role("button", name="Try again").click(timeout=15000)
+    expect(stopped.get_by_role("listitem").get_by_text("The server's words.")).to_be_visible()
+
+
+@pytest.mark.parametrize("spool", [{"github": serve_fake.FakeGitHub(offline=True)}], indirect=True)
+def test_the_engine_strip_shows_the_servers_sentence(app, spool):
+    strip = app.get_by_role("complementary", name="Engine")
+    expect(strip).to_be_visible(timeout=15000)
+    errors = {e["error"] for e in spool[1].snapshot()["engines"].values()} - {None}
+    expect(strip.get_by_role("alert")).to_have_text(errors.pop())
+
+
+def test_a_stalled_stream_shows_reconnecting(app, spool, monkeypatch):
+    from spool import server
+
+    app.clock.install()
+    download(app, "https://fake.test/slow?delay=2", "Fake slow video")
+    row = group(app, "Downloading").get_by_role("listitem")
+    expect(row.get_by_text("Downloading video")).to_be_visible(timeout=10000)
+    monkeypatch.setattr(server, "PING", 3600)
+    with spool[1].lock:
+        spool[1].subscribers.clear()  # Spool is suspended: the stream stays open and says nothing
+    app.clock.run_for(60_000)
+    expect(row.get_by_text("Reconnecting…")).to_be_visible()
+
+
+BLOCKED_NOTIFICATIONS = """
+window.Notification = class {};
+Notification.permission = 'default';
+Notification.requestPermission = async () => { Notification.permission = 'denied'; return 'denied'; };
+"""
+
+
+def test_notifications_the_browser_blocks_say_so(app):
+    app.add_init_script(BLOCKED_NOTIFICATIONS)
+    app.reload()
+    app.get_by_role("button", name="Settings", exact=True).click()
+    switch = app.get_by_role("checkbox", name="Get a notification when downloads finish")
+    switch.click()
+    expect(switch).not_to_be_checked()
+    expect(switch).to_be_disabled()
+    expect(app.get_by_role("dialog").get_by_text("Your browser blocks notifications from Spool.")).to_be_visible()
+
+
+def test_update_and_try_again_runs_the_lookup_after_the_update(app):
+    probe_answers(app, "blocked", "update_engine")
+    look_up(app, VIDEO)
+    app.unroute("**/api/probe")
+    with app.expect_request("**/api/probe"):
+        app.get_by_role("button", name="Update and try again").click()
+    expect(tray(app, "Fake video 1")).to_be_visible()
+
+
+def test_two_removes_each_keep_their_five_seconds(app, spool):
+    add(spool, [("https://fake.test/403", "Fake refused video"), ("https://fake.test/broken", "Fake broken video")])
+    stopped = group(app, "Stopped")
+    expect(stopped.get_by_role("listitem")).to_have_count(2, timeout=15000)
+    started = time.time()
+    stopped.get_by_role("button", name="Remove from list").first.click()
+    app.wait_for_timeout(1000)
+    with app.expect_request(lambda r: r.method == "DELETE", timeout=7000):
+        stopped.get_by_role("button", name="Remove from list").click()
+    assert time.time() - started > 4.5
+
+
+def test_a_page_hidden_with_undo_showing_sends_and_drops_the_undo(app, spool):
+    add(spool, [("https://fake.test/403", "Fake refused video")])
+    with app.expect_request(lambda r: r.method == "DELETE"):
+        group(app, "Stopped").get_by_role("button", name="Remove from list").click(timeout=15000)
+        app.evaluate("window.dispatchEvent(new PageTransitionEvent('pagehide', {persisted: true}))")
+    expect(app.get_by_role("button", name="Undo", exact=True)).to_be_hidden()
+
+
+def test_the_bookmark_link_leaves_the_opening_site_no_handle(page, spool, context):
+    page.goto(spool[0])
+    page.get_by_role("button", name="Settings", exact=True).click()
+    code = page.get_by_role("link", name="Save with Spool").get_attribute("href").removeprefix("javascript:")
+    other = context.new_page()
+    other.goto(spool[0].replace("127.0.0.1", "localhost").split("#")[0] + "icon.svg")  # another origin
+    with context.expect_page() as opened:
+        handle = other.evaluate(f"() => {{ {code}; return window.__last ?? null }}")
+    assert handle is None
+    assert opened.value.evaluate("window.opener") is None
+
+
+def test_the_notice_and_undo_words_reach_a_screen_reader(app, spool):
+    assert app.locator(".notice").evaluate("e => getComputedStyle(e).display") != "none"
+    add(spool, [("https://fake.test/403", "Fake refused video")])
+    group(app, "Stopped").get_by_role("button", name="Remove from list").click(timeout=15000)
+    expect(app.locator("[aria-live=polite]")).to_have_text("Removed.")
+
+
+@pytest.mark.parametrize("spool", [{"ffmpeg": False}], indirect=True)
+def test_a_copy_the_browser_refuses_selects_the_command(app):
+    app.add_init_script("navigator.clipboard.writeText = () => Promise.reject(new Error('denied'))")
+    app.reload()
+    strip = app.get_by_role("complementary", name="Free helper")
+    strip.get_by_role("button", name="Copy command").click()
+    expect(strip.get_by_role("button", name=re.compile(r"^Press (Cmd|Ctrl)\+C$"))).to_be_visible()
+    assert app.evaluate("getSelection().toString()") == strip.locator("code").inner_text()

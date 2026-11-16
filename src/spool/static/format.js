@@ -67,16 +67,18 @@ export function split(presets) {
   return [shown, presets.filter((p) => !shown.includes(p))];
 }
 
-// Every link in any text: Markdown links, wrappers and trailing punctuation are taken off, and a bare host
-// ("youtu.be/x") gets https://. Paste, drop, Enter and the address bar all read links through this.
-const BARE = /^(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:[/?#]|$)/i;
+// Every link in any text: Markdown links, wrappers and trailing punctuation are taken off, and a bare host with a
+// path or www. ("youtu.be/x", "www.site.com") gets https://, so a word like "Node.js" stays a word. Paste, drop,
+// Enter and the address bar all read links through this.
+const BARE = /^(?:www\.(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:[/?#]|$)|(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?[/?#])/i;
 export function links(text = "") {
   return text
-    .replace(/\[[^\]]*\]\(([^)\s]+)\)/g, " $1 ")
-    .split(/[\s,]+/)
+    .replace(/\[[^\]]*\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g, " $1 ")
+    .split(/\s+|,(?=https?:\/\/)/i) // a comma inside a link is part of it
     .map(clean)
     .map((t) => (BARE.test(t) ? `https://${t}` : t))
-    .filter((t) => /^https?:\/\/[^\s/?#]+\.[^\s/?#]/i.test(t) || /^https?:\/\/(localhost|\[[\d:]+\]|[\d.]+)(?=[:/?#]|$)/i.test(t));
+    .filter((t) => /^https?:\/\/[^\s/?#]+\.[^\s/?#]/i.test(t) || /^https?:\/\/(localhost|\[[\d:]+\]|[\d.]+)(?=[:/?#]|$)/i.test(t))
+    .filter((t) => !/^https?:\/\/[^/?#]*@/i.test(t)); // user:pw@shown.host@real.host shows one host and fetches another
 }
 function clean(t) {
   for (let before; before !== t;) {

@@ -28,8 +28,6 @@ const canNotify = () => "Notification" in window;
 const notifying = () => canNotify() && Notification.permission === "granted" && local.get("spool-notify") === "on";
 const UNDO_MS = 5000, FLASH_MS = 2000, SHOWN = 10;
 
-window.name = "spool"; // the bookmark button opens its link in the window of this name, so it lands in this tab
-
 function App() {
   const [snap, setSnap] = useState(null);
   const [jobs, setJobs] = useState([]);
@@ -50,7 +48,7 @@ function App() {
   const field = useRef(null);
   const settings = useRef(null);
   const undoButton = useRef(null);
-  const waiting = useRef(null);
+  const waiting = useRef([]); // each Remove or Clear not sent yet: { ids, send, states, timer }
 
   const say = (text) => { setSaid(""); setTimeout(() => setSaid(text), 50); };
   const tint = (ids) => {
@@ -63,12 +61,19 @@ function App() {
     connected: setConnected,
     snapshot: (s) => {
       seen.current = Object.fromEntries(s.jobs.map((j) => [j.id, j.state]));
+      followUp(s);
       setSnap(s);
       setJobs(s.jobs);
     },
     job: (j) => {
       const before = seen.current[j.id];
       seen.current[j.id] = j.state;
+      // A row taken off here that another tab starts again is no longer this tab's to remove.
+      for (const w of waiting.current.filter((w) => w.ids.includes(j.id) && w.states[j.id] !== j.state)) {
+        w.ids = w.ids.filter((id) => id !== j.id);
+        setAway((s) => new Set([...s].filter((id) => id !== j.id)));
+        if (!w.ids.length) drop(w);
+      }
       if (before && before !== j.state && j.state === "done") {
         say(`Finished: ${j.title}`);
         tint([j.id]);
@@ -88,46 +93,57 @@ function App() {
     return () => document.removeEventListener("visibilitychange", visible);
   }, []);
 
-  // "Update and try again": run the follow-up once the engine has been busy and is idle again.
-  useEffect(() => {
-    const p = pending.current, e = snap?.engines[p?.name];
+  // "Update and try again": run the follow-up once the engine is idle after the update started. Checked on every
+  // snapshot, not every render: busy and idle can arrive together. A fast update may be over before its 202 answer,
+  // so an idle snapshot that came after the request counts too.
+  const followUp = (s) => {
+    const p = pending.current, e = s?.engines[p?.name];
     if (!e) return;
+    p.last = s;
     if (e.busy) p.saw = true;
-    else if (p.saw) { pending.current = null; if (!e.error) p.then(); }
-  }, [snap]);
+    else if (p.saw || p.started) { pending.current = null; if (!e.error) p.then(); }
+  };
   const whenUpdated = async (name, then) => {
-    pending.current = { name, then, saw: false };
-    try { await api.updateEngine(name); } catch (err) { if (err.status !== 409) { pending.current = null; say(err.message); } }
+    const p = pending.current = { name, then, saw: false, started: false };
+    try { await api.updateEngine(name); } catch (err) {
+      if (err.status !== 409) { pending.current = null; return say(err.message); }
+    }
+    p.started = true;
+    if (pending.current === p && p.last) followUp(p.last);
   };
 
-  // Remove and Clear: off the screen at once, sent when Undo's time has passed (or the tab closes).
-  const send = () => {
-    const w = waiting.current;
-    if (!w) return;
+  // Remove and Clear: off the screen at once, each sent when its own Undo time has passed (or the tab closes).
+  const drop = (w) => {
     clearTimeout(w.timer);
-    waiting.current = null;
-    w.send().catch((e) => { setAway((s) => new Set([...s].filter((id) => !w.ids.includes(id)))); say(e.message); });
+    waiting.current = waiting.current.filter((x) => x !== w);
+    setUndo((u) => (u?.w === w ? null : u));
   };
-  useEffect(() => { window.addEventListener("pagehide", send); return () => window.removeEventListener("pagehide", send); }, []);
+  const send = (w) => {
+    drop(w);
+    w.send(w.ids).catch((e) => { setAway((s) => new Set([...s].filter((id) => !w.ids.includes(id)))); say(e.message); });
+  };
+  useEffect(() => {
+    const all = () => waiting.current.forEach(send);
+    window.addEventListener("pagehide", all);
+    return () => window.removeEventListener("pagehide", all);
+  }, []);
   const takeAway = (ids, words, call) => {
-    send();
-    const timer = setTimeout(() => {
+    const w = { ids, send: call, states: Object.fromEntries(ids.map((id) => [id, seen.current[id]])) };
+    w.timer = setTimeout(() => {
       const focused = document.activeElement === undoButton.current;
-      send();
-      setUndo(null);
+      send(w);
       if (focused) field.current?.focus();
     }, UNDO_MS);
-    waiting.current = { ids, send: call, timer };
+    waiting.current = [...waiting.current, w];
     setAway((s) => new Set([...s, ...ids]));
-    setUndo({ words, ids });
+    setUndo({ words, w });
+    say(words);
   };
   const putBack = () => {
-    const w = waiting.current;
-    if (!w) return;
-    clearTimeout(w.timer);
-    waiting.current = null;
+    const w = undo?.w;
+    if (!w || !waiting.current.includes(w)) return;
+    drop(w);
     setAway((s) => new Set([...s].filter((id) => !w.ids.includes(id))));
-    setUndo(null);
     lastRow.current = { id: w.ids[0], index: 0, back: true };
   };
   useEffect(() => { if (undo) undoButton.current?.focus(); }, [undo]);
@@ -135,7 +151,8 @@ function App() {
   // Keep keyboard focus when the focused row changes state, moves list or goes away.
   useLayoutEffect(() => {
     const last = lastRow.current, active = document.activeElement;
-    if (!last || (!last.back && active && active !== document.body)) return;
+    // Only when the focused button left the page; focus the person put elsewhere (even on the page itself) stays.
+    if (!last || (!last.back && ((active && active !== document.body) || last.el?.isConnected))) return;
     if (last.back) lastRow.current = { ...last, back: false };
     const rows = [...document.querySelectorAll("[data-job]")];
     const row = rows.find((r) => r.dataset.job === last.id) || rows[Math.min(last.index, rows.length - 1)];
@@ -143,7 +160,7 @@ function App() {
   }, [jobs, away]);
   const trackRow = (e) => {
     const li = e.target.closest("[data-job]");
-    lastRow.current = li ? { id: li.dataset.job, index: [...document.querySelectorAll("[data-job]")].indexOf(li) } : null;
+    lastRow.current = li ? { id: li.dataset.job, index: [...document.querySelectorAll("[data-job]")].indexOf(li), el: e.target } : null;
   };
 
   const shown = jobs.filter((j) => !away.has(j.id));
@@ -181,7 +198,7 @@ function App() {
     async turnOn() {
       const answer = await Notification.requestPermission();
       local.set("spool-notify", answer === "granted" ? "on" : "off");
-      setNotifyPref(local.get("spool-notify"));
+      setNotifyPref(answer); // re-render: a refusal also disables the switch
     },
     turnOff() { local.set("spool-notify", "off"); setNotifyPref("off"); },
   };
@@ -196,7 +213,7 @@ function App() {
       </div>
     </main>
     ${undo && html`
-      <div class="undo" role="status">
+      <div class="undo">
         <span>${undo.words}</span>
         <button class="link-button" ref=${undoButton} onClick=${putBack}>Undo</button>
       </div>`}
@@ -257,7 +274,7 @@ function Deck({ snap, say, whenUpdated, field, openSettings, turning, added, not
       const data = await api.probe(link);
       if (n !== lookup.current) return;
       const remembered = f.pick(data.entries[0].presets, snap.settings.preset);
-      if (quick && !data.entries.some((e) => e.live)) {
+      if (quick && data.kind !== "playlist" && !data.entries.some((e) => e.live)) {
         setLook({ status: "idle" });
         return queue(data.entries, remembered, data.engine);
       }
@@ -296,7 +313,11 @@ function Deck({ snap, say, whenUpdated, field, openSettings, turning, added, not
   }, [look]);
 
   useEffect(() => field.current.focus(), []);
-  useEffect(() => api.onLink((text) => { setUrl(f.links(text).join(" ") || text); field.current.focus(); }), []);
+  // Selected, so a paste replaces it rather than joining it.
+  useEffect(() => api.onLink((text) => {
+    setUrl(f.links(text).join(" ") || text);
+    setTimeout(() => { field.current.focus(); field.current.select(); });
+  }), []);
 
   // Paste or drop a link anywhere on the page. Escape cancels a lookup or closes the preview;
   // Cmd+Enter (Ctrl+Enter elsewhere) downloads the quality selected in the preview.
@@ -407,7 +428,7 @@ function Fix({ hint, snap, engine, retry, whenUpdated, changeFolder, cls }) {
   if (hint === "update_engine") return html`<button class=${cls} disabled=${!!busy} onClick=${() => whenUpdated(engine, retry)}>
     ${busy ? "Updating…" : "Update and try again"}</button>`;
   if (hint === "check_dest") return html`<button class=${cls} onClick=${changeFolder}>Change folder</button>`;
-  if (hint === "install_ffmpeg") return html`<${CopyCommand} command=${f.ffmpegCommand(snap.tools.platform)} cls=${cls} />`;
+  if (hint === "install_ffmpeg") return html`<${CopyCommand} command=${f.ffmpegCommand(snap.tools.platform)} platform=${snap.tools.platform} cls=${cls} />`;
   return null;
 }
 
@@ -512,11 +533,10 @@ function EngineStrip({ snap }) {
       </div>
     </aside>`;
   if (!broken.length) return null;
-  const setUp = broken.some(([, e]) => !e.installed);
   return html`
     <aside class="strip" aria-label="Engine">
       <div class="measure">
-        <p role="alert"><${Icon} d=${ICONS.alert} />${setUp ? "Spool couldn't set up its engine." : "Spool couldn't update its engine."}</p>
+        <p role="alert"><${Icon} d=${ICONS.alert} />${broken[0][1].error}</p>
         <button class="secondary" onClick=${() => broken.forEach(([name]) => api.updateEngine(name).catch(() => {}))}>Try again</button>
       </div>
     </aside>`;
@@ -527,23 +547,29 @@ function FfmpegStrip({ snap }) {
     <aside class="strip" aria-label="Free helper">
       <div class="measure">
         <p>The top qualities and MP3 need a free helper. Run this in your terminal:</p>
-        <${CopyCommand} command=${f.ffmpegCommand(snap.tools.platform)} />
+        <${CopyCommand} command=${f.ffmpegCommand(snap.tools.platform)} platform=${snap.tools.platform} />
       </div>
     </aside>`;
 }
 
-function CopyCommand({ command, cls = "secondary" }) {
-  const [copied, setCopied] = useState(false);
+function CopyCommand({ command, platform, cls = "secondary" }) {
+  const [copied, setCopied] = useState(null);
+  const code = useRef();
   const copy = async () => {
-    await navigator.clipboard.writeText(command);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopied("Copied");
+    } catch { // the browser refused: select the command so a key press copies it
+      getSelection().selectAllChildren(code.current);
+      setCopied(`Press ${modKey(platform)}+C`);
+    }
+    setTimeout(() => setCopied(null), 2000);
   };
-  return html`<span class="command"><code>${command}</code>
-    <button class=${cls} onClick=${copy}>${copied ? "Copied" : "Copy command"}</button></span>`;
+  return html`<span class="command"><code ref=${code}>${command}</code>
+    <button class=${cls} onClick=${copy}>${copied || "Copy command"}</button></span>`;
 }
 
-const canResume = (j) => j.state === "cancelled" || (j.state === "failed" && j.error?.hint === "resume");
+const canResume = (j) => j.state === "cancelled" || (j.state === "failed" && ["resume", "check_dest"].includes(j.error?.hint));
 // Running, then waiting in the order they will start; the server lists newest first.
 const downloading = (jobs) => [...jobs.filter((j) => j.state === "running"), ...jobs.filter((j) => j.state === "queued").reverse()];
 
@@ -586,7 +612,9 @@ function Queue({ jobs, flash, ready, failed, ...ctx }) {
 function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, takeAway }) {
   const [logText, setLogText] = useState(null);
   const [gone, setGone] = useState(null);
-  const act = (fn) => fn().catch((e) => say(e.message));
+  const [problem, setProblem] = useState(null); // why the last action on this row failed, shown on the row
+  const act = (fn) => { setProblem(null); return fn().catch((e) => { setProblem(e.message); say(e.message); }); };
+  const why = problem && html`<p class="failure" role="alert">${problem}</p>`;
   const tid = `title-${job.id}`; // each row button is described by its row's title, so "Cancel" says which one
   const title = html`<h3 class="title clamp" id=${tid} dir="auto" title=${job.title || job.url}>${job.title || job.url}</h3>`;
   const removeIt = () => takeAway([job.id], "Removed.", () => api.remove(job.id));
@@ -610,6 +638,7 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
                 : job.stage === "downloading" && html`<span class="num">${f.speed(job.speed)}</span><span class="num">${f.timeLeft(job.eta)}</span>`}`
               : html`<span><${Icon} d=${ICONS.wait} />Waiting</span>`}
           </p>
+          ${why}
         </div>
         <div class="actions"><button class="secondary" aria-describedby=${tid} onClick=${() => act(() => api.cancel(job.id))}>Cancel</button></div>
       </li>`;
@@ -617,7 +646,7 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
 
   if (job.state === "done") {
     const show = async () => {
-      try { await api.reveal(job.id); } catch (e) { e.status === 410 ? setGone(e.message) : say(e.message); }
+      try { await api.reveal(job.id); } catch (e) { e.status === 410 ? setGone(e.message) : (setProblem(e.message), say(e.message)); }
     };
     const menuId = `menu-${job.id}`;
     const place = (e) => {
@@ -634,6 +663,7 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
           <p class="meta dim"><span>${f.presetName(job.preset)}</span><span class="num">${f.bytes(job.size)}</span>
             ${job.dest && job.dest !== snap.settings.dest && html`<span class="folder" title=${job.dest}><${Icon} d=${ICONS.folder} /><span class="visually-hidden">In </span>${f.folderName(job.dest)}</span>`}</p>
           ${gone && html`<p class="dim moved">${gone}</p>`}
+          ${why}
         </div>
         <div class="actions">
           ${job.file_exists && !gone ? html`<button class="secondary" aria-describedby=${tid} onClick=${show}>${revealWord(snap.tools.platform)}</button>`
@@ -655,6 +685,7 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
         <div class="row-actions">
           <button class="fill" aria-describedby=${tid} onClick=${() => act(() => api.retry(job.id))}>Resume</button>${remove}
         </div>
+        ${why}
       </div>
     </li>`;
 
@@ -662,9 +693,10 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
   const error = job.error || {};
   const showLog = async () => {
     if (logText != null) return setLogText(null);
-    try { setLogText(await api.log(job.id)); } catch (e) { say(e.message); }
+    try { setLogText(await api.log(job.id)); } catch (e) { setProblem(e.message); say(e.message); }
   };
   const retry = () => act(() => api.retry(job.id));
+  const again = ["show_log", "check_dest", "install_ffmpeg"].includes(error.hint); // fixed outside Spool, then Try again
   return html`
     <li class="${cls} stopped failed" data-job=${job.id}>
       <div class="state-icon danger"><${Icon} d=${ICONS.alert} /></div>
@@ -672,14 +704,15 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
         ${title}
         <p class="failure"><span class="visually-hidden">Stopped: </span>${error.message}</p>
         <div class="row-actions">
+          ${again && html`<button class="fill" aria-describedby=${tid} onClick=${retry}>Try again</button>`}
           ${error.hint === "show_log" ? html`
-            <button class="fill" aria-describedby=${tid} onClick=${retry}>Try again</button>
             <button class="secondary" aria-describedby=${tid} aria-expanded=${logText != null ? "true" : "false"} aria-controls="log-${job.id}" onClick=${showLog}>
               ${logText != null ? "Hide log" : "Show log"}</button>`
             : html`<${Fix} hint=${error.hint} snap=${snap} engine=${job.engine} retry=${retry} whenUpdated=${whenUpdated}
-                changeFolder=${() => openSettings(true)} cls="fill" />`}
+                changeFolder=${() => openSettings(true)} cls=${again ? "secondary" : "fill"} />`}
           ${remove}
         </div>
+        ${why}
         ${logText != null && html`<pre class="log" id="log-${job.id}" tabindex="0" role="region" aria-label="Download log">${logText || "The log is empty."}</pre>`}
       </div>
     </li>`;
@@ -711,8 +744,11 @@ function SettingsDialog({ snap, handle, notify }) {
     Object.entries(snap.engines).forEach(([name, e]) => e.installed && api.updateEngine(name).catch(() => {}));
   };
   const engineError = Object.values(snap.engines).some((e) => e.error);
-  const bookmark = `javascript:void(window.open(${JSON.stringify(`${location.origin}/#url=`)}+encodeURIComponent(location.href),"spool"))`;
+  // A new tab with no way back to the site: a named window never matches from another site, and the handle
+  // window.open returns would let that site navigate Spool's tab.
+  const bookmark = `javascript:void(window.open(${JSON.stringify(`${location.origin}/#url=`)}+encodeURIComponent(location.href),"_blank","noopener"))`;
   const on = notifying();
+  const blocked = canNotify() && Notification.permission === "denied";
 
   return html`
     <dialog class="settings" ref=${dialog} aria-labelledby="settings-title" onClose=${saveFolder}>
@@ -731,9 +767,11 @@ function SettingsDialog({ snap, handle, notify }) {
       </form>
       ${canNotify() && html`
         <label class="switch">
-          <input type="checkbox" checked=${on} onChange=${() => (on ? notify.turnOff() : notify.turnOn())} />
+          <input type="checkbox" checked=${on} disabled=${blocked} aria-describedby=${blocked ? "notify-blocked" : undefined}
+            onChange=${async (e) => { await (on ? notify.turnOff() : notify.turnOn()); e.target.checked = notifying(); }} />
           Get a notification when downloads finish
-        </label>`}
+        </label>
+        ${blocked && html`<p id="notify-blocked" class="dim notify-blocked">Your browser blocks notifications from Spool.</p>`}`}
       <div class="stack bookmark">
         <p>Save from any page. Drag this to your bookmarks bar:</p>
         <p><a class="bookmarklet" href=${bookmark} onClick=${(e) => e.preventDefault()}>Save with Spool</a></p>
