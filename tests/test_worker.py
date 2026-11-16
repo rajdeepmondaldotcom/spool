@@ -621,3 +621,70 @@ def test_a_channel_link_that_names_a_tab_lists_that_tab():
 def test_an_ordinary_playlist_is_listed_whole():
     info = last(run("probe", "https://fake.test/playlist"))
     assert (len(info["entries"]), info["truncated"]) == (3, False)
+
+
+# What a reviewer found in pieces mode (each proved against the real engine with a local stand-in for the site)
+
+
+def throttled(events):
+    return logged(events, "[fake] throttled: ")
+
+
+def test_a_slow_line_reads_the_video_again_at_most_once(tmp_path):
+    events = run("download", TUBE + "?throttle=line", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert len(throttled(events)) <= 1  # each read is a page request to a site that may be limiting this line
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_a_stream_fetched_whole_has_no_floor_as_in_0_1_2(tmp_path, stale):
+    if stale:  # the video goes whole, the audio in pieces
+        (tmp_path / f"{TUBE_NAME}.f136.mp4.part").write_bytes(stream(3_000_000))
+    events = run("download", TUBE, dest=str(tmp_path), preset="best", ffmpeg=stale)
+    assert last(events)["event"] == "done", last(events)
+    assert logged(events, "[fake] a stream fetched whole with a floor") == []
+
+
+@pytest.mark.parametrize(
+    "fault, real",
+    [
+        ("ignore=range", TUBE_BYTES),  # the host sends the whole stream for each piece: three times too big
+        ("size=small", TUBE_BYTES),  # the site says 5 MB less than it sends: the end would be cut off
+    ],
+)
+def test_a_stream_of_the_wrong_size_is_fetched_again_whole(tmp_path, fault, real):
+    events = run("download", f"{TUBE}?{fault}", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert (tmp_path / f"{TUBE_NAME}.mp4").read_bytes() == stream(*real)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [f"{TUBE_NAME}.mp4"]
+
+
+def test_a_kill_between_a_piece_and_its_count_does_not_add_the_piece_twice(tmp_path):
+    run("download", TUBE + "?stop=2&between=1", dest=str(tmp_path), preset="best")
+    events = run("download", TUBE, dest=str(tmp_path), preset="best")  # the resume adds piece 2 again
+    assert last(events)["event"] == "done", last(events)
+    assert (tmp_path / f"{TUBE_NAME}.mp4").read_bytes() == stream(*TUBE_BYTES)
+
+
+@pytest.mark.parametrize("fault", ["refuse=limit", "fail=merge"])  # the site's limit; a join that fails
+def test_only_a_failure_to_fetch_pieces_goes_on_the_old_way(tmp_path, fault):
+    events = run("download", f"{TUBE}?{fault}", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "error"
+    assert logged(events, "[spool] fetching in pieces failed") == []
+
+
+def test_a_piece_is_tried_again_twice_with_a_pause(tmp_path):
+    events = run("download", TUBE, dest=str(tmp_path), preset="best")
+    assert set(logged(events, "[fake] tries a piece ")) == {"[fake] tries a piece 2 more times, pausing [1, 2]"}
+
+
+def test_no_piece_file_remains_after_going_on_the_old_way(tmp_path):
+    events = run("download", TUBE + "?refuse=pieces", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [f"{TUBE_NAME}.mp4"]  # no .part-Frag3 beside it
+
+
+def test_a_lookup_makes_one_engine_object():
+    events = run("probe", TUBE)
+    assert last(events)["event"] == "info"
+    assert len(logged(events, "[fake] a new engine object")) == 1
