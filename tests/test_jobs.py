@@ -217,6 +217,9 @@ def test_probe_errors_have_a_kind_and_plain_words(app):
         ("ERROR: [instagram] abc: Too Many Requests", "limited"),
         ("ERROR: [youtube] abc: This content isn't available, try again later.", "limited"),
         ("ERROR: [youtube] abc: This content isn’t available, try again later.", "limited"),
+        ("ERROR: [youtube] abc: This content isn\ufffdt available, try again later.", "limited"),  # a mark lost
+        ("ERROR: [youtube] abc: Sign in to confirm you\ufffdre not a bot.", "limited"),
+        ("ERROR: [youtube] abc: Sign in to confirm you`re not a bot.", "limited"),
         ("ERROR: [youtube] abc: Sign in to confirm your age. This video may be inappropriate", "unavailable"),
         ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access", "unavailable"),
         ("ERROR: [youtube] abc: This video is available to this channel's members-only content", "unavailable"),
@@ -695,3 +698,77 @@ def test_with_no_page_open_nothing_checks_the_folder(tmp_path, monkeypatch):
 def test_a_link_must_be_http_or_https_with_a_plain_host(app, url):
     status, body = app.json("POST", "/api/probe", {"url": url})
     assert (status, body["error"]["kind"]) == (422, "invalid_link")
+
+
+# One file, one writer
+
+
+def downloading_together(app, monkeypatch):
+    """Every set of jobs seen downloading at once, at every progress event the workers send."""
+    together, progress = [], app.jobs._progress
+
+    def record(job, event):
+        progress(job, event)
+        with app.jobs.lock:
+            together.append({j["id"] for j in app.jobs.jobs if j["state"] == "running" and j["stage"] == "downloading"})
+
+    monkeypatch.setattr(app.jobs, "_progress", record)
+    return together
+
+
+@pytest.mark.parametrize("with_id", [True, False])
+def test_two_links_to_one_video_never_write_its_file_at_once(app, events, monkeypatch, with_id):
+    together = downloading_together(app, monkeypatch)
+    ids = []
+    for url in ("https://fake.test/slow?delay=0.05", "https://fake.test/slow/1?delay=0.05"):  # one video, two links
+        entry = {"url": url, **({"id": "slow-1"} if with_id else {})}
+        ids.append(app.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})[1]["jobs"][0]["id"])
+    ended = {}
+    events.until(
+        lambda e, d: (
+            e == "job"
+            and d["id"] in ids
+            and d["state"] in ("done", "failed")
+            and not ended.update({d["id"]: d})
+            and len(ended) == 2
+        ),
+        timeout=30,
+    )
+    assert [ended[i]["state"] for i in ids] == ["done", "done"]
+    assert {ended[i]["size"] for i in ids} == {4_000_000}
+    assert together and max(len(s) for s in together) == 1
+
+
+def test_audio_and_mp3_of_one_video_take_turns(app, events, monkeypatch):
+    together = downloading_together(app, monkeypatch)
+    entry = {"url": "https://fake.test/audio?delay=0.05", "id": "aud-1"}
+    ids = [
+        app.json("POST", "/api/jobs", {"entries": [entry], "preset": p})[1]["jobs"][0]["id"] for p in ("audio", "mp3")
+    ]
+    ended = {}
+    events.until(
+        lambda e, d: (
+            e == "job"
+            and d["id"] in ids
+            and d["state"] in ("done", "failed")
+            and not ended.update({d["id"]: d})
+            and len(ended) == 2
+        ),
+        timeout=30,
+    )
+    assert [ended[i]["state"] for i in ids] == ["done", "done"]
+    assert max(len(s) for s in together) == 1
+
+
+def test_a_site_limiting_the_connection_never_offers_an_engine_update(tmp_path):
+    from spool.engines import Engines
+    from spool.jobs import Jobs
+
+    engines = Engines(tmp_path / "engines")
+    engines.status = lambda: {"yt-dlp": {"latest": "2", "version": "1"}}
+    jobs = Jobs(tmp_path, engines)
+    try:
+        assert jobs._error("blocked", "yt-dlp")["hint"] == "update_engine"
+        assert jobs._error("limited", "yt-dlp")["hint"] == "retry"
+    finally:
+        jobs.close()

@@ -81,7 +81,7 @@ count.write_text(str(n))
 def say(**event):
     print(json.dumps(event), flush=True)
 say(event="progress", status="downloading", part=1, downloaded=n * FURTHER, total=1000, speed=None, eta=None,
-    progress=n / 100, what="video")
+    progress=n * FURTHER / 1000, what="video")
 if n < RUNS:
     say(event="error", message=MESSAGE, **KIND)
 else:
@@ -95,10 +95,11 @@ def stub(monkeypatch, tmp_path, message, runs=99, further=100, kind=None):
     worker = tmp_path / "stub" / "worker.py"
     worker.parent.mkdir()
     worker.write_text(
-        STUB.replace("FURTHER", str(further))
+        encoding="utf-8",
+        data=STUB.replace("FURTHER", str(further))
         .replace("RUNS", str(runs))
         .replace("MESSAGE", repr(message))
-        .replace("KIND", repr({"kind": kind} if kind else {}))
+        .replace("KIND", repr({"kind": kind} if kind else {})),
     )
     monkeypatch.setattr(spool.jobs, "WORKER", worker)
     return worker.with_name("runs")
@@ -249,3 +250,79 @@ def test_a_handful_of_downloads_is_not_slowed(app, events):
 
 def test_the_pace_is_kept_in_one_place():
     assert (spool.jobs.PACE, spool.jobs.PACE_FROM) == (8, 5)
+
+
+def test_the_test_server_paces_nothing_unless_a_test_asks(tmp_path):
+    httpd, _, jobs, _ = start(tmp_path)
+    try:
+        assert jobs.pace == 0
+    finally:
+        httpd.shutdown()
+        jobs.close()
+    httpd, _, jobs, _ = start(tmp_path / "paced", pace=3)
+    try:
+        assert jobs.pace == 3
+    finally:
+        httpd.shutdown()
+        jobs.close()
+
+
+PARTS = """
+import json, pathlib, sys
+sys.stdin.read()
+count = pathlib.Path(sys.argv[0]).with_name("runs")
+n = int(count.read_text()) + 1 if count.exists() else 1
+count.write_text(str(n))
+def say(**event):
+    print(json.dumps(event), flush=True)
+def progress(part, what, downloaded, total, progress):
+    say(event="progress", status="downloading", part=part, downloaded=downloaded, total=total, speed=None,
+        eta=None, progress=progress, what=what)
+if n == 1:  # the video stream whole, then the audio drops early
+    progress(1, "video", 900, 900, 0.9)
+    say(event="progress", status="finished", part=1, downloaded=900, total=900, speed=None, eta=None,
+        progress=0.9, what="video")
+    progress(2, "audio", 5, 100, 0.905)
+else:  # the video is on disk: the audio is this run's first stream, and gets further up to run 8
+    m = min(n, 8)
+    progress(1, "audio", 5 + m * 10, 100, 0.9 + (5 + m * 10) / 1000)
+say(event="error", message="ERROR: [Errno 54] Connection reset by peer")
+"""
+
+
+def test_progress_on_a_later_stream_starts_the_count_again(app, events, monkeypatch, tmp_path):
+    worker = tmp_path / "parts" / "worker.py"
+    worker.parent.mkdir()
+    worker.write_text(PARTS, encoding="utf-8")
+    monkeypatch.setattr(spool.jobs, "WORKER", worker)
+    app.jobs.waits = (0.05, 0.05)
+    job_id = add(app, "https://fake.test/big")
+    wait_for(events, job_id, lambda d: d["state"] in ("done", "failed"))
+    assert (
+        int(worker.with_name("runs").read_text()) == 10
+    )  # up to run 8 each got further; then two waits, and two tries that did not
+
+
+UNICODE = """
+import json, sys
+sys.stdin.read()
+said = {"utf8": sys.flags.utf8_mode, "encoding": sys.stdout.encoding}
+print(json.dumps({"event": "meta", "title": "Ünïcödé 日本語 " + json.dumps(said), "uploader": "Zoë", "thumbnail": None,
+                  "duration": 1}, ensure_ascii=False), flush=True)
+print(json.dumps({"event": "error", "message": "ERROR: [youtube] abc: Sign in to confirm you’re not a bot."},
+                 ensure_ascii=False), flush=True)
+"""
+
+
+def test_text_from_a_worker_arrives_intact_whatever_the_systems_code_page(app, events, monkeypatch, tmp_path):
+    worker = tmp_path / "unicode" / "worker.py"
+    worker.parent.mkdir()
+    worker.write_text(UNICODE, encoding="utf-8")
+    monkeypatch.setattr(spool.jobs, "WORKER", worker)
+    job_id = add(app, "https://fake.test/big")
+    failed = wait_for(events, job_id, lambda d: d["state"] in ("done", "failed"))[-1][1]
+    assert failed["title"].startswith("Ünïcödé 日本語 ") and failed["uploader"] == "Zoë"
+    assert json.loads(failed["title"].split(" ", 2)[2]) == {"utf8": 1, "encoding": "utf-8"}
+    assert failed["error"]["kind"] == "limited"
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/big"})  # the probe's path too
+    assert (status, body["error"]["kind"]) == (422, "limited")

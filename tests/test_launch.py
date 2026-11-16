@@ -331,3 +331,14 @@ def test_a_newer_spool_found_at_launch_reaches_the_page(tmp_path, monkeypatch):
         assert (event, snap["update"]) == ("snapshot", {"version": "0.2.1"})
     finally:
         jobs.close()
+
+
+def test_quit_tells_the_open_tab_that_spool_stopped(data):
+    proc, line = launch(data)
+    url = url_in(line)
+    client = Client(url.split("/#")[0], url.split("#t=")[1])
+    events = client.events()
+    events.next()
+    assert client.request("POST", "/api/quit")[0] == 204
+    assert events.until(lambda e, d: e == "stopped")[-1] == ("stopped", {})
+    assert proc.wait(10) == 0
