@@ -111,3 +111,50 @@ def test_remove_keeps_an_mp3_an_earlier_run_of_the_job_finished(tmp_path):
     job["started"] = time.time() - 30
     remove_leftovers(job, set())
     assert not mp3.exists()  # written during this run: the half-written file a cancel leaves
+
+
+def test_remove_cleans_the_pieces_of_a_stream_fetched_several_at_once(tmp_path):
+    from spool.jobs import remove_leftovers
+
+    dest = tmp_path / "Spool"
+    dest.mkdir()
+    name = dest / "Clip [1-2] [ab].f137.mp4"  # a title glob would read as patterns
+    pieces = [f"{name.name}.part-Frag1", f"{name.name}.part-Frag12.part", f"{name.name}.ytdl", f"{name.name}.part"]
+    kept = [
+        "Clip [1-2] [ab].f137.mp4.part-Frag",  # no number
+        "Clip [1-2] [ab].f137.mp4.part-Frag1x",
+        "Clip [1-2] [ab].f137.mp4.part-Frag1.part.mp4",
+        "Clip [1-2] [ab].f137.mp4.part-Frag1.mp4",
+        "Other [x].mp4.part-Frag1",  # another job's
+        "Clip [a].f137.mp4.part-Frag1",
+    ]
+    for f in pieces + kept:
+        (dest / f).write_bytes(b"x")
+    (dest / "Clip [1-2] [ab].f137.mp4.part-Frag2").mkdir()  # never a folder
+    outside = tmp_path / f"{name.name}.part-Frag1"  # beside the folder, not in it
+    outside.write_bytes(b"x")
+    job = {"files": [str(name)], "preset": "best", "state": "cancelled", "dest": str(dest), "started": None}
+    remove_leftovers(job, set())
+    assert names(dest) == sorted(kept + ["Clip [1-2] [ab].f137.mp4.part-Frag2"])
+    assert outside.exists()
+
+
+def test_remove_keeps_the_pieces_a_running_twin_is_writing(tmp_path):
+    from spool.jobs import remove_leftovers
+
+    name = tmp_path / "Clip [a].mp4"
+    (tmp_path / "Clip [a].mp4.part-Frag3").write_bytes(b"x")
+    job = {"files": [str(name)], "preset": "best", "state": "cancelled", "dest": str(tmp_path), "started": None}
+    remove_leftovers(job, {str(name)})
+    assert names(tmp_path) == ["Clip [a].mp4.part-Frag3"]
+
+
+def test_the_finished_file_is_never_a_piece(tmp_path):
+    from spool.jobs import remove_leftovers
+
+    name = tmp_path / "Clip [a].mp4"
+    finished = tmp_path / "Clip [a].mp4.part-Frag1"  # a title that happens to end so
+    finished.write_bytes(b"done")
+    job = {"files": [str(name)], "preset": "best", "state": "done", "dest": str(tmp_path), "started": None}
+    remove_leftovers(job, {str(finished)})
+    assert finished.exists()

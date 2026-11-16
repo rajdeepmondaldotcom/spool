@@ -1,5 +1,6 @@
 """The queue: jobs and their states, settings, the one state file, live events and plain-word errors."""
 
+import glob
 import json
 import math
 import os
@@ -153,7 +154,13 @@ class Jobs:
         if kind:
             e = self._error(kind, engine, probe=True)
             raise Problem(422, kind, e["message"], e["hint"])
-        return {"engine": engine, "kind": result["kind"], "title": result["title"], "entries": result["entries"]}
+        return {
+            "engine": engine,
+            "kind": result["kind"],
+            "title": result["title"],
+            "entries": result["entries"],  # whole: each preset's ext rides along
+            "truncated": result.get("truncated", False),  # a channel with more videos than it lists
+        }
 
     def add(self, entries, preset, engine=None):
         """Add a job per entry. Returns (jobs, existing): an entry matching a job already in the list adds nothing."""
@@ -820,11 +827,16 @@ def mp3_of(job, f):
     return os.path.splitext(f.removesuffix(".part"))[0] + ".mp3" if job["preset"] == "mp3" else None
 
 
+PIECE = re.compile(r"\.part-Frag\d+(\.part)?")  # one of several pieces of a stream fetched at once
+
+
 def remove_leftovers(job, keep):
     """Delete what the engine wrote for this job, except any finished file and what a running job still uses."""
     names = set()
     for f in job["files"]:
         names |= {f, f + ".part", f + ".ytdl"}
+        if f not in keep:  # a running twin's pieces are its own
+            names |= {p for p in glob.glob(glob.escape(f) + ".part-Frag*") if PIECE.fullmatch(p[len(f) :])}
         mp3 = mp3_of(job, f)
         if mp3 and job["state"] != "done" and job["started"]:  # ffmpeg's half-written .mp3 looks finished
             if os.path.exists(mp3) and os.path.getmtime(mp3) >= job["started"]:  # never an earlier run's mp3
