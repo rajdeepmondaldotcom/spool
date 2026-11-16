@@ -1182,3 +1182,181 @@ def test_a_copy_the_browser_refuses_selects_the_command(app):
     strip.get_by_role("button", name="Copy command").click()
     expect(strip.get_by_role("button", name=re.compile(r"^Press (Cmd|Ctrl)\+C$"))).to_be_visible()
     assert app.evaluate("getSelection().toString()") == strip.locator("code").inner_text()
+
+
+# Spool 0.2.0. The server half is built alongside: new values are put on the job, the snapshot or the probe answer here.
+
+
+def newer_server(page, spool, update=None):
+    """The page as a 0.2 server serves it: its snapshot carries `update` (null when Spool is up to date)."""
+    jobs = spool[1]
+    plain = jobs.snapshot
+    jobs.snapshot = lambda *a, **k: {**plain(*a, **k), "update": update}
+    with page.expect_request("**/api/events"):
+        page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")  # a fresh snapshot
+    return jobs
+
+
+def with_ext(route):
+    response = route.fetch()
+    body = response.json()
+    for p in body["entries"][0]["presets"]:
+        p["ext"] = None if p["id"] == "audio" else "mkv" if p["id"] == "best" else "mp4"
+    route.fulfill(response=response, json=body)
+
+
+def test_each_quality_says_the_type_of_file_it_saves(app):
+    app.route("**/api/probe", with_ext)
+    look_up(app, VIDEO)
+    quality = tray(app, "Fake video 1").get_by_role("group", name="Quality")
+    best = quality.locator(".tile").filter(has=app.get_by_role("radio", name=re.compile("^Best")))
+    expect(best.locator(".tile-size")).to_have_text(re.compile(r"^\d+(\.\d)? (KB|MB|GB) MKV$"))
+    expect(quality.get_by_role("radio", name=re.compile(r"^720p .* MP4$"))).to_be_visible()
+    expect(quality.locator(".tile").filter(has_text="Audio").locator(".tile-size")).to_have_text(
+        re.compile(r"^\d+(\.\d)? (KB|MB)$")  # no type known: the size alone, as before
+    )
+
+
+def test_a_tile_from_an_older_server_shows_only_its_size(app):
+    look_up(app, VIDEO)
+    expect(tray(app, "Fake video 1")).to_be_visible()
+    sizes = tray(app, "Fake video 1").locator(".tile-size").all_inner_texts()
+    assert sizes and all(re.fullmatch(r"\d+(\.\d)? (KB|MB|GB)", s) for s in sizes), sizes
+
+
+def test_a_download_trying_again_by_itself_says_why_and_when(app, spool):
+    add(spool, [("https://fake.test/slow?delay=60", "Fake slow video")])
+    row = group(app, "Downloading").get_by_role("listitem")
+    expect(row.get_by_role("progressbar")).to_have_attribute("value", re.compile(r"^\d+$"), timeout=10000)
+    processing(spool, "Fake slow video", stage="waiting", note="The connection dropped.", eta=28, attempt=2, attempts=5)
+    expect(row.locator(".meta")).to_have_text("The connection dropped.Trying again in 28 s")
+    pct = row.get_by_role("progressbar").get_attribute("value")
+    assert row.locator(".counter").inner_text().replace("\n", "") == f"{pct}%"  # the job's progress, kept
+    expect(row.get_by_role("alert")).to_have_count(0)
+    assert "danger" not in row.evaluate("e => e.innerHTML")
+    expect(row.get_by_role("button", name="Cancel")).to_be_visible()
+    expect(app).to_have_title(f"{pct}% - Spool")
+
+
+def test_a_running_row_from_an_older_server_looks_as_before(app, spool):
+    add(spool, [("https://fake.test/slow?delay=60", "Fake slow video")])
+    processing(spool, "Fake slow video", stage="downloading", downloaded=4_000_000, speed=2_000_000, eta=12)
+    expect(group(app, "Downloading").locator(".meta")).to_have_text("Downloading video2.0 MB/s12 s left")
+
+
+def test_a_channel_with_more_videos_says_it_shows_the_newest(app):
+    def channel(route):
+        response = route.fetch()
+        route.fulfill(response=response, json={**response.json(), "truncated": True})
+
+    app.route("**/api/probe", channel)
+    look_up(app, "https://fake.test/playlist")
+    t = tray(app, "Fake playlist")
+    expect(t.get_by_text("Showing the newest 3.")).to_have_count(1)
+    app.unroute("**/api/probe")
+    app.keyboard.press("Escape")
+    look_up(app, "https://fake.test/playlist")
+    expect(tray(app, "Fake playlist").get_by_text(re.compile("^Showing"))).to_have_count(0)
+
+
+def test_settings_offers_a_newer_spool_with_its_command(app, spool):
+    newer_server(app, spool, {"version": "0.2.1"})
+    app.get_by_role("button", name="Settings", exact=True).click()
+    dialog = app.get_by_role("dialog", name="Settings")
+    expect(dialog.get_by_text("Spool 0.2.1 is ready.")).to_be_visible()
+    expect(dialog.locator("code")).to_have_text("uv tool upgrade spool-dl")
+    expect(dialog.get_by_role("button", name="Copy command")).to_be_visible()
+    expect(dialog.get_by_text("When it finishes, quit Spool and start it again.")).to_be_visible()
+
+
+def test_settings_from_an_older_server_look_as_before(app):
+    app.get_by_role("button", name="Settings", exact=True).click()
+    dialog = app.get_by_role("dialog", name="Settings")
+    expect(dialog.get_by_role("button", name="Done")).to_be_visible()
+    expect(dialog.get_by_text(re.compile("is ready"))).to_have_count(0)
+    expect(dialog.get_by_role("button", name="Quit Spool")).to_have_count(0)
+    expect(dialog.locator("code")).to_have_count(0)
+
+
+def test_quit_with_nothing_running_quits_at_once(app, spool):
+    newer_server(app, spool)
+    app.get_by_role("button", name="Settings", exact=True).click()
+    dialog = app.get_by_role("dialog", name="Settings")
+    expect(dialog.get_by_text(re.compile("is ready"))).to_have_count(0)
+    with app.expect_request("**/api/quit"):
+        dialog.get_by_role("button", name="Quit Spool").click()
+    expect(dialog).to_be_hidden()
+    assert app.native == ["quit"]
+
+
+def test_quit_while_downloading_asks_first_in_the_page(app, spool):
+    newer_server(app, spool)
+    add(spool, [("https://fake.test/slow?delay=60", "Fake slow video")])
+    expect(group(app, "Downloading").get_by_role("progressbar")).to_be_visible(timeout=10000)
+    app.on("dialog", lambda d: pytest.fail(f"a browser dialog: {d.message}"))
+    app.get_by_role("button", name="Settings", exact=True).click()
+    dialog = app.get_by_role("dialog", name="Settings")
+    dialog.get_by_role("button", name="Quit Spool").click()
+    expect(dialog.get_by_text("Downloads running now stop. You can resume them next time.")).to_be_visible()
+    expect(dialog.get_by_role("button", name="Quit now")).to_be_focused()
+    dialog.get_by_role("button", name="Keep running").click()
+    expect(dialog.get_by_text("Downloads running now stop.", exact=False)).to_have_count(0)
+    expect(dialog.get_by_role("button", name="Quit Spool")).to_be_focused()
+    assert app.native == []
+    dialog.get_by_role("button", name="Quit Spool").click()
+    with app.expect_request("**/api/quit"):
+        dialog.get_by_role("button", name="Quit now").click()
+    expect(dialog).to_be_hidden()
+
+
+def test_open_a_finished_file_from_its_menu(app, spool):
+    newer_server(app, spool)
+    download(app, VIDEO, "Fake video 1")
+    finished = group(app, "Finished")
+    finished.get_by_role("button", name="More actions for Fake video 1").click(timeout=15000)
+    menu = finished.locator(".menu")
+    expect(menu.get_by_role("button").first).to_have_text("Open")
+    job = server_job(spool, "Fake video 1", "done")
+    menu.get_by_role("button", name="Open", exact=True).click()
+    expect(menu).to_be_hidden()
+    assert app.native == [f"jobs/{job['id']}/open"]
+
+
+def test_a_file_that_will_not_open_says_why_on_the_row(app, spool):
+    newer_server(app, spool)
+    app.route(
+        "**/api/jobs/*/open",
+        lambda route: route.fulfill(
+            status=410, json={"error": {"kind": "gone", "message": "The server's words.", "hint": None}}
+        ),
+    )
+    download(app, VIDEO, "Fake video 1")
+    finished = group(app, "Finished")
+    finished.get_by_role("button", name="More actions for Fake video 1").click(timeout=15000)
+    finished.get_by_role("button", name="Open", exact=True).click()
+    expect(finished.get_by_role("listitem").get_by_role("alert")).to_have_text("The server's words.")
+
+
+def test_a_finished_row_from_an_older_server_has_no_open(app):
+    download(app, VIDEO, "Fake video 1")
+    finished = group(app, "Finished")
+    finished.get_by_role("button", name="More actions for Fake video 1").click(timeout=15000)
+    expect(finished.locator(".menu").get_by_role("button")).to_have_text(["Download again", "Remove from list"])
+
+
+def test_after_quit_the_tab_says_spool_stopped_and_how_to_start_it(app, spool):
+    newer_server(app, spool)
+    add(spool, [("https://fake.test/slow?delay=60", "Fake slow video")])
+    expect(group(app, "Downloading").get_by_role("progressbar")).to_be_visible(timeout=10000)
+    app.get_by_role("button", name="Settings", exact=True).click()
+    dialog = app.get_by_role("dialog", name="Settings")
+    dialog.get_by_role("button", name="Quit Spool").click()
+    dialog.get_by_role("button", name="Quit now").click()
+    expect(
+        app.get_by_text("Spool has stopped. To start it again, run spool in your terminal. It opens a new tab.")
+    ).to_be_visible()
+    spool[1].close()  # the stream ends, as it does when Spool stops
+    app.wait_for_timeout(500)
+    expect(app.get_by_text("Reconnecting…")).to_have_count(0)
+    expect(app.get_by_label("Link to download")).to_have_count(0)
+    expect(app.get_by_role("button")).to_have_count(0)

@@ -64,6 +64,8 @@ export const retry = (id) => call("POST", `/api/jobs/${id}/retry`, {});
 export const remove = (id) => call("DELETE", `/api/jobs/${id}`, undefined, true);
 export const clearFinished = (ids) => call("POST", "/api/jobs/clear", { ids }, true);
 export const reveal = (id) => call("POST", `/api/jobs/${id}/reveal`);
+export const open = (id) => call("POST", `/api/jobs/${id}/open`);
+export const quit = () => call("POST", "/api/quit");
 export const revealFolder = () => call("POST", "/api/dest/reveal");
 export const log = (id) => call("GET", `/api/jobs/${id}/log`);
 export const saveSettings = (changes) => call("PUT", "/api/settings", changes);
