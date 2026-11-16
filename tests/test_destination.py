@@ -254,7 +254,8 @@ def test_a_drive_busy_with_spools_own_download_is_answering(app, monkeypatch):
     """A slow drive queues the write test behind Spool's own writes: the running job is the proof it works."""
     events = app.events()
     events.next()
-    first = app.json("POST", "/api/jobs", {"entries": [entry("https://fake.test/slow?delay=0.3")], "preset": "best"})
+    slow = dict(entry("https://fake.test/slow?delay=0.3"), id="slow-1")  # another video: the two run at once
+    first = app.json("POST", "/api/jobs", {"entries": [slow], "preset": "best"})
     first = first[1]["jobs"][0]
     events.until(lambda e, d: e == "job" and d["id"] == first["id"] and d["stage"] == "downloading")
     monkeypatch.setattr(system, "CHECK_TIMEOUT", 0.3)

@@ -353,8 +353,10 @@ def test_quit_answers_then_stops_the_server_and_passes_the_access_checks(app):
     end = time.time() + 5
     while True:
         try:
-            app.request("GET", "/api/jobs/x/log")
-        except OSError:
+            conn = http.client.HTTPConnection(*app.httpd.server_address, timeout=1)
+            conn.request("GET", "/api/jobs/x/log", headers={"Host": host(app), **TOKEN})
+            conn.getresponse()
+        except OSError:  # refused, or accepted and never answered
             break
         assert time.time() < end, "the server is still answering"
         time.sleep(0.1)
@@ -364,3 +366,18 @@ def test_the_snapshot_says_when_a_newer_spool_exists(app):
     assert app.jobs.snapshot()["update"] is None
     app.jobs.newer = "0.2.1"
     assert app.jobs.snapshot()["update"] == {"version": "0.2.1"}
+
+
+def test_every_open_stream_hears_that_spool_stopped_then_ends(app):
+    streams = []
+    for _ in range(2):
+        conn = http.client.HTTPConnection(*app.httpd.server_address, timeout=10)
+        conn.request("GET", "/api/events", headers={"Host": host(app), **TOKEN})
+        reply = conn.getresponse()
+        assert reply.status == 200
+        assert reply.readline().startswith(b"event: snapshot")
+        reply.readline(), reply.readline()
+        streams.append(reply)
+    app.jobs.close()  # what Quit, Ctrl+C and a closed terminal all end in
+    for reply in streams:
+        assert reply.read() == b"event: stopped\ndata: {}\n\n"  # then the stream ends

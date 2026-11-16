@@ -31,10 +31,25 @@ def finished(events, job_id):
 # One percentage
 
 
-def test_progress_is_one_rising_number_across_video_and_audio(app, events):
-    job = add(app, "https://fake.test/video?delay=0.08")["jobs"][0]  # each part spans several 0.25 s ticks
+def every_progress(app, monkeypatch):
+    """The job as it stands after each progress event a worker sends: none is lost to the four-a-second throttle,
+    however fast or slow the machine is."""
+    seen, progress = [], app.jobs._progress
+
+    def record(job, event):
+        progress(job, event)
+        with app.jobs.lock:
+            seen.append(dict(job))
+
+    monkeypatch.setattr(app.jobs, "_progress", record)
+    return seen
+
+
+def test_progress_is_one_rising_number_across_video_and_audio(app, events, monkeypatch):
+    every = every_progress(app, monkeypatch)
+    job = add(app, "https://fake.test/video?delay=0")["jobs"][0]
     seen = finished(events, job["id"])
-    running = [d for e, d in seen if e == "job" and d["id"] == job["id"] and d["progress"] is not None]
+    running = [d for d in every if d["id"] == job["id"] and d["progress"] is not None] + [seen[-1][1]]
     progress = [d["progress"] for d in running]
     assert progress == sorted(progress) and progress[-1] == 1.0
     assert seen[-1][1]["state"] == "done"
@@ -44,10 +59,11 @@ def test_progress_is_one_rising_number_across_video_and_audio(app, events):
     assert by_what["video"] < 0.9  # the 3 MB video is most of the 3.4 MB job, but not all of it
 
 
-def test_an_audio_job_says_audio(app, events):
-    job = add(app, "https://fake.test/audio?delay=0.05", "audio")["jobs"][0]
-    seen = finished(events, job["id"])
-    assert {d["what"] for e, d in seen if e == "job" and d["stage"] == "downloading"} == {"audio"}
+def test_an_audio_job_says_audio(app, events, monkeypatch):
+    every = every_progress(app, monkeypatch)
+    job = add(app, "https://fake.test/audio?delay=0", "audio")["jobs"][0]
+    finished(events, job["id"])
+    assert {d["what"] for d in every if d["stage"] == "downloading"} == {"audio"}
 
 
 def test_youtube_dl_progress_rises_too(app, events):

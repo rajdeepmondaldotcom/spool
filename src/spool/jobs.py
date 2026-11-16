@@ -119,7 +119,7 @@ class Jobs:
             }
 
     def subscribe(self):
-        """A queue of (event, data), starting with a snapshot. (None, None) means Spool is closing."""
+        """A queue of (event, data), starting with a snapshot. ("stopped", {}) then (None, None): Spool is closing."""
         q, dest, there = queue.Queue(), self._check(self.settings["dest"], write=False), self._there()
         with self.lock:
             q.put(("snapshot", self.snapshot(dest, there)))
@@ -330,9 +330,13 @@ class Jobs:
             self.wake.notify_all()
             procs = [p for p in self.procs.values() if p]
             for q in self.subscribers:
+                q.put(("stopped", {}))
                 q.put((None, None))
         for proc in procs:
             system.kill(proc)
+        end = time.monotonic() + 1  # each open tab hears it before the process exits
+        while self.subscribers and time.monotonic() < end:
+            time.sleep(0.02)
 
     # Inside
 
@@ -386,10 +390,11 @@ class Jobs:
     def _call(self, spec, timeout=120):
         try:
             out = subprocess.run(
-                [sys.executable, "-I", str(WORKER)],
+                [sys.executable, "-I", "-X", "utf8", str(WORKER)],
                 input=json.dumps(self._spec(**spec)),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 errors="replace",  # ffmpeg shares the pipe and may write any bytes
                 timeout=timeout,
             ).stdout
@@ -413,11 +418,26 @@ class Jobs:
         for job in reversed(self.jobs):
             if len(self.procs) >= AT_ONCE or self.closed:
                 return
-            if job["state"] == "queued" and job["id"] not in self.procs:
+            if job["state"] == "queued" and job["id"] not in self.procs and not self._clash(job):
                 job.update(state="running", stage="starting", started=time.time())
                 self._changed(job)
                 self.procs[job["id"]] = None  # no worker yet
                 threading.Thread(target=self._run, args=(job,), daemon=True).start()
+
+    def _clash(self, job):
+        """A running job that writes, or would write, the same file: the same video to the same folder, or a file
+        name both reported. The later one waits in the queue."""
+        return next(
+            (
+                j
+                for j in self.jobs
+                if j is not job
+                and j["state"] == "running"
+                and j["dest"] == job["dest"]
+                and ((job["entry_id"] and j["entry_id"] == job["entry_id"]) or set(j["files"]) & set(job["files"]))
+            ),
+            None,
+        )
 
     def _rested(self):
         with self.lock:
@@ -443,7 +463,8 @@ class Jobs:
                     with self.lock:  # the other engine may read what this one can't
                         job["engine"], switched = other(job["engine"]), True
                     continue
-                reached = (job["part"], job["downloaded"] or 0)
+                # how far across the whole job: a stream already on disk does not count again as this run's part 1
+                reached = (job["progress"] or 0.0, job["downloaded"] or 0)
                 if furthest is not None and reached > furthest:
                     waited = 0  # this try got further: a line that drops now and then still finishes
                 furthest = max(furthest or reached, reached)
@@ -511,7 +532,7 @@ class Jobs:
                 log.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} {job['engine']} {job['preset']} {job['url']}\n")
                 log.flush()
                 proc = system.spawn(
-                    [sys.executable, "-I", str(WORKER)],
+                    [sys.executable, "-I", "-X", "utf8", str(WORKER)],  # UTF-8 pipes, whatever the code page
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=log,
@@ -530,10 +551,18 @@ class Jobs:
                     self._progress(job, event)
                 elif event["event"] == "meta":
                     self._details(job, event)
-                elif event["event"] == "file":
+                elif event["event"] == "file":  # named before the engine writes to it
                     with self.lock:
                         job["files"].append(event["path"])
                         self._save()  # Remove needs these after a quit too
+                        clash = job["state"] == "running" and self._clash(job)
+                        if clash:  # a link with no id of its own, to a video another job is saving: wait for it
+                            job.update(RUN | {"started": job["started"], "progress": job["progress"]})
+                            self._changed(job)
+                    if clash:
+                        system.kill(proc)
+                        result = None
+                        break
                 else:
                     result = event
                     break  # a child the engine left behind may hold the pipe open; this was the last word
@@ -630,11 +659,11 @@ MESSAGES = {  # kind -> (the sentence people read, hint). Every sentence the ser
     "unavailable": ("This video is private, removed, or needs a sign-in.", None),
     "live": ("This is live now. Download it after it ends.", None),
     "playlist": ("This link is a list of videos. Paste it in the link field to choose from it.", None),
-    "blocked": ("The site refused the download.", "retry"),
+    "blocked": ("The site refused the download.", "retry"),  # update_engine when a newer engine exists
     "limited": (
         "The site is limiting this connection for now. Wait an hour or so, then try again.",
         "retry",
-    ),  # update_engine when a newer engine exists
+    ),
     "network": ("Spool couldn't reach the site. Check your internet connection.", "retry"),
     "no_ffmpeg": ("This quality needs a free helper to join video and audio.", "install_ffmpeg"),
     "no_js": ("Spool couldn't set up what it needs for YouTube. Check your internet connection.", "retry"),
@@ -795,7 +824,7 @@ ERRORS = [  # (kind, lowercase pieces of engine messages); the first match wins.
     ("no_ffmpeg", ("ffmpeg not found", "ffprobe and ffmpeg not found", "ffmpeg is not installed", "ffprobe/avprobe")),
     ("engine", ("requested format is not available",)),  # the video is there; the log says what was asked
     # before "unavailable": the robot check says "sign in" too. Never tried again by itself: more requests make it worse
-    ("limited", ("not a bot", "http error 429", "too many requests", "isn't available, try again later")),
+    ("limited", ("not a bot", "http error 429", "too many requests", "available, try again later")),
     ("blocked", ("http error 403",)),
     (
         "unavailable",
