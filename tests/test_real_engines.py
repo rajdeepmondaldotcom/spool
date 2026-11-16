@@ -254,3 +254,64 @@ def test_a_real_channel_link_fails_as_a_list_and_saves_nothing(jobs, tmp_path):
     events = worker(jobs, tmp_path, "https://www.youtube.com/@jawed")
     assert (events[-1]["event"], events[-1].get("kind")) == ("error", "playlist"), events[-1]
     assert list(tmp_path.iterdir()) == []
+
+
+FILM = "https://www.youtube.com/watch?v=SkVqJ1SGeL0"  # a short open-licence film, with no chapters of its own
+CHAPTERS = """
+import runpy, sys
+sys.path.insert(0, sys.argv[1])
+import yt_dlp
+from yt_dlp.postprocessor.common import PostProcessor
+
+class Chapters(PostProcessor):
+    def run(self, info):  # before the streams are chosen, as an extractor gives them
+        half = info["duration"] / 2
+        info["chapters"] = [
+            {"start_time": 0, "end_time": half, "title": "One"},
+            {"start_time": half, "end_time": info["duration"], "title": "Two"},
+        ]
+        return [], info
+
+init = yt_dlp.YoutubeDL.__init__
+def with_chapters(self, *args, **kwargs):
+    init(self, *args, **kwargs)
+    self.add_post_processor(Chapters(), when="pre_process")
+yt_dlp.YoutubeDL.__init__ = with_chapters
+sys.argv = sys.argv[2:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
+
+@pytest.mark.skipif(not (shutil.which("ffmpeg") and shutil.which("ffprobe")), reason="joins need ffmpeg")
+def test_a_real_join_writes_the_big_file_once_with_chapters_and_details(jobs, tmp_path):
+    spec = jobs._spec("yt-dlp", mode="download", url=FILM, dest=str(tmp_path), preset="240", item=None)
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", CHAPTERS, jobs.engines.path("yt-dlp"), str(WORKER)],
+        input=json.dumps(spec),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    ).stdout
+    events = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+    assert events[-1]["event"] == "done", events[-1]
+    name = os.path.basename(events[-1]["path"])
+    logs = [e["line"] for e in events if e["event"] == "log"]
+    assert any(line.startswith("[Merger] Merging formats into") and name in line for line in logs), logs
+    tagged = [line for line in logs if line.startswith("[Metadata] Adding metadata to")]
+    assert len(tagged) == 1 and name not in tagged[0], tagged  # only the small audio part, never the joined file
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_chapters", "-show_entries", "format_tags", "-of", "json", name],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    probe = json.loads(probe)
+    assert [c["tags"]["title"] for c in probe["chapters"]] == ["One", "Two"]
+    tags = {k.lower(): v for k, v in probe["format"]["tags"].items()}
+    assert tags["title"] and tags["artist"] and tags["date"], tags
+    steps = [e for e in events if e["event"] == "progress" and e["status"] == "processing"]
+    assert [e["what"] for e in steps][:1] == ["tags"] and "join" in [e["what"] for e in steps]  # the engine's hooks
+    parts = sum(e["total"] for e in events if e["event"] == "progress" and e["status"] == "finished")
+    [join] = {e["total"] for e in steps if e["what"] == "join"}
+    assert 0 <= join - parts < 64_000  # the join's expected size: its parts, the audio part with its new tags

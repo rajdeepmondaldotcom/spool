@@ -58,6 +58,22 @@ def test_youtube_dl_progress_rises_too(app, events):
     assert progress == sorted(progress) and progress[-1] == 1.0
 
 
+def test_the_join_says_how_far_it_is(app, events):
+    job = add(app, "https://fake.test/video?delay=0.02&join=0.15")["jobs"][0]
+    seen = finished(events, job["id"])
+    assert seen[-1][1]["state"] == "done"
+    mine = [d for e, d in seen if e == "job" and d["id"] == job["id"]]
+    join = [d for d in mine if d["stage"] == "processing" and d["what"] == "join"]
+    assert len(join) >= 2, [(d["stage"], d["what"]) for d in mine]
+    assert {d["total"] for d in join} == {3_400_000}
+    written = [d["downloaded"] for d in join]
+    assert written == sorted(written) and written[-1] > 0
+    assert any(d["speed"] for d in join)
+    progress = [d["progress"] for d in mine if d["progress"] is not None]
+    assert progress == sorted(progress)
+    assert all(d["what"] in ("join", "tags", "mp3", None) for d in mine if d["stage"] == "processing")
+
+
 # Engines without choices
 
 

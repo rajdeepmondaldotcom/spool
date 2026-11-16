@@ -92,7 +92,7 @@ class Jobs:
     def snapshot(self, dest=None, there=None):
         """Pass dest and there (from _there) when holding the lock: disk checks can hang, so never under it."""
         if dest is None or dest["path"] != self.settings["dest"]:  # the setting changed since dest was checked
-            dest = system.check_dest(self.settings["dest"], write=False)
+            dest = self._check(self.settings["dest"], write=False)
         there = self._there() if there is None else there
         with self.lock:  # a job finished since there was taken keeps the file_exists it finished with
             jobs = [dict(j, file_exists=there.get(j["path"], j["file_exists"])) for j in self.jobs]
@@ -107,7 +107,7 @@ class Jobs:
 
     def subscribe(self):
         """A queue of (event, data), starting with a snapshot. (None, None) means Spool is closing."""
-        q, dest, there = queue.Queue(), system.check_dest(self.settings["dest"], write=False), self._there()
+        q, dest, there = queue.Queue(), self._check(self.settings["dest"], write=False), self._there()
         with self.lock:
             q.put(("snapshot", self.snapshot(dest, there)))
             self.subscribers.append(q)
@@ -157,7 +157,7 @@ class Jobs:
         if not isinstance(entries, list) or not entries or not all(isinstance(e, dict) for e in entries):
             raise Problem(422, "invalid_entries", "Choose at least one video to download.")
         dest = self.settings["dest"]
-        dest_problem(system.check_dest(dest), status=409)
+        dest_problem(self._check(dest), status=409)
         new = [new_job(e, preset, engine, dest) for e in entries]
         with self.lock:
             done = [(j, j["path"]) for j in self.jobs if j["state"] == "done" and j["path"]]
@@ -254,7 +254,7 @@ class Jobs:
 
     def reveal_dest(self):
         dest = self.settings["dest"]
-        dest_problem(system.check_dest(dest), status=409)
+        dest_problem(self._check(dest), status=409)
         system.open_folder(dest)
 
     def log(self, job_id):
@@ -291,7 +291,7 @@ class Jobs:
         self._snapshot_changed()
         return {
             "settings": dict(self.settings),
-            "dest": dest_message(system.check_dest(self.settings["dest"], write=False)),
+            "dest": dest_message(self._check(self.settings["dest"], write=False)),
         }
 
     def close(self):
@@ -310,6 +310,20 @@ class Jobs:
         if job is None:
             raise problem(404, "not_found")
         return job
+
+    def _check(self, path, write=True, but=None):
+        """system.check_dest, except that a folder a job of ours is writing to is never "not answering": on a slow
+        drive the write test waits behind that job's own writes. but: a job that cannot vouch for itself."""
+        check = system.check_dest(path, write=write)
+        if check["problem"] == "not_responding":
+            with self.lock:
+                writing = any(
+                    j is not but and j["state"] == "running" and j["stage"] != "starting" and j["dest"] == str(path)
+                    for j in self.jobs
+                )
+            if writing:
+                return dict(check, ok=True, problem=None)
+        return check
 
     def _engine(self, engine):
         engine = engine or self.settings["engine"]
@@ -371,13 +385,13 @@ class Jobs:
         try:
             failure = None
             for attempt in (1, 2):
-                dest_problem(system.check_dest(job["dest"]))
+                dest_problem(self._check(job["dest"], but=job))
                 result = self._attempt(job)
                 if result is None or result["event"] == "done":
                     break
                 kind = result.get("kind") if result.get("kind") in KINDS else classify(result["message"])
                 try:
-                    dest_problem(system.check_dest(job["dest"]))  # a drive unplugged mid-download says so
+                    dest_problem(self._check(job["dest"], but=job))  # a drive unplugged mid-download says so
                 except Problem as p:
                     kind = p.kind
                 failure = self._error(kind, job["engine"], job["dest"])
@@ -465,17 +479,17 @@ class Jobs:
             if event.get("progress") is not None:  # never backwards, whatever the engine reports
                 job["progress"] = max(job["progress"] or 0.0, min(1.0, event["progress"]))
             job["what"] = event.get("what")
-            if event["status"] == "downloading":
+            if event["status"] in ("downloading", "processing"):  # a part, or a join, tags or MP3 step on a file
                 job.update(
-                    stage="downloading",
+                    stage=event["status"],
                     part=event["part"],
                     downloaded=event["downloaded"],
                     total=event["total"],
                     speed=event["speed"],
                     eta=event["eta"],
                 )
-            elif event["status"] == "finished":
-                job.update(stage="processing", downloaded=event["total"], speed=None, eta=None)
+            elif event["status"] == "finished":  # a part is done; what comes next is not known yet
+                job.update(stage="processing", what=None, downloaded=event["total"], speed=None, eta=None)
             self.dirty.add(job["id"])
 
     def _details(self, job, event):
@@ -509,13 +523,13 @@ class Jobs:
     def _snapshot_changed(self):
         if not self.subscribers:  # no page open: nobody to tell, and a subscriber starts with a snapshot
             return
-        dest, there = system.check_dest(self.settings["dest"], write=False), self._there()
+        dest, there = self._check(self.settings["dest"], write=False), self._there()
         with self.lock:
             if not self.closed:
                 self._publish("snapshot", self.snapshot(dest, there))
 
     def _machine(self):
-        return dict(system.check_dest(self.settings["dest"], write=False), free_bytes=None), self.tools()
+        return dict(self._check(self.settings["dest"], write=False), free_bytes=None), self.tools()
 
     def _tick(self):
         """Flush throttled job progress."""
@@ -657,7 +671,7 @@ RUN = {  # a job's fields for one run, as it is before the run starts; Retry set
     "stage": None,
     "part": 0,
     "progress": None,  # 0 to 1 across all parts, never decreasing
-    "what": None,  # "video" or "audio": what the current part carries
+    "what": None,  # downloading: "video" or "audio", what the part carries; processing: "join", "tags", "mp3" or None
     "downloaded": None,
     "total": None,
     "speed": None,
