@@ -3,11 +3,13 @@
 import json
 import os
 import queue
+import re
 import secrets
 import subprocess
 import sys
 import threading
 import time
+import traceback
 from importlib import metadata
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -86,12 +88,13 @@ class Jobs:
 
     # Reading
 
-    def snapshot(self, dest=None):
-        """Pass dest when holding the lock: checking a destination can take CHECK_TIMEOUT, so never under it."""
+    def snapshot(self, dest=None, there=None):
+        """Pass dest and there (from _there) when holding the lock: disk checks can hang, so never under it."""
         if dest is None or dest["path"] != self.settings["dest"]:  # the setting changed since dest was checked
             dest = system.check_dest(self.settings["dest"])
-        with self.lock:
-            jobs = [dict(j, file_exists=bool(j["path"]) and Path(j["path"]).exists()) for j in self.jobs]
+        there = self._there() if there is None else there
+        with self.lock:  # a job finished since there was taken keeps the file_exists it finished with
+            jobs = [dict(j, file_exists=there.get(j["path"], j["file_exists"])) for j in self.jobs]
             return {
                 "settings": dict(self.settings),
                 "dest": dest_message(dest),
@@ -103,9 +106,9 @@ class Jobs:
 
     def subscribe(self):
         """A queue of (event, data), starting with a snapshot. (None, None) means Spool is closing."""
-        q, dest = queue.Queue(), system.check_dest(self.settings["dest"])
+        q, dest, there = queue.Queue(), system.check_dest(self.settings["dest"]), self._there()
         with self.lock:
-            q.put(("snapshot", self.snapshot(dest)))
+            q.put(("snapshot", self.snapshot(dest, there)))
             self.subscribers.append(q)
         return q
 
@@ -132,7 +135,12 @@ class Jobs:
     def _probe(self, url, engine):
         events = self._call({"mode": "probe", "url": url, "engine": engine})
         result = next((e for e in reversed(events) if e.get("event") in ("info", "error")), None)
-        kind = "engine" if result is None else classify(result["message"]) if result["event"] == "error" else None
+        if result is None:
+            kind = "engine"
+        elif result["event"] == "error":
+            kind = result.get("kind") if result.get("kind") in KINDS else classify(result["message"])
+        else:
+            kind = None
         if kind is None and not result["entries"]:
             kind = "empty"
         if kind:
@@ -160,9 +168,11 @@ class Jobs:
                 same = next((j for j in live if key(j) == key(job)), None)
                 if same is None:
                     self.jobs.insert(0, job)
-                    self._changed(job)
+                    self._publish("job", dict(job))
                 existing += same is not None
                 added.append(dict(same or job))
+            if existing < len(new):
+                self._save()  # once for the lot: the list is rewritten whole
             self._pump()
         return added, existing
 
@@ -187,25 +197,11 @@ class Jobs:
             job = self._job(job_id)
             if job["state"] in ("queued", "running"):
                 raise Problem(409, "conflict", "This download is still going.")
+            if any(j["state"] in ("queued", "running") and key(j) == key(job) for j in self.jobs):
+                raise Problem(409, "conflict", "The same download is already going.")  # one partial file
             engine = self._engine(engine or job["engine"])
             self.setup()
-            job.update(
-                engine=engine,
-                state="queued",
-                stage=None,
-                part=0,
-                progress=None,
-                what=None,
-                downloaded=None,
-                total=None,
-                speed=None,
-                eta=None,
-                path=None,
-                size=None,
-                file_exists=False,
-                error=None,
-                finished=None,
-            )
+            job.update(RUN, engine=engine)
             self._changed(job)
             copy = dict(job)
             self._pump()
@@ -233,13 +229,15 @@ class Jobs:
         (self.logs / f"{job_id}.log").unlink(missing_ok=True)
         remove_leftovers(job, keep)
 
-    def clear(self, state):
-        """Take every finished job off the list. Their files stay."""
-        if state != "done":
-            raise Problem(422, "invalid_state", "Spool only clears finished downloads.")
+    def clear(self, ids):
+        """Take the finished jobs among ids off the list; their files stay. Other ids are ignored.
+
+        The page names the rows it showed as cleared, so a job that finished during its Undo stays."""
+        if not (isinstance(ids, list) and all(isinstance(i, str) for i in ids)):
+            raise Problem(422, "invalid_ids", "Choose the finished downloads to clear.")
         with self.lock:
-            gone = [j for j in self.jobs if j["state"] == "done"]
-            self.jobs = [j for j in self.jobs if j["state"] != "done"]
+            gone = [j for j in self.jobs if j["state"] == "done" and j["id"] in ids]
+            self.jobs = [j for j in self.jobs if j not in gone]
             for job in gone:
                 self._publish("job_removed", {"id": job["id"]})
             self._save()
@@ -343,6 +341,7 @@ class Jobs:
                 input=json.dumps(self._spec(**spec)),
                 capture_output=True,
                 text=True,
+                errors="replace",  # ffmpeg shares the pipe and may write any bytes
                 timeout=timeout,
             ).stdout
         except subprocess.TimeoutExpired:
@@ -372,7 +371,7 @@ class Jobs:
                 result = self._attempt(job)
                 if result is None or result["event"] == "done":
                     break
-                kind = classify(result["message"])
+                kind = result.get("kind") if result.get("kind") in KINDS else classify(result["message"])
                 try:
                     dest_problem(system.check_dest(job["dest"]))  # a drive unplugged mid-download says so
                 except Problem as p:
@@ -389,6 +388,15 @@ class Jobs:
                     break
         except Problem as p:
             result, failure = {"event": "error"}, {"kind": p.kind, "message": p.message, "hint": p.hint}
+        except Exception:  # a spawn or write that fails must not leave the job "starting" and its slot taken
+            result, failure = {"event": "error"}, error("engine")
+            if self.procs.get(job["id"]):
+                system.kill(self.procs[job["id"]])
+            try:
+                with open(self.logs / f"{job['id']}.log", "a", encoding="utf-8") as log:
+                    log.write(traceback.format_exc())
+            except OSError:
+                pass
         with self.lock:
             self.procs.pop(job["id"], None)
             if self.closed:
@@ -396,6 +404,8 @@ class Jobs:
             if job["state"] == "running" and result is not None:  # else cancelled, and perhaps retried since
                 if result["event"] == "done":
                     job.update(state="done", path=result["path"], size=result["size"], file_exists=True, progress=1.0)
+                    for j in self.jobs:  # a finished file is nobody's leftover, whichever job wrote under its name
+                        j["files"] = [f for f in j["files"] if result["path"] not in (f, mp3_of(j, f))]
                 else:
                     job.update(state="failed", error=failure)
                 job.update(stage=None, speed=None, eta=None, finished=time.time())
@@ -421,6 +431,7 @@ class Jobs:
                     stderr=log,
                     text=True,
                     encoding="utf-8",
+                    errors="replace",  # ffmpeg shares the pipe and may write any bytes
                 )
                 self.procs[job["id"]] = proc
             proc.stdin.write(json.dumps(spec))
@@ -436,6 +447,7 @@ class Jobs:
                 elif event["event"] == "file":
                     with self.lock:
                         job["files"].append(event["path"])
+                        self._save()  # Remove needs these after a quit too
                 else:
                     result = event
                     break  # a child the engine left behind may hold the pipe open; this was the last word
@@ -485,11 +497,19 @@ class Jobs:
     def _save(self):
         write_atomic(self.state_file, json.dumps({"settings": self.settings, "jobs": self.jobs}).encode())
 
+    def _there(self):
+        """Whether each finished job's file is still on disk, checked outside the lock."""
+        with self.lock:
+            paths = [j["path"] for j in self.jobs if j["path"]]
+        return {p: os.path.exists(p) for p in paths}
+
     def _snapshot_changed(self):
-        dest = system.check_dest(self.settings["dest"])
+        if not self.subscribers:  # no page open: nobody to tell, and a subscriber starts with a snapshot
+            return
+        dest, there = system.check_dest(self.settings["dest"]), self._there()
         with self.lock:
             if not self.closed:
-                self._publish("snapshot", self.snapshot(dest))
+                self._publish("snapshot", self.snapshot(dest, there))
 
     def _machine(self):
         return dict(system.check_dest(self.settings["dest"]), free_bytes=None), self.tools()
@@ -506,9 +526,11 @@ class Jobs:
 
     def _watch(self):
         """Destination and tools have no events, so poll them once a second, apart from progress: a check can hang."""
-        last = self._machine()
+        last = None  # checked first when a page opens: a write test is not free
         while not self.closed:
             time.sleep(1)
+            if self.closed or not self.subscribers:
+                continue
             now = self._machine()
             if now != last:
                 self._snapshot_changed()
@@ -522,6 +544,7 @@ MESSAGES = {  # kind -> (the sentence people read, hint). Every sentence the ser
     "empty": ("Spool found no video at this link.", None),
     "unavailable": ("This video is private, removed, or needs a sign-in.", None),
     "live": ("This is live now. Download it after it ends.", None),
+    "playlist": ("This link is a list of videos. Paste it in the link field to choose from it.", None),
     "blocked": ("The site refused the download.", "retry"),  # update_engine when a newer engine exists
     "network": ("Spool couldn't reach the site. Check your internet connection.", "retry"),
     "no_ffmpeg": ("This quality needs a free helper to join video and audio.", "install_ffmpeg"),
@@ -542,6 +565,7 @@ MESSAGES = {  # kind -> (the sentence people read, hint). Every sentence the ser
     "not_found": ("Spool can't find that download.", None),
     "gone": ("Spool can't find the file. It was moved or deleted.", None),
 }
+KINDS = ("live", "no_js", "playlist")  # the worker names these itself; its message is then not read
 DEST_KINDS = {
     "unplugged": "dest_unplugged",
     "missing": "dest_missing",
@@ -605,14 +629,41 @@ def link(url):
     """A link must be http or https with a host; it reaches the engine as data only."""
     if isinstance(url, str) and len(url) > LINK_LIMIT:
         raise problem(422, "too_long")
-    parts = urlsplit(url) if isinstance(url, str) else None
-    if not parts or parts.scheme not in ("http", "https") or not parts.hostname or any(c.isspace() for c in url):
+    try:
+        parts = urlsplit(url) if isinstance(url, str) else None
+    except ValueError:  # a broken [IPv6] host
+        parts = None
+    if (
+        not parts
+        or parts.scheme not in ("http", "https")
+        or not parts.hostname
+        or "@" in parts.netloc  # a user name lets a link show one host and fetch another
+        or any(c.isspace() for c in url)
+    ):
         raise problem(422, "invalid_link")
     return url
 
 
 def text(value, limit=1000):
     return str(value)[:limit] if value is not None else None
+
+
+RUN = {  # a job's fields for one run, as it is before the run starts; Retry sets them back
+    "state": "queued",
+    "stage": None,
+    "part": 0,
+    "progress": None,  # 0 to 1 across all parts, never decreasing
+    "what": None,  # "video" or "audio": what the current part carries
+    "downloaded": None,
+    "total": None,
+    "speed": None,
+    "eta": None,
+    "path": None,
+    "size": None,
+    "file_exists": False,
+    "error": None,
+    "finished": None,
+}
 
 
 def new_job(entry, preset, engine, dest):
@@ -632,31 +683,20 @@ def new_job(entry, preset, engine, dest):
         "preset": preset,
         "engine": engine,
         "dest": dest,
-        "state": "queued",
-        "stage": None,
-        "part": 0,
-        "progress": None,  # 0 to 1 across all parts, never decreasing
-        "what": None,  # "video" or "audio": what the current part carries
-        "downloaded": None,
-        "total": None,
-        "speed": None,
-        "eta": None,
-        "path": None,
-        "size": None,
-        "file_exists": False,
+        **RUN,
         "files": [],  # every name the engine wrote, temporary ones included: what Remove cleans up
-        "error": None,
         "created": time.time(),
-        "finished": None,
     }
 
 
+OS_ERROR = re.compile(r"(\[errno \d+\] [^:]*):.*")  # "[Errno 13] Permission denied: '<file name>'"
 ERRORS = [  # (kind, lowercase pieces of engine messages); the first match wins. The words people read are MESSAGES.
     ("live", ("this is live now.",)),
     ("no_js", ("no supported javascript runtime",)),  # yt-dlp warns first; what fails after it fails for this
     ("unsupported", ("unsupported url",)),
     ("empty", ("found no video at this link",)),
     ("no_ffmpeg", ("ffmpeg not found", "ffprobe and ffmpeg not found", "ffmpeg is not installed", "ffprobe/avprobe")),
+    ("engine", ("requested format is not available",)),  # the video is there; the log says what was asked
     ("blocked", ("http error 403", "not a bot", "http error 429", "too many requests")),  # the bot check says sign in
     (
         "unavailable",
@@ -703,9 +743,16 @@ ERRORS = [  # (kind, lowercase pieces of engine messages); the first match wins.
 
 
 def classify(message):
-    """An engine's message -> an error kind. The engine's own words stay in the job's log."""
-    low = message.lower()
+    """An engine's message -> an error kind. The engine's own words stay in the job's log.
+
+    File names carry the video's title, so an OS error's file names are not read."""
+    low = OS_ERROR.sub(r"\1", message.lower())
     return next((kind for kind, pieces in ERRORS if any(p in low for p in pieces)), "engine")
+
+
+def mp3_of(job, f):
+    """The .mp3 ffmpeg makes from a reported name f, for an MP3 job."""
+    return os.path.splitext(f.removesuffix(".part"))[0] + ".mp3" if job["preset"] == "mp3" else None
 
 
 def remove_leftovers(job, keep):
@@ -713,10 +760,13 @@ def remove_leftovers(job, keep):
     names = set()
     for f in job["files"]:
         names |= {f, f + ".part", f + ".ytdl"}
-        if job["preset"] == "mp3" and job["state"] != "done":  # ffmpeg's half-written .mp3 looks finished
-            mp3 = os.path.splitext(f.removesuffix(".part"))[0] + ".mp3"
+        mp3 = mp3_of(job, f)
+        if mp3 and job["state"] != "done":  # ffmpeg's half-written .mp3 looks finished
             if os.path.exists(mp3) and os.path.getmtime(mp3) >= job["created"]:  # never an older job's mp3
                 names.add(mp3)
     for name in names - keep:
-        if os.path.dirname(name) == job["dest"] and os.path.isfile(name):
-            os.unlink(name)
+        try:  # the worker reports names under the folder's real path, which the typed one may not spell
+            if os.path.isfile(name) and os.path.samefile(os.path.dirname(name), job["dest"]):
+                os.unlink(name)
+        except OSError:
+            pass

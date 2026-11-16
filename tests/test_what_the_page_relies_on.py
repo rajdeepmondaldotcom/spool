@@ -8,6 +8,7 @@ from serve_fake import FakeGitHub
 from support import job_state
 
 from spool import system
+from spool.jobs import Problem
 
 
 @pytest.fixture
@@ -116,12 +117,14 @@ def test_adding_what_is_already_in_the_list_adds_nothing(app, events):
 
 def test_clear_takes_finished_rows_off_the_list_and_keeps_their_files(app, events):
     done = finished(events, add(app, "https://fake.test/video?delay=0")["jobs"][0]["id"])[-1][1]
+    later = finished(events, add(app, "https://fake.test/video/2?delay=0")["jobs"][0]["id"])[-1][1]
     failed = finished(events, add(app, "https://fake.test/unsupported")["jobs"][0]["id"])[-1][1]
-    assert app.request("POST", "/api/jobs/clear", {"state": "done"})[0] == 204
+    app.jobs.clear([done["id"], failed["id"], "nope"])  # the server passes the page's list through
     assert events.until(lambda e, d: e == "job_removed")[-1][1] == {"id": done["id"]}
-    assert [j["id"] for j in app.jobs.snapshot()["jobs"]] == [failed["id"]]
+    assert [j["id"] for j in app.jobs.snapshot()["jobs"]] == [failed["id"], later["id"]]
     assert os.path.exists(done["path"])
-    assert app.json("POST", "/api/jobs/clear", {"state": "failed"})[0] == 422
+    with pytest.raises(Problem):
+        app.jobs.clear("done")
 
 
 # The folder
@@ -161,8 +164,11 @@ def test_the_interrupted_job_can_resume(tmp_path):
     from serve_fake import start
 
     httpd, _, jobs, _ = start(tmp_path)
-    jobs.add([{"url": "https://fake.test/slow?delay=0.3"}], "best")
-    time.sleep(0.3)
+    job = jobs.add([{"url": "https://fake.test/slow?delay=0.1"}], "best")[0][0]
+    end = time.time() + 10
+    while not jobs.snapshot()["jobs"][0]["downloaded"]:
+        assert time.time() < end
+        time.sleep(0.05)
     httpd.shutdown()
     jobs.close()
     httpd, _, jobs, _ = start(tmp_path)
@@ -172,6 +178,12 @@ def test_the_interrupted_job_can_resume(tmp_path):
             "message": "Spool was closed before this download finished.",
             "hint": "resume",
         }
+        jobs.retry(job["id"])
+        end = time.time() + 15
+        while jobs.snapshot()["jobs"][0]["state"] != "done":
+            assert time.time() < end
+            time.sleep(0.05)
+        assert "Resuming download at byte" in jobs.log(job["id"])
     finally:
         httpd.shutdown()
         jobs.close()
