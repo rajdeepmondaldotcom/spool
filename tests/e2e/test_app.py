@@ -191,6 +191,22 @@ def test_escape_closes_the_tray_and_returns_to_the_field(app):
     expect(app.get_by_label("Link to download")).to_be_focused()
 
 
+def test_escape_in_the_instant_the_preview_opens_still_returns_to_the_field(app):
+    # Escape arrives as the preview is drawn, before the browser paints it: no later focus move may undo the close.
+    app.evaluate(
+        """() => new MutationObserver((_, watch) => {
+            if (!document.querySelector('section.tray')) return;
+            watch.disconnect();
+            document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));
+        }).observe(document.body, {childList: true, subtree: true})"""
+    )
+    look_up(app, VIDEO)
+    expect(app.locator("section.tray")).to_have_count(0)
+    expect(app.get_by_label("Link to download")).to_be_focused()
+    app.wait_for_timeout(300)  # past the moment a late focus move would have run
+    expect(app.get_by_label("Link to download")).to_be_focused()
+
+
 def test_pasting_several_links_queues_them_all(app):
     app.locator(".queue").click()
     paste(app, "https://fake.test/video/1\nhttps://fake.test/video/2, https://fake.test/audio")
