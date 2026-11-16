@@ -250,6 +250,33 @@ def test_a_snapshot_goes_out_when_the_stuck_check_finally_answers(app, tmp_path,
     assert seen[-1][1]["dest"]["problem"] is None
 
 
+def test_a_drive_busy_with_spools_own_download_is_answering(app, monkeypatch):
+    """A slow drive queues the write test behind Spool's own writes: the running job is the proof it works."""
+    events = app.events()
+    events.next()
+    first = app.json("POST", "/api/jobs", {"entries": [entry("https://fake.test/slow?delay=0.3")], "preset": "best"})
+    first = first[1]["jobs"][0]
+    events.until(lambda e, d: e == "job" and d["id"] == first["id"] and d["stage"] == "downloading")
+    monkeypatch.setattr(system, "CHECK_TIMEOUT", 0.3)
+    real = system.probe
+    monkeypatch.setattr(system, "probe", lambda path, write: time.sleep(1) or real(path, write))  # past the limit
+
+    status, body = app.json("PUT", "/api/settings", {"dest": str(app.dest)})
+    assert (status, body["dest"]["ok"], body["dest"]["problem"]) == (200, True, None)
+    assert app.jobs.snapshot()["dest"]["ok"] is True  # the page leaves Download enabled
+    status, body = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})
+    assert status == 201, body
+    second = events.until(
+        lambda e, d: e == "job" and d["id"] == body["jobs"][0]["id"] and d["state"] in ("done", "failed")
+    )
+    assert second[-1][1]["state"] == "done", second[-1][1]["error"]
+
+    events.until(lambda e, d: e == "job" and d["id"] == first["id"] and d["state"] == "done", timeout=20)
+    events.close()
+    status, body = app.json("PUT", "/api/settings", {"dest": str(app.dest)})  # no job of Spool's there now
+    assert body["dest"]["problem"] == "not_responding"
+
+
 # A check never raises, and a watcher's check writes nothing
 
 
