@@ -2,7 +2,8 @@
 
 Links look like https://fake.test/<scenario>[/<n>][?delay=<seconds per step>].
 It implements only what spool's worker uses: YoutubeDL(params) as a context manager,
-extract_info, download, add_post_processor, progress hooks and the logger.
+extract_info, download, add_post_processor, progress and post-processor hooks, the merger's
+postprocessor_args, FFmpegMetadataPP and the logger.
 """
 
 import os
@@ -138,6 +139,7 @@ SLOW_FORMATS = [
 ]
 
 
+TAGGED = set()  # files holding chapters and details: written by a metadata step, or carried over by a join
 HOME = os.path.realpath(os.getcwd())  # the engine is imported before the worker moves: the test's own tmp_path
 
 
@@ -148,6 +150,8 @@ class Named:
         self.key = key
 
     def run(self, information):
+        if self.key == "FFmpegMetadata":
+            TAGGED.add(information["filepath"])
         return [], information
 
 
@@ -161,6 +165,26 @@ class PostProcessor:
 
     def run(self, information):
         return [], information
+
+
+class FFmpegMetadataPP(PostProcessor):
+    """yt-dlp's chapters-and-details step: it rewrites the whole file it is given, through <name>.temp.<ext>."""
+
+    def __init__(self, downloader, add_metadata=True, add_chapters=True, add_infojson="if_exists"):
+        super().__init__(downloader)
+
+    def run(self, info):
+        ydl, path = self._downloader, info["filepath"]
+        ydl.pp_hook("started", "Metadata", info)
+        ydl.log(f'[Metadata] Adding metadata to "{path}"')
+        if info.get("_fail_tags") and "requested_formats" not in info:  # one part's, not the joined file's
+            raise DownloadError("ERROR: Postprocessing: Conversion failed!")
+        temp = "{}.temp{}".format(*os.path.splitext(path))
+        shutil.copyfile(path, temp)
+        os.replace(temp, path)
+        TAGGED.add(path)
+        ydl.pp_hook("finished", "Metadata", info)
+        return [], info
 
 
 def video(url, n, title=None, formats=VIDEO_FORMATS, **extra):
@@ -199,8 +223,10 @@ def scenario(url):
     delay = parse_qs(parts.query).get("delay")
     delay = float(delay[0]) if delay else None
     if name == "video":
-        fail = parse_qs(parts.query).get("fail") == ["merge"]  # the merge breaks half way through its file
-        return {**video(url, n), "_fail_merge": fail}, delay if delay is not None else 0.02
+        fail = parse_qs(parts.query).get("fail")  # merge: the join breaks half way; tags: a part can't be tagged
+        join = float(parse_qs(parts.query).get("join", ["0"])[0])  # seconds per tenth of the join
+        extra = {"_fail_merge": fail == ["merge"], "_fail_tags": fail == ["tags"], "_join": join}
+        return {**video(url, n), **extra}, delay if delay is not None else 0.02
     if name == "audio":
         return {
             **video(url, n, "Fake audio track", AUDIO_FORMATS),
@@ -321,6 +347,10 @@ class YoutubeDL:
 
     def add_post_processor(self, pp):
         self.pps.append((1, pp))
+
+    def pp_hook(self, status, key, info):
+        for h in self.params.get("postprocessor_hooks", []):
+            h({"status": status, "postprocessor": key, "info_dict": info})
 
     def log(self, msg):
         if self.params.get("logger"):
@@ -507,19 +537,10 @@ class YoutubeDL:
         else:
             files = [self.fetch(info, f, delay, parts) for f in parts]
             if len(files) == 2:
-                self.log(f'[Merger] Merging formats into "{final}"')
-                temp = os.path.splitext(final)[0] + ".temp.mp4"
-                time.sleep(delay)
-                with self.open(temp, "wb") as out:
-                    for f in files:
-                        with open(f, "rb") as src:
-                            out.write(src.read())
-                        if info.get("_fail_merge"):
-                            self.fail("ERROR: Postprocessing: Conversion failed!")
-                os.replace(temp, final)
-                for f in files:
-                    os.remove(f)
+                self.merge(info, parts, files, final, delay)
             elif mp3:  # ffmpeg writes the .mp3 as it goes, so a cut leaves a short file that looks finished
+                about = {**info, "filepath": files[0]}
+                self.pp_hook("started", "ExtractAudio", about)
                 self.log(f"[ExtractAudio] Destination: {final}")
                 with self.open(final, "wb") as out:
                     out.write(b"\0" * 1000)
@@ -527,6 +548,7 @@ class YoutubeDL:
                     time.sleep(delay * 10)
                     out.write(b"\0" * 1000)
                 os.remove(files[0])
+                self.pp_hook("finished", "ExtractAudio", about)
             else:
                 os.replace(files[0], final)
         order = [pp for when, pp in sorted(self.pps, key=lambda x: x[0]) if when != self.WHEN.get("video")]
@@ -535,6 +557,40 @@ class YoutubeDL:
             os.utime(final, (info["timestamp"], info["timestamp"]))
         for pp in order:
             pp.run({**info, "filepath": final})
+        self.log(f"[fake] details in the file: {final in TAGGED}")
+
+    def merge(self, info, parts, files, final, delay):
+        """yt-dlp's join: chapters and details come from the input its postprocessor_args name, else none."""
+        about = {
+            **info,
+            "filepath": final,
+            "requested_formats": [{**f, "filepath": n} for f, n in zip(parts, files, strict=True)],
+        }
+        self.pp_hook("started", "Merger", about)
+        self.log(f'[Merger] Merging formats into "{final}"')
+        args = (self.params.get("postprocessor_args") or {}).get("merger+ffmpeg_o", [])
+        temp = os.path.splitext(final)[0] + ".temp.mp4"
+        time.sleep(delay)
+        with self.open(temp, "wb") as out:
+            for f in files:
+                with open(f, "rb") as src:
+                    data = src.read()
+                step = len(data) // self.STEPS + 1
+                for k in range(0, len(data), step):  # ffmpeg writes as it goes
+                    out.write(data[k : k + step])
+                    out.flush()
+                    time.sleep(info.get("_join", 0))
+                if info.get("_fail_merge"):
+                    self.fail("ERROR: Postprocessing: Conversion failed!")
+        os.replace(temp, final)
+        if "-map_metadata" in args:
+            i = args[args.index("-map_metadata") + 1]
+            assert args[args.index("-map_chapters") + 1] == i, args
+            if files[int(i)] in TAGGED:
+                TAGGED.add(final)
+        for f in files:
+            os.remove(f)
+        self.pp_hook("finished", "Merger", about)
 
     def fetch(self, info, f, delay, parts):
         split = len(parts) > 1

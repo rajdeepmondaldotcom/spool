@@ -294,6 +294,36 @@ def download(engine, module, params, spec):
                 wrote(base + ".temp" + e)
             return [], information
 
+    joined = []  # the join takes chapters and details from the audio part: no second pass over the joined file
+
+    def tag_audio(d):
+        """Tag the small audio part and have the join copy its tags, instead of rewriting the joined file after.
+
+        Any failure leaves today's two passes: the Details step then writes them into the joined file."""
+        info = d["info_dict"]
+        i = next((k for k, f in enumerate(plan) if f.get("format_id") == info.get("format_id")), None)
+        if i is None or len(plan) < 2 or has(info, "vcodec") or not has(info, "acodec"):
+            return
+        try:
+            wrote("{}.temp{}".format(*os.path.splitext(d["filename"])))
+            tags(dict(info, filepath=d["filename"]))
+        except Exception as exc:  # the engine's error, or a change in its insides
+            emit(event="log", line=f"[spool] details go in after the join: {exc!r}")
+            return
+        args = ydl.params.setdefault("postprocessor_args", {})
+        args["merger+ffmpeg_o"] = ["-map_metadata", str(i), "-map_chapters", str(i)]
+        joined.append(i)
+
+    def tags(info):
+        Metadata = import_module("yt_dlp.postprocessor.ffmpeg").FFmpegMetadataPP
+        return Metadata(ydl, add_metadata=True, add_chapters=True).run(info)
+
+    class Details(PostProcessor):
+        """yt-dlp's chapters-and-details step, unless the join already carried them."""
+
+        def run(self, information):
+            return ([], information) if joined else tags(information)
+
     part = {"n": 0, "last": None}
 
     def hook(d):
@@ -317,6 +347,8 @@ def download(engine, module, params, spec):
             speed=d.get("speed"),
             eta=d.get("eta"),
         )
+        if module == "yt_dlp" and spec["ffmpeg"] and d.get("status") == "finished" and d.get("info_dict"):
+            tag_audio(d)
 
     refused = []
 
@@ -349,12 +381,8 @@ def download(engine, module, params, spec):
     params["postprocessors"] = []
     if spec["preset"] == "mp3":
         params["postprocessors"].append({"key": "FFmpegExtractAudio", "preferredcodec": "mp3"})
-    if spec["ffmpeg"]:  # chapters and the video's details go into the file; youtube-dl's takes no options
-        params["postprocessors"].append(
-            {"key": "FFmpegMetadata", "add_chapters": True, "add_metadata": True}
-            if module == "yt_dlp"
-            else {"key": "FFmpegMetadata"}
-        )
+    if spec["ffmpeg"] and module != "yt_dlp":  # chapters and the video's details go into the file; yt-dlp's: Details
+        params["postprocessors"].append({"key": "FFmpegMetadata"})
     try:  # from inside dest, an engine cannot recreate it: a path relative to a deleted folder goes nowhere
         os.chdir(spec["dest"])
     except OSError:
@@ -362,6 +390,8 @@ def download(engine, module, params, spec):
     with engine.YoutubeDL(params) as ydl:
         if module == "yt_dlp":
             ydl.add_post_processor(Name(), when="video")
+            if spec["ffmpeg"]:  # after the MP3 step, which params added first
+                ydl.add_post_processor(Details(), when="post_process")
             ydl.add_post_processor(Capture(), when="after_move")
         else:
             ydl.add_post_processor(Capture())
