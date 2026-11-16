@@ -202,6 +202,9 @@ def exe():
     return "deno.exe" if sys.platform == "win32" else "deno"
 
 
+_replacing = threading.Lock()
+
+
 def write_atomic(path, data):
     """Replace path with data in one step. The temp name is unique, so two writers never share it; mode 0600."""
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
@@ -210,14 +213,15 @@ def write_atomic(path, data):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        for wait in (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, None):
-            try:
-                os.replace(tmp, path)
-                break
-            except PermissionError:  # Windows refuses while another writer is replacing the same file
-                if wait is None or sys.platform != "win32":
-                    raise
-                time.sleep(wait)
+        with _replacing:  # our own threads take turns; the retries below are for another Spool process
+            for wait in (0.01, 0.02, 0.05, 0.1, 0.2, 0.5, None):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:  # Windows refuses while another writer is replacing the same file
+                    if wait is None or sys.platform != "win32":
+                        raise
+                    time.sleep(wait)
     except BaseException:
         os.unlink(tmp)  # our own temp file, never anything else
         raise
