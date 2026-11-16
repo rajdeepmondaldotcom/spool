@@ -7,6 +7,7 @@ import os
 import secrets
 import signal
 import sys
+import threading
 import webbrowser
 from urllib.parse import quote
 
@@ -56,7 +57,9 @@ def main(argv=None):
             signal.signal(stop, interrupt)
     try:  # from here a stop (Ctrl+C, SIGTERM, SIGHUP) at any moment shuts down quietly
         engines.start()
-        js.start()
+        threading.Thread(
+            target=js.start, daemon=True
+        ).start()  # it asks other programs their version: never wait on them
         print(f"Spool is running at {url}", flush=True)
         print("Press Ctrl+C to stop it.", flush=True)
         if not args.no_open:

@@ -182,10 +182,17 @@ SHA256 = re.compile(r"\b[0-9a-fA-F]{64}\b")  # deno's .sha256sum is "<hex>  <nam
 @functools.cache  # shortcut: a runtime upgraded in place is seen at the next launch; fine for a local app
 def new_enough(name, path):
     """Whether a runtime on PATH is one the engine will use: an older one is skipped and YouTube fails."""
-    try:
-        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10).stdout
-    except (OSError, subprocess.SubprocessError):
-        return False
+    with (
+        tempfile.TemporaryFile() as said
+    ):  # a file, not a pipe: a pipe keeps us waiting on whatever the program started
+        try:
+            subprocess.run(
+                [path, "--version"], stdin=subprocess.DEVNULL, stdout=said, stderr=subprocess.DEVNULL, timeout=3
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False  # a program that will not say its version in time is not one to rely on
+        said.seek(0)
+        out = said.read().decode(errors="replace")
     found = re.search(r"(\d+)\.(\d+)\.(\d+)", out)
     return bool(found) and tuple(map(int, found.groups())) >= JS_FLOORS[name]
 

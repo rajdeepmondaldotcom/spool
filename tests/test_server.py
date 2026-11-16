@@ -170,11 +170,13 @@ def test_job_events_are_throttled_to_four_a_second(app):
     events.next()
     # 20 progress steps over about one second
     entry = {"url": "https://fake.test/video?delay=0.05", "id": "vid-1", "title": "Fake video 1"}
+    began = time.monotonic()
     app.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})
     seen = events.until(job_state("done"))
+    took = time.monotonic() - began  # about a second here, several on a loaded machine
     events.close()
     progress = [d for e, d in seen if e == "job" and d["state"] == "running"]
-    assert 2 <= len(progress) <= 8
+    assert 2 <= len(progress) <= 4 * took + 4  # four a second, plus the stage changes, which go out at once
 
 
 def test_two_jobs_run_at_once_and_the_third_waits(app):
