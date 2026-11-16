@@ -248,3 +248,132 @@ def test_a_snapshot_goes_out_when_the_stuck_check_finally_answers(app, tmp_path,
     seen = events.until(lambda e, d: e == "snapshot" and d["dest"]["ok"], timeout=10)
     events.close()
     assert seen[-1][1]["dest"]["problem"] is None
+
+
+# A check never raises, and a watcher's check writes nothing
+
+
+def test_a_folder_spool_may_not_enter_is_denied_not_a_crash(tmp_path, monkeypatch):
+    inside = tmp_path / "Private" / "Spool"
+    real = Path.exists
+    monkeypatch.setattr(
+        Path,
+        "exists",
+        lambda p, **k: (_ for _ in ()).throw(PermissionError(13, "denied")) if p == inside else real(p, **k),
+    )
+    check = system.check_dest(inside)
+    assert (check["ok"], check["problem"], check["path"]) == (False, "not_writable", str(inside))
+
+
+def test_a_share_that_drops_is_not_responding_not_a_crash(tmp_path, monkeypatch):
+    monkeypatch.setattr(system.shutil, "disk_usage", lambda p: (_ for _ in ()).throw(OSError(5, "Input/output error")))
+    check = system.check_dest(tmp_path)
+    assert (check["ok"], check["problem"], check["free_bytes"]) == (False, "not_responding", None)
+
+
+def test_a_check_that_fails_in_a_way_nobody_foresaw_still_answers(tmp_path, monkeypatch):
+    monkeypatch.setattr(system, "probe_dest", lambda path: 1 / 0)
+    assert system.check_dest(tmp_path)["problem"] == "not_responding"
+
+
+def test_the_quick_check_writes_nothing_and_still_sees_a_folder_it_cannot_write(tmp_path, monkeypatch):
+    monkeypatch.setattr(system.tempfile, "TemporaryFile", lambda **k: pytest.fail("the quick check wrote a file"))
+    assert system.check_dest(tmp_path, write=False)["ok"] is True
+    monkeypatch.setattr(system.os, "access", lambda p, mode: False)
+    assert system.check_dest(tmp_path / ".", write=False)["problem"] == "not_writable"
+
+
+# Tools, the folder dialog and the file manager (never run for real: subprocess.run is replaced)
+
+
+def test_tools_with_spools_runtime_reads_path_once_and_agrees_with_it(monkeypatch):
+    asked = []
+    monkeypatch.setattr(system.shutil, "which", lambda name: asked.append(name) or (name == "quickjs") or None)
+
+    class Js:
+        def tools(self):
+            return {"js_runtime": "deno", "js_setup": None, "js_path": "/x/deno"}
+
+    assert system.tools(Js())["js_runtime"] == "deno"
+    assert asked == ["ffmpeg"]
+    assert system.tools()["js_runtime"] is None  # a runtime the engines can't use is no runtime
+
+
+class Ran:
+    def __init__(self, monkeypatch, returncode=0, stdout="", stderr="", missing=False):
+        self.calls, self.result = [], (returncode, stdout, stderr)
+        self.missing = missing
+        monkeypatch.setattr(system.subprocess, "run", self)
+
+    def __call__(self, args, **kwargs):
+        self.calls.append(args)
+        if self.missing:
+            raise FileNotFoundError(2, "No such file or directory")
+        code, out, err = self.result
+        return system.subprocess.CompletedProcess(args, code, out, err)
+
+
+def test_the_folder_dialog_tells_cancel_from_failure(monkeypatch):
+    monkeypatch.setattr(system.sys, "platform", "darwin")
+    Ran(monkeypatch, stdout="/Volumes/T7/Spool/\n")
+    assert system.choose_folder() == "/Volumes/T7/Spool"
+    Ran(monkeypatch, 1, stderr="execution error: User canceled. (-128)")
+    assert system.choose_folder() is None
+    Ran(monkeypatch, 1, stderr="execution error: Not authorized to send Apple events to System Events. (-1743)")
+    with pytest.raises(NotImplementedError):
+        system.choose_folder()
+
+
+def test_reveal_on_windows_quotes_only_the_path(monkeypatch):
+    monkeypatch.setattr(system.sys, "platform", "win32")
+    ran = Ran(monkeypatch)
+    system.reveal(r"C:\Users\a\Downloads\My video [x].mp4")
+    assert ran.calls == [r'explorer /select,"C:\Users\a\Downloads\My video [x].mp4"']
+
+
+def test_no_file_manager_is_not_supported_not_a_crash(monkeypatch):
+    monkeypatch.setattr(system.sys, "platform", "linux")
+    Ran(monkeypatch, missing=True)
+    for call in (system.reveal, system.open_folder):
+        with pytest.raises(NotImplementedError):
+            call("/srv/videos/a.mp4")
+
+
+# Process groups
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="process groups")
+def test_leftovers_are_killed_before_the_worker_is_reaped(tmp_path):
+    marker = tmp_path / "child.pid"
+    script = (
+        "import subprocess, sys; "
+        "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        f"open({str(marker)!r}, 'w').write(str(c.pid))"
+    )
+    proc = system.spawn([sys.executable, "-c", script])
+    while not marker.exists():  # never poll(): that would reap the worker
+        time.sleep(0.02)
+    os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)  # exited, not yet reaped
+    child = int(marker.read_text())
+    system.kill_leftovers(proc)
+    assert proc.returncode == 0  # kill_leftovers reaps it, after the group is gone
+    deadline = time.time() + 5
+    while True:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        assert time.time() < deadline, "the grandchild outlived the worker"
+        time.sleep(0.05)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="process groups")
+def test_kill_survives_a_group_it_may_not_signal(monkeypatch):
+    proc = system.spawn([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        with monkeypatch.context() as m:
+            m.setattr(system.os, "killpg", lambda *a: (_ for _ in ()).throw(PermissionError(1, "not permitted")))
+            system.kill(proc, grace=0.1)
+    finally:
+        proc.kill()
+        proc.wait()

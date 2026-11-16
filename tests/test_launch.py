@@ -1,11 +1,13 @@
 import json
 import os
+import queue
 import re
 import signal
 import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -38,19 +40,40 @@ def stop_every_launch():
         stop(LAUNCHED.pop())
 
 
-def launch(data, *args):
-    # an unreachable proxy keeps the latest-version check off the network
-    env = {**os.environ, "SPOOL_DATA_DIR": str(data), "HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": ""}
+def env(data):
+    """An unreachable proxy, in both spellings (lowercase wins), keeps the latest-version check off the network."""
+    proxy = {k: v for k in ("https_proxy", "HTTPS_PROXY") for v in ["http://127.0.0.1:9"]}
+    blank = {k: "" for k in ("http_proxy", "HTTP_PROXY", "no_proxy", "NO_PROXY", "all_proxy", "ALL_PROXY")}
+    return {**os.environ, "SPOOL_DATA_DIR": str(data), **proxy, **blank}
+
+
+def start(data, *args):
     proc = subprocess.Popen(
         [sys.executable, "-m", "spool", "--no-open", *args],
-        env=env,
+        env=env(data),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
     LAUNCHED.append(proc)
-    line = proc.stdout.readline()
-    return proc, line
+    proc.lines = queue.Queue()
+    threading.Thread(
+        target=lambda: [proc.lines.put(x) for x in proc.stdout] + [proc.lines.put("")], daemon=True
+    ).start()
+    return proc
+
+
+def readline(proc, timeout=15):
+    """The next line Spool prints; a launch that blocks fails the test instead of hanging the suite."""
+    try:
+        return proc.lines.get(timeout=timeout)
+    except queue.Empty:
+        pytest.fail(f"Spool printed nothing for {timeout} s")
+
+
+def launch(data, *args):
+    proc = start(data, *args)
+    return proc, readline(proc)
 
 
 def url_in(line):
@@ -65,34 +88,44 @@ def stop(proc):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
-    proc.stdout.close()
 
 
 def test_launch_prints_the_link_with_the_token_in_the_fragment(data):
     proc, line = launch(data)
     try:
         assert line.startswith("Spool is running at http://127.0.0.1:")
-        assert proc.stdout.readline() == "Press Ctrl+C to stop it.\n"
+        assert readline(proc) == "Press Ctrl+C to stop it.\n"
         url = url_in(line)
-        token = (data / "token").read_text().strip()
         lock = json.loads((data / "spool.lock").read_text())
-        assert lock == {"port": lock["port"], "pid": proc.pid}
-        assert url == f"http://127.0.0.1:{lock['port']}/#t={token}"
-        assert stat.S_IMODE((data / "token").stat().st_mode) == 0o600
-        client = Client(url.split("/#")[0], token)
+        assert lock == {"port": lock["port"], "pid": proc.pid, "token": lock["token"]}
+        assert url == f"http://127.0.0.1:{lock['port']}/#t={lock['token']}"
+        assert stat.S_IMODE((data / "spool.lock").stat().st_mode) == 0o600
+        assert not (data / "token").exists()  # no token outlives its launch
+        client = Client(url.split("/#")[0], lock["token"])
         assert client.request("GET", "/api/jobs/x/log")[0] == 404  # past the token check
     finally:
         stop(proc)
 
 
-def test_the_token_and_the_default_port_survive_a_restart(data):
+def test_every_launch_has_a_new_token_and_the_default_port_survives(data):
     first, line = launch(data)
     stop(first)
     second, again = launch(data)
     try:
-        assert url_in(again).split("#")[1] == url_in(line).split("#")[1]  # the same token
+        assert url_in(again).split("#")[1] != url_in(line).split("#")[1]  # an old tab's token opens nothing
+        if ":7766/" in line:
+            assert url_in(again).split("#")[0] == url_in(line).split("#")[0]
+    finally:
+        stop(second)
+
+
+def test_the_default_port_survives_a_restart(data):
+    first, line = launch(data)
+    stop(first)
+    second, again = launch(data)
+    try:
         if ":7766/" in line:  # unless something else on this machine holds the default port
-            assert url_in(again) == url_in(line)
+            assert url_in(again).split("#")[0] == url_in(line).split("#")[0]
     finally:
         stop(second)
 
@@ -123,8 +156,30 @@ def test_a_second_launch_points_at_the_running_one_and_exits(data):
         stop(first)
 
 
+def dead_pid():
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    return gone.pid
+
+
+def test_a_stale_lockfile_never_sends_its_token_to_whatever_holds_the_port_now(data):
+    with socket.socket() as stranger:
+        stranger.bind(("127.0.0.1", 0))
+        stranger.listen()
+        stranger.setblocking(False)
+        lock = {"port": stranger.getsockname()[1], "pid": dead_pid(), "token": "old-token"}
+        (data / "spool.lock").write_text(json.dumps(lock))
+        proc, line = launch(data)
+        try:
+            assert "Spool is running at" in line
+            with pytest.raises(BlockingIOError):
+                stranger.accept()  # nobody called
+        finally:
+            stop(proc)
+
+
 def test_a_stale_lockfile_is_ignored(data):
-    (data / "spool.lock").write_text(json.dumps({"port": 9, "pid": 999999}))
+    (data / "spool.lock").write_text(json.dumps({"port": 9, "pid": dead_pid()}))
     proc, line = launch(data)
     try:
         assert "already running" not in line
@@ -148,7 +203,8 @@ def test_a_chosen_port_is_used_and_a_taken_one_is_a_plain_error(data):
         stop(proc)
 
 
-def test_shutdown_stops_running_downloads_and_removes_the_lockfile(data):
+def downloading(data):
+    """A Spool with a download running, and its workers' pids."""
     proc, line = launch(data)
     url = url_in(line)
     client = Client(url.split("/#")[0], url.split("#t=")[1])
@@ -162,12 +218,28 @@ def test_shutdown_stops_running_downloads_and_removes_the_lockfile(data):
         int(p) for p in subprocess.run(["pgrep", "-P", str(proc.pid)], capture_output=True, text=True).stdout.split()
     ]
     assert workers
-    stop(proc)
+    return proc, workers
+
+
+def stopped_cleanly(proc, data, workers):
+    proc.wait(10)
     assert proc.returncode == 0
     assert not (data / "spool.lock").exists()
     for pid in workers:  # each worker's whole group, the helper it started included
         with pytest.raises((ProcessLookupError, PermissionError)):
             os.killpg(pid, 0)
+
+
+def test_shutdown_stops_running_downloads_and_removes_the_lockfile(data):
+    proc, workers = downloading(data)
+    stop(proc)
+    stopped_cleanly(proc, data, workers)
+
+
+def test_closing_the_terminal_window_shuts_down_the_same_way(data):
+    proc, workers = downloading(data)
+    proc.send_signal(signal.SIGHUP)
+    stopped_cleanly(proc, data, workers)
 
 
 def test_tests_never_run_from_inside_the_repo(tmp_path):
@@ -180,27 +252,22 @@ def test_a_damaged_state_file_does_not_stop_launch(data):
     (data / "state.json").write_text('{"settings": {"dest": ')
     proc, line = launch(data)
     assert line.startswith("Spool couldn't read its saved list, so it started a new one.") and "Traceback" not in line
-    assert "Spool is running at" in proc.stdout.readline()
+    assert "Spool is running at" in readline(proc)
 
 
-def test_two_launches_at_the_same_instant_both_come_up_cleanly(data):
+def test_two_launches_at_the_same_instant_never_crash(data):
+    """A known limit, not a promise: both may start (the shortcut in __main__.running); neither may crash."""
     (data / "state.json").unlink()
-    procs = [
-        subprocess.Popen(
-            [sys.executable, "-m", "spool", "--no-open", "--port", "0"],
-            env={**os.environ, "SPOOL_DATA_DIR": str(data), "HTTPS_PROXY": "http://127.0.0.1:9", "HTTP_PROXY": ""},
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        for _ in range(2)
-    ]
-    LAUNCHED.extend(procs)
+    procs = [start(data, "--port", "0") for _ in range(2)]
     for proc in procs:
-        assert "Spool is" in proc.stdout.readline()
+        assert "Spool is" in readline(proc)
     for proc in procs:
         proc.send_signal(signal.SIGTERM)
-        assert "Traceback" not in proc.communicate(timeout=10)[0]
+        proc.wait(10)
+        printed = []
+        while (line := readline(proc)) != "":
+            printed.append(line)
+        assert "Traceback" not in "".join(printed)
 
 
 def test_links_on_the_command_line_ride_in_the_fragment():
