@@ -11,7 +11,7 @@ import urllib.request
 
 
 class Client:
-    """Talks to a running Spool the way the page does: cookie, same Origin, JSON."""
+    """Talks to a running Spool the way the page does: token header, same Origin, JSON."""
 
     def __init__(self, base, token="fake-token"):
         self.base, self.token = base, token

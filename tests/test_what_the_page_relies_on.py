@@ -8,7 +8,6 @@ from serve_fake import FakeGitHub
 from support import job_state
 
 from spool import system
-from spool.jobs import Problem
 
 
 @pytest.fixture
@@ -119,12 +118,11 @@ def test_clear_takes_finished_rows_off_the_list_and_keeps_their_files(app, event
     done = finished(events, add(app, "https://fake.test/video?delay=0")["jobs"][0]["id"])[-1][1]
     later = finished(events, add(app, "https://fake.test/video/2?delay=0")["jobs"][0]["id"])[-1][1]
     failed = finished(events, add(app, "https://fake.test/unsupported")["jobs"][0]["id"])[-1][1]
-    app.jobs.clear([done["id"], failed["id"], "nope"])  # the server passes the page's list through
+    assert app.json("POST", "/api/jobs/clear", {"ids": [done["id"], failed["id"], "nope"]})[0] == 204
     assert events.until(lambda e, d: e == "job_removed")[-1][1] == {"id": done["id"]}
     assert [j["id"] for j in app.jobs.snapshot()["jobs"]] == [failed["id"], later["id"]]
     assert os.path.exists(done["path"])
-    with pytest.raises(Problem):
-        app.jobs.clear("done")
+    assert app.json("POST", "/api/jobs/clear", {"state": "done"})[0] == 422
 
 
 # The folder

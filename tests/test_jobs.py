@@ -45,14 +45,6 @@ def gone(proc, timeout=5):
     return False
 
 
-@pytest.fixture(autouse=True)
-def no_home_downloads(tmp_path, monkeypatch):
-    """A Jobs built here with no saved folder checks tmp_path, never the real Downloads (R17)."""
-    from spool import system
-
-    monkeypatch.setattr(system, "default_dest", lambda: tmp_path)
-
-
 @pytest.fixture
 def events(app):
     events = app.events()
@@ -681,7 +673,7 @@ def test_with_no_page_open_nothing_checks_the_folder(tmp_path, monkeypatch):
     jobs = Jobs(tmp_path, Engines(tmp_path / "engines"))
     checks = []
     check = system.check_dest
-    monkeypatch.setattr(system, "check_dest", lambda p: checks.append(p) or check(p))
+    monkeypatch.setattr(system, "check_dest", lambda p, **k: checks.append(p) or check(p, **k))
     try:
         jobs._snapshot_changed()
         time.sleep(1.3)

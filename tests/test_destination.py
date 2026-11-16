@@ -207,18 +207,18 @@ def test_a_file_as_destination_fails_as_not_a_folder(app, tmp_path):
 
 @pytest.fixture
 def hanging_drive(monkeypatch):
-    """The first write to the drive blocks forever, as a sleeping drive or a macOS permission prompt does."""
+    """Every look at the drive blocks, as a sleeping drive or a macOS permission prompt does."""
     import threading
 
     monkeypatch.setattr(system, "CHECK_TIMEOUT", 0.3)
-    release, started, real = threading.Event(), [], system.probe_dest
+    release, started, real = threading.Event(), [], system.probe
 
-    def stuck(path):
+    def stuck(path, write):
         started.append(path)
         release.wait()
-        return real(path)
+        return real(path, write)
 
-    monkeypatch.setattr(system, "probe_dest", stuck)
+    monkeypatch.setattr(system, "probe", stuck)
     yield started, release
     release.set()
 
@@ -235,7 +235,7 @@ def test_a_destination_that_never_answers_is_not_responding_and_nothing_freezes(
     status, body = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})
     assert (status, body["error"]["kind"]) == (409, "dest_not_responding")
     assert time.time() - t < 5
-    assert hanging_drive[0].count(str(folder)) == 1  # one stuck check, however often Spool asks
+    assert hanging_drive[0].count(str(folder)) == 2  # one stuck check of each kind, however often Spool asks
 
 
 def test_a_snapshot_goes_out_when_the_stuck_check_finally_answers(app, tmp_path, hanging_drive):
@@ -271,6 +271,7 @@ def test_a_share_that_drops_is_not_responding_not_a_crash(tmp_path, monkeypatch)
     assert (check["ok"], check["problem"], check["free_bytes"]) == (False, "not_responding", None)
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")  # the failure is the test
 def test_a_check_that_fails_in_a_way_nobody_foresaw_still_answers(tmp_path, monkeypatch):
     monkeypatch.setattr(system, "probe_dest", lambda path: 1 / 0)
     assert system.check_dest(tmp_path)["problem"] == "not_responding"

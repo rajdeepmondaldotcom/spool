@@ -123,7 +123,7 @@ def main():
     if args.dest_hangs:
         from spool import system
 
-        system.probe_dest = lambda path: threading.Event().wait()  # never answers
+        system.probe = lambda path, write: threading.Event().wait()  # never answers
     print(f"Data folder: {data}", flush=True)
     print(url, flush=True)
     try:

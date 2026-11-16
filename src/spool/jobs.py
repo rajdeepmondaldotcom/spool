@@ -91,7 +91,7 @@ class Jobs:
     def snapshot(self, dest=None, there=None):
         """Pass dest and there (from _there) when holding the lock: disk checks can hang, so never under it."""
         if dest is None or dest["path"] != self.settings["dest"]:  # the setting changed since dest was checked
-            dest = system.check_dest(self.settings["dest"])
+            dest = system.check_dest(self.settings["dest"], write=False)
         there = self._there() if there is None else there
         with self.lock:  # a job finished since there was taken keeps the file_exists it finished with
             jobs = [dict(j, file_exists=there.get(j["path"], j["file_exists"])) for j in self.jobs]
@@ -106,7 +106,7 @@ class Jobs:
 
     def subscribe(self):
         """A queue of (event, data), starting with a snapshot. (None, None) means Spool is closing."""
-        q, dest, there = queue.Queue(), system.check_dest(self.settings["dest"]), self._there()
+        q, dest, there = queue.Queue(), system.check_dest(self.settings["dest"], write=False), self._there()
         with self.lock:
             q.put(("snapshot", self.snapshot(dest, there)))
             self.subscribers.append(q)
@@ -288,7 +288,10 @@ class Jobs:
             self.settings.update(changes)
             self._save()
         self._snapshot_changed()
-        return {"settings": dict(self.settings), "dest": dest_message(system.check_dest(self.settings["dest"]))}
+        return {
+            "settings": dict(self.settings),
+            "dest": dest_message(system.check_dest(self.settings["dest"], write=False)),
+        }
 
     def close(self):
         with self.lock:
@@ -451,8 +454,7 @@ class Jobs:
                 else:
                     result = event
                     break  # a child the engine left behind may hold the pipe open; this was the last word
-            proc.wait()
-            system.kill_leftovers(proc)
+            system.kill_leftovers(proc)  # it waits for the worker itself, and reaps it last
         return result
 
     def _progress(self, job, event):
@@ -506,13 +508,13 @@ class Jobs:
     def _snapshot_changed(self):
         if not self.subscribers:  # no page open: nobody to tell, and a subscriber starts with a snapshot
             return
-        dest, there = system.check_dest(self.settings["dest"]), self._there()
+        dest, there = system.check_dest(self.settings["dest"], write=False), self._there()
         with self.lock:
             if not self.closed:
                 self._publish("snapshot", self.snapshot(dest, there))
 
     def _machine(self):
-        return dict(system.check_dest(self.settings["dest"]), free_bytes=None), self.tools()
+        return dict(system.check_dest(self.settings["dest"], write=False), free_bytes=None), self.tools()
 
     def _tick(self):
         """Flush throttled job progress."""
