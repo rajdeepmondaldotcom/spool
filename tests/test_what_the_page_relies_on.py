@@ -74,6 +74,19 @@ def test_the_join_says_how_far_it_is(app, events):
     assert all(d["what"] in ("join", "tags", "mp3", None) for d in mine if d["stage"] == "processing")
 
 
+def test_a_join_that_fails_with_the_tags_is_tried_once_more_the_plain_way(app, events):
+    job = add(app, "https://fake.test/video?delay=0&fail=join-args")["jobs"][0]
+    done = finished(events, job["id"])[-1][1]
+    assert done["state"] == "done", done["error"]
+    assert os.path.exists(done["path"])
+    log = app.request("GET", f"/api/jobs/{job['id']}/log")[1].decode().splitlines()
+    assert len([line for line in log if line.startswith("[download] Destination: ")]) == 2  # each part fetched once
+    assert len([line for line in log if line.startswith("[spool] ")]) == 1  # the quick way failed, the plain way ran
+    name = os.path.basename(done["path"])
+    assert f'[Metadata] Adding metadata to "{name}"' in log  # the second pass wrote the details
+    assert "[fake] details in the file: True" in log
+
+
 # Engines without choices
 
 
