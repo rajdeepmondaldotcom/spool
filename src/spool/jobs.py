@@ -259,6 +259,16 @@ class Jobs:
             raise problem(410, "gone")
         system.reveal(path)
 
+    def open(self, job_id):
+        with self.lock:
+            job = self._job(job_id)
+            state, path = job["state"], job["path"]
+        if state != "done":
+            raise Problem(409, "conflict", "Only a finished download can be opened.")
+        if not path or not os.path.exists(path):
+            raise problem(410, "gone")
+        system.open_file(path)
+
     def reveal_dest(self):
         dest = self.settings["dest"]
         dest_problem(self._check(dest), status=409)

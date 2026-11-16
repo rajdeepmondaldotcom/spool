@@ -7,6 +7,7 @@ import mimetypes
 import queue
 import re
 import socketserver
+import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -189,6 +190,18 @@ class Handler(BaseHTTPRequestHandler):
             self.server.jobs.reveal(job_id)
         self.send_bytes(204, b"", "application/json")
 
+    def open(self, job_id):
+        try:
+            self.server.jobs.open(job_id)
+        except NotImplementedError:
+            raise Problem(501, "not_supported", "Spool can't open files on this system.") from None
+        self.send_bytes(204, b"", "application/json")
+
+    def quit(self):
+        """Answer, then stop serving: whoever runs the server cleans up as after Ctrl+C."""
+        self.send_bytes(204, b"", "application/json")
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
+
     def settings(self):
         self.send_json(200, self.server.jobs.update_settings(self.body()))
 
@@ -256,6 +269,8 @@ ROUTES = [
     ("POST", r"/api/jobs/(\w+)/retry", "retry"),
     ("DELETE", r"/api/jobs/(\w+)", "remove"),
     ("POST", r"/api/jobs/(\w+)/reveal", "reveal"),
+    ("POST", r"/api/jobs/(\w+)/open", "open"),
+    ("POST", r"/api/quit", "quit"),
     ("GET", r"/api/jobs/(\w+)/log", "log"),
     ("PUT", r"/api/settings", "settings"),
     ("POST", r"/api/choose-folder", "choose_folder"),
