@@ -23,8 +23,9 @@ NATIVE = ("**/api/choose-folder", "**/api/dest/reveal", "**/api/jobs/*/reveal")
 
 
 def guard_native(page):
-    """Calls that would open a native folder dialog or the file manager never reach the server in a test.
-    Returns the list of (path, request) they made; a test sets page.chosen to answer choose-folder."""
+    """Calls that would open a native folder dialog or the file manager never reach the server in a test, from this
+    page or any other tab of its browser context. Returns the paths they called; a test sets page.chosen to answer
+    choose-folder."""
     made = []
 
     def fake(route):
@@ -35,7 +36,7 @@ def guard_native(page):
         route.fulfill(status=204)
 
     for pattern in NATIVE:
-        page.route(pattern, fake)
+        page.context.route(pattern, fake)
     return made
 
 

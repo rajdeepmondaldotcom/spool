@@ -51,6 +51,12 @@ CASES = [
     ("links", ["https://en.wikipedia.org/wiki/Foo_(bar)"], ["https://en.wikipedia.org/wiki/Foo_(bar)"]),
     ("links", ["cats playing piano e.g. 1.5"], []),
     ("links", [""], []),
+    ("links", ["made with Node.js, see README.md"], []),
+    ("links", ["Node.js https://fake.test/video"], ["https://fake.test/video"]),
+    ("links", ["https://example.com/a,b"], ["https://example.com/a,b"]),
+    ("links", ["[x](https://e.com/Foo_(bar))"], ["https://e.com/Foo_(bar)"]),
+    ("links", ["https://user:pw@youtube.com@evil.test/x"], []),
+    ("links", ["http://localhost:8000/v"], ["http://localhost:8000/v"]),
 ]
 
 

@@ -156,7 +156,7 @@ input[type="radio"], input[type="checkbox"] { width: 18px; height: 18px; margin:
 .link-row button { min-height: 48px; min-width: 9.5em; }
 .deck .help, .deck .notice { margin-top: var(--s2); font-size: 15px; color: var(--deck-ink-2); }
 .deck .notice { color: var(--deck-ink); font-weight: 500; }
-.deck .notice:empty { display: none; }
+.deck .notice:empty { margin: 0; } /* kept in the page: a live region must exist before its words arrive */
 .deck-message, .ask {
   display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3);
   margin-top: var(--s3); padding: var(--s2) var(--s3);
@@ -325,6 +325,7 @@ progress:not([value])::-webkit-progress-bar { background: repeating-linear-gradi
 .folder-row { display: flex; flex-wrap: wrap; gap: var(--s2); }
 .folder-row input { flex: 1 1 14em; }
 .switch { display: flex; align-items: center; gap: var(--s3); min-height: 40px; margin-bottom: var(--s5); cursor: pointer; }
+.notify-blocked { margin: calc(-1 * var(--s4)) 0 var(--s5); font-size: 15px; }
 .bookmark { padding-top: var(--s4); border-top: 1px solid var(--rule); }
 .bookmarklet {
   display: inline-flex; align-items: center; gap: var(--s2); min-height: 36px; padding: 0 var(--s4);
