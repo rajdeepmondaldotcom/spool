@@ -2,6 +2,7 @@ import http.client
 import json
 import socket
 import time
+from importlib import metadata
 from pathlib import Path
 
 import pytest
@@ -112,7 +113,7 @@ def test_events_start_with_a_snapshot(app):
     assert snap["engines"]["yt-dlp"]["version"] == "2026.01.01"
     assert set(snap["tools"]) == {"ffmpeg", "js_runtime", "js_setup", "platform", "can_choose_folder"}
     assert snap["dest"]["message"] is None
-    assert snap["version"] == "0.1.0"
+    assert snap["version"] == metadata.version("spool-dl")  # the installed package says which Spool this is
     assert snap["jobs"] == []
 
 

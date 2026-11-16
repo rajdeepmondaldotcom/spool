@@ -146,7 +146,9 @@ function App() {
     setAway((s) => new Set([...s].filter((id) => !w.ids.includes(id))));
     lastRow.current = { id: w.ids[0], index: 0, back: true };
   };
-  useEffect(() => { if (undo) undoButton.current?.focus(); }, [undo]);
+  // Focus moves in the same step that draws its target. Moved a frame later, it could land after the person
+  // (or a test) had already acted, and undo what they did.
+  useLayoutEffect(() => { if (undo) undoButton.current?.focus(); }, [undo]);
 
   // Keep keyboard focus when the focused row changes state, moves list or goes away.
   useLayoutEffect(() => {
@@ -305,14 +307,14 @@ function Deck({ snap, say, whenUpdated, field, openSettings, turning, added, not
   handlers.current = { take, close, download, lookUp, look };
 
   // The preview opens with focus on Download (Enter downloads), scrolled into view on small or zoomed screens.
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (look.status !== "preview") return;
     const t = tray.current, submit = t.querySelector("button[type=submit]");
     (submit.disabled ? t.querySelector("input:checked") || t.querySelector("button[type=button]") : submit)?.focus({ preventScroll: true });
     submit.scrollIntoView({ block: "nearest" });
   }, [look]);
 
-  useEffect(() => field.current.focus(), []);
+  useLayoutEffect(() => field.current.focus(), []);
   // Selected, so a paste replaces it rather than joining it.
   useEffect(() => api.onLink((text) => {
     setUrl(f.links(text).join(" ") || text);
