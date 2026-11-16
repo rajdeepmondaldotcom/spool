@@ -110,7 +110,7 @@ Options: `spool --port 8000` picks the port, and `spool --no-open` starts withou
 ## Privacy
 
 - Spool listens on your own machine only (`127.0.0.1`). It talks to the sites you download from, and to GitHub to fetch its engine and updates.
-- Other websites can't drive it, and neither can other people using your computer. Every request needs a token that your tab holds.
+- Other websites can't drive it, and neither can other people using your computer. Every request needs a token that your tab holds, and Spool makes a new one each time it starts.
 - It has no analytics, and it loads no third-party scripts or fonts.
 
 ## Limits
