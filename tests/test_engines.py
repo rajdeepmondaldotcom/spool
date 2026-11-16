@@ -293,3 +293,18 @@ def test_the_wheel_carries_every_licence(tmp_path):
     names = zipfile.ZipFile(wheel).namelist()
     for wanted in ("licenses/LICENSE", "licenses/NOTICE.md", "vendor/LICENSE-preact.txt", "vendor/LICENSE-htm.txt"):
         assert any(n.endswith(wanted) for n in names), wanted
+
+
+def test_reading_the_current_version_takes_its_turn_with_a_replace(tmp_path):
+    """Windows refuses to open a file that is being replaced, so a read waits for the write to finish."""
+    import threading
+
+    from spool import engines as module
+
+    install_fake_engines(tmp_path)
+    engines, read = Engines(tmp_path / "engines"), threading.Event()
+    with module._replacing:  # a replace is in flight
+        threading.Thread(target=lambda: (engines.version("yt-dlp"), read.set()), daemon=True).start()
+        assert not read.wait(0.2)
+    assert read.wait(2)
+    assert engines.version("yt-dlp") == INSTALLED

@@ -61,8 +61,7 @@ class Engines:
 
     def version(self, name):
         """The current version, while its file is there: a deleted file is installed again."""
-        current = self.root / name / "current"
-        tag = current.read_text().strip() if current.exists() else None
+        tag = read_current(self.root / name)
         return tag if tag and (self.root / name / tag).exists() else None
 
     def path(self, name):
@@ -204,8 +203,8 @@ class JsRuntime:
     def tools(self):
         """{js_runtime, js_setup, js_path}: js_path is Spool's own deno, None for a runtime on PATH."""
         on_path = next((n for n in JS_ON_PATH if (path := self.which(n)) and new_enough(n, path)), None)
-        current = self.root / "current"
-        own = self.root / current.read_text().strip() / exe() if not on_path and current.exists() else None
+        tag = None if on_path else read_current(self.root)
+        own = self.root / tag / exe() if tag else None
         own = own if own and own.exists() else None
         with self.lock:
             return {"js_runtime": on_path or (own and "deno"), "js_setup": self.setup, "js_path": own and str(own)}
@@ -263,6 +262,16 @@ def exe():
 
 
 _replacing = threading.Lock()
+
+
+def read_current(folder):
+    """The version a folder's `current` file names, or None. A read takes its turn with write_atomic: Windows
+    refuses to open a file while it is being replaced."""
+    with _replacing:
+        try:
+            return (folder / "current").read_text().strip() or None
+        except FileNotFoundError:
+            return None
 
 
 def write_atomic(path, data):
