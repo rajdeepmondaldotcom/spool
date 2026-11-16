@@ -200,8 +200,10 @@ def kill_leftovers(proc):
 
     Reaping last keeps the worker's pid, and so its group's number, from being reused by an unrelated process."""
     if sys.platform != "win32":  # shortcut: on Windows a stray grandchild outlives the worker; fix if one shows up
-        if proc.returncode is None:
+        if proc.returncode is None and hasattr(os, "waitid"):
             os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+        else:  # shortcut: macOS before Python 3.13 has no waitid, so there the worker is reaped first and its
+            proc.wait()  # group's number could, for an instant, belong to something else; upgrade when 3.13 is the floor
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):

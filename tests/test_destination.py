@@ -344,6 +344,30 @@ def test_no_file_manager_is_not_supported_not_a_crash(monkeypatch):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="process groups")
+def test_leftovers_are_killed_where_python_cannot_wait_without_reaping(tmp_path, monkeypatch):
+    monkeypatch.delattr(os, "waitid", raising=False)  # as on macOS before Python 3.13
+    marker = tmp_path / "child.pid"
+    script = (
+        "import subprocess, sys; "
+        "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        f"open({str(marker)!r}, 'w').write(str(c.pid))"
+    )
+    proc = system.spawn([sys.executable, "-c", script])
+    while not marker.exists():
+        time.sleep(0.02)
+    system.kill_leftovers(proc)
+    assert proc.returncode == 0
+    child, deadline = int(marker.read_text()), time.time() + 5
+    while True:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        assert time.time() < deadline, "the grandchild outlived the worker"
+        time.sleep(0.05)
+
+
+@pytest.mark.skipif(not hasattr(os, "waitid"), reason="needs os.waitid: not on Windows, nor macOS before Python 3.13")
 def test_leftovers_are_killed_before_the_worker_is_reaped(tmp_path):
     marker = tmp_path / "child.pid"
     script = (
