@@ -659,10 +659,10 @@ def test_adding_a_video_already_in_the_list_tints_its_row(app, spool):
     download(app, VIDEO, "Fake video 1")
     server_job(spool, "Fake video 1", "done")
     download(app, VIDEO, "Fake video 1")
-    expect(app.get_by_role("status").filter(has_text="already in the list")).to_be_visible()
     finished = group(app, "Finished").get_by_role("listitem")
+    expect(finished).to_have_class(re.compile(r"\bflash\b"))  # the tint lasts two seconds, so look at it first
+    expect(app.get_by_role("status").filter(has_text="already in the list")).to_be_visible()
     expect(finished).to_have_count(1)
-    expect(finished).to_have_class(re.compile(r"\bflash\b"))
 
 
 def test_several_links_say_how_many_were_already_in_the_list(app, spool):

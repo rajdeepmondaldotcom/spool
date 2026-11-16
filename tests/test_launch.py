@@ -44,13 +44,16 @@ def env(data):
     """An unreachable proxy, in both spellings (lowercase wins), keeps the latest-version check off the network."""
     proxy = {k: v for k in ("https_proxy", "HTTPS_PROXY") for v in ["http://127.0.0.1:9"]}
     blank = {k: "" for k in ("http_proxy", "HTTP_PROXY", "no_proxy", "NO_PROXY", "all_proxy", "ALL_PROXY")}
-    return {**os.environ, "SPOOL_DATA_DIR": str(data), **proxy, **blank}
+    # No program of this machine's is found (a runtime's version check must never decide a launch test), and a
+    # launch that goes silent can be made to show where it is: faulthandler dumps every thread on SIGABRT.
+    quiet = {"PATH": os.defpath, "PYTHONFAULTHANDLER": "1"}
+    return {**os.environ, "SPOOL_DATA_DIR": str(data), **proxy, **blank, **quiet}
 
 
-def start(data, *args, **popen):
+def start(data, *args, path=None, **popen):
     proc = subprocess.Popen(
         [sys.executable, "-m", "spool", "--no-open", *args],
-        env=env(data),
+        env={**env(data), **({"PATH": path} if path else {})},
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -69,7 +72,14 @@ def readline(proc, timeout=15):
     try:
         return proc.lines.get(timeout=timeout)
     except queue.Empty:
-        pytest.fail(f"Spool printed nothing for {timeout} s")
+        proc.send_signal(signal.SIGABRT)  # our own child: it dumps where every thread is, then dies
+        stuck = []
+        try:
+            while line := proc.lines.get(timeout=3):
+                stuck.append(line)
+        except queue.Empty:
+            pass
+        pytest.fail(f"Spool printed nothing for {timeout} s. It was here:\n{''.join(stuck)}")
 
 
 def launch(data, *args):
@@ -233,6 +243,16 @@ def test_a_spool_started_with_nohup_outlives_its_terminal(data):
     proc.send_signal(signal.SIGHUP)
     time.sleep(0.5)
     assert proc.poll() is None and (data / "spool.lock").exists()
+
+
+def test_a_program_on_path_that_never_answers_does_not_hold_up_the_launch(data, tmp_path):
+    slow = tmp_path / "bin"
+    slow.mkdir()
+    for name in ("deno", "node", "bun"):  # as a version manager's shim that hangs
+        (slow / name).write_text("#!/bin/sh\nsleep 30\n")
+        (slow / name).chmod(0o755)
+    proc = start(data, path=f"{slow}{os.pathsep}{os.defpath}")
+    assert "Spool is running at" in readline(proc, timeout=5)
 
 
 def test_tests_never_run_from_inside_the_repo(tmp_path):

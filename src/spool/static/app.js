@@ -321,7 +321,8 @@ function Deck({ snap, say, whenUpdated, field, openSettings, turning, added, not
 
   // Paste or drop a link anywhere on the page. Escape cancels a lookup or closes the preview;
   // Cmd+Enter (Ctrl+Enter elsewhere) downloads the quality selected in the preview.
-  useEffect(() => {
+  // A layout effect: the page listens from the moment it is drawn, so a paste in its first instant is not lost.
+  useLayoutEffect(() => {
     const blocked = () => document.querySelector("dialog[open]");
     const onPaste = (e) => {
       if (blocked() || (isEditable(e.target) && e.target !== field.current)) return;
