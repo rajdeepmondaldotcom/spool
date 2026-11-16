@@ -4,8 +4,8 @@
 
 | What | Where | Licence |
 |---|---|---|
-| Preact | `src/spool/static/vendor/preact-htm.module.js` | MIT |
-| htm | `src/spool/static/vendor/preact-htm.module.js` | Apache-2.0 |
+| Preact | `src/spool/static/vendor/preact-htm.module.js` | MIT (`LICENSE-preact.txt` beside it) |
+| htm | `src/spool/static/vendor/preact-htm.module.js` | Apache-2.0 (`LICENSE-htm.txt` beside it) |
 | Barlow and Barlow Condensed | `src/spool/static/fonts/` | SIL Open Font License 1.1 (`OFL.txt` beside the fonts) |
 
 The screenshots in the README show open movies by the Blender Foundation, licensed CC BY.

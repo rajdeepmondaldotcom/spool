@@ -11,6 +11,9 @@ JavaScript runtime (deno) are there, so every machine offers the same qualities.
 Other fake links: /live (fails as "live"), /needs-js (kind "no_js"), /shared-playlist (entries that share one link,
 downloaded as items), /broken (an engine bug), /ytdl-only (only the second engine reads it), /audio (a part with
 no video), /video (Best is its top class, 1080p; MP3 has a size). Adding a finished video again is an "existing" add.
+/no-combined (no stream has both picture and sound), /channel (a list of lists, fails as "playlist"),
+/needs-js-403 (a refusal that is not the runtime's fault), /pipes (a title the engine widens), ?fail=merge (the
+join step is cut short).
 A /Volumes/<no such drive>/... destination is "unplugged" on macOS; on Linux use /media/<nobody>/<drive>/...
 """
 

@@ -15,7 +15,7 @@ from .engines import JS_ON_PATH
 
 def data_dir():
     if os.environ.get("SPOOL_DATA_DIR"):
-        path = Path(os.environ["SPOOL_DATA_DIR"])
+        path = Path(os.environ["SPOOL_DATA_DIR"]).absolute()  # a worker moves into the destination folder
     elif sys.platform == "darwin":
         path = Path.home() / "Library" / "Application Support" / "spool"
     elif sys.platform == "win32":
