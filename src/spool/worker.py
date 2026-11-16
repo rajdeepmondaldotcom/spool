@@ -80,6 +80,12 @@ def short(f):
     return min(f["width"], f["height"]) if f.get("width") and f.get("height") else (f.get("height") or 0)
 
 
+def klass(f):
+    """The smallest standard class that holds a format's short side: 1920x800 is class 1080, as sites label it."""
+    side = short(f)
+    return next((h for h in reversed(HEIGHTS) if side and side <= h), None)
+
+
 def has(f, codec):
     return f.get(codec) != "none"  # no codec info means the stream carries it
 
@@ -135,7 +141,7 @@ def entry(info, ffmpeg):
     else:
         formats = info.get("formats") or [info]  # a site with one stream puts it on the info itself
         playable = formats if ffmpeg else [f for f in formats if has(f, "acodec")]  # no merging without ffmpeg
-        classes = {short(f) for f in playable if has(f, "vcodec")}
+        classes = {klass(f) for f in playable if has(f, "vcodec")}
         ids = ["best", *(str(h) for h in HEIGHTS if h in classes), "audio"]
         presets = [preset(p, estimate(formats, p, ffmpeg, info.get("duration"))) for p in ids]
     if ffmpeg:

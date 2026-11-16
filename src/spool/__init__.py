@@ -1,1 +1,1 @@
-"""Spool: a local web app for yt-dlp and youtube-dl."""
+"""Spool: save any video to your own disk."""

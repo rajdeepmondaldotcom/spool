@@ -263,3 +263,16 @@ def test_an_item_downloads_only_that_entry(tmp_path):
     events = run("download", "https://fake.test/shared-playlist?delay=0", dest=str(tmp_path), preset="best", item=2)
     assert last(events)["event"] == "done"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["Shared item 2 [shared-2].mp4"]
+
+
+def test_a_wide_screen_video_gets_the_class_above_its_short_side():
+    """1920x800 is what sites call 1080p: a format's class is the smallest standard one that holds its short side."""
+    from spool import worker
+
+    video = [
+        {"format_id": f"v{h}", "width": w, "height": h, "vcodec": "avc1", "acodec": "none", "filesize": 100}
+        for w, h in ((1920, 800), (1280, 534))
+    ]
+    sound = {"format_id": "a", "vcodec": "none", "acodec": "mp4a", "ext": "m4a", "filesize": 10}
+    entry = worker.entry({"id": "x", "title": "Wide", "formats": [*video, sound]}, ffmpeg=True)
+    assert [p["id"] for p in entry["presets"]] == ["best", "1080", "720", "audio", "mp3"]

@@ -1,7 +1,7 @@
 [project]
 name = "spool-dl"
 version = "0.1.0"
-description = "A local web app for yt-dlp and youtube-dl. Paste a link, pick a quality, get the file."
+description = "Save any video to your own disk. Paste a link, pick a quality, get the file."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
