@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from pathlib import Path
 
 import pytest
 from serve_fake import INSTALLED, LATEST, FakeGitHub, install_fake_engines
@@ -275,3 +276,20 @@ def test_a_fetch_larger_than_the_limit_is_refused(monkeypatch):
         engines.http_get("https://example.test/big")
     monkeypatch.setattr(engines.urllib.request, "urlopen", lambda url, timeout: Response(b"x" * 10))
     assert engines.http_get("https://example.test/small") == b"x" * 10
+
+
+# The package carries the licences of what it ships
+
+
+def test_the_wheel_carries_every_licence(tmp_path):
+    import spool
+
+    root = Path(spool.__file__).parents[2]
+    if not (root / "pyproject.toml").exists() or not shutil.which("uv"):
+        pytest.skip("needs the source tree and uv")
+    build = ["uv", "build", "--wheel", "--offline", "--out-dir", str(tmp_path), str(root)]
+    subprocess.run(build, check=True, capture_output=True, timeout=120)
+    [wheel] = tmp_path.glob("*.whl")
+    names = zipfile.ZipFile(wheel).namelist()
+    for wanted in ("licenses/LICENSE", "licenses/NOTICE.md", "vendor/LICENSE-preact.txt", "vendor/LICENSE-htm.txt"):
+        assert any(n.endswith(wanted) for n in names), wanted
