@@ -425,8 +425,9 @@ class Jobs:
                 threading.Thread(target=self._run, args=(job,), daemon=True).start()
 
     def _clash(self, job):
-        """A running job that writes, or would write, the same file: the same video to the same folder, or a file
-        name both reported. The later one waits in the queue."""
+        """A running job that may write the same file, so this one waits in the queue. A file's name carries the
+        video's id and is known only once the worker runs: two jobs in one folder run together only when both
+        have ids and they differ. A link added without its details (no id) runs alone in its folder."""
         return next(
             (
                 j
@@ -434,7 +435,7 @@ class Jobs:
                 if j is not job
                 and j["state"] == "running"
                 and j["dest"] == job["dest"]
-                and ((job["entry_id"] and j["entry_id"] == job["entry_id"]) or set(j["files"]) & set(job["files"]))
+                and not (job["entry_id"] and j["entry_id"] and j["entry_id"] != job["entry_id"])
             ),
             None,
         )
@@ -551,18 +552,10 @@ class Jobs:
                     self._progress(job, event)
                 elif event["event"] == "meta":
                     self._details(job, event)
-                elif event["event"] == "file":  # named before the engine writes to it
+                elif event["event"] == "file":
                     with self.lock:
                         job["files"].append(event["path"])
                         self._save()  # Remove needs these after a quit too
-                        clash = job["state"] == "running" and self._clash(job)
-                        if clash:  # a link with no id of its own, to a video another job is saving: wait for it
-                            job.update(RUN | {"started": job["started"], "progress": job["progress"]})
-                            self._changed(job)
-                    if clash:
-                        system.kill(proc)
-                        result = None
-                        break
                 else:
                     result = event
                     break  # a child the engine left behind may hold the pipe open; this was the last word
