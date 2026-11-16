@@ -121,15 +121,17 @@ def github():
     return FakeGitHub(delay=0.3)
 
 
-def test_update_is_accepted_and_progress_arrives_in_snapshots(app):
-    settle(app.engines)
+def test_update_is_accepted_and_progress_arrives_in_snapshots(app, github):
+    settle(app.engines)  # the update Spool starts by itself at launch has finished
+    github.delay = 0.3  # long enough for the second request to find the engine busy
     events = app.events()
     events.next()
     status, _ = app.json("POST", "/api/engines/yt-dlp/update")
     assert status == 202
     assert app.json("POST", "/api/engines/yt-dlp/update")[0] == 409
-    seen = events.until(lambda e, d: e == "snapshot" and d["engines"]["yt-dlp"]["version"] == LATEST)
-    assert any(e == "snapshot" and d["engines"]["yt-dlp"]["busy"] == "updating" for e, d in seen)
+    events.until(lambda e, d: e == "snapshot" and d["engines"]["yt-dlp"]["busy"] == "updating")
+    events.until(lambda e, d: e == "snapshot" and not d["engines"]["yt-dlp"]["busy"])
+    assert app.engines.status()["yt-dlp"]["version"] == LATEST
     events.close()
 
 

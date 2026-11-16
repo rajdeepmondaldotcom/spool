@@ -1,6 +1,7 @@
 """The main flows a person uses, through the real server and the fake engine."""
 
 import re
+import sys
 import threading
 import time
 
@@ -708,11 +709,17 @@ def test_a_file_chosen_as_the_folder_says_so(app, spool, tmp_path):
     expect(app.get_by_role("alert").filter(has_text="is a file, not a folder.")).to_be_visible()
 
 
+# A folder on a drive that is not there, in each system's own form.
+UNPLUGGED = {"darwin": "/Volumes/NoSuchDrive/Spool", "win32": "Q:\\Spool"}.get(
+    sys.platform, "/media/nobody-here/NoSuchDrive/Spool"
+)
+
+
 def test_an_unplugged_drive_says_to_plug_it_in(app, spool):
-    spool[1].update_settings({"dest": "/Volumes/NoSuchDrive/Spool"})
+    spool[1].update_settings({"dest": UNPLUGGED})
     expect(
         app.get_by_role("alert").filter(
-            has_text=re.compile("NoSuchDrive.* isn't connected. Plug it in, or choose another folder.")
+            has_text=re.compile(r"isn't connected\. Plug it in, or choose another folder\.")
         )
     ).to_be_visible()
 
