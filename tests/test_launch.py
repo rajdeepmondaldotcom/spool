@@ -47,13 +47,14 @@ def env(data):
     return {**os.environ, "SPOOL_DATA_DIR": str(data), **proxy, **blank}
 
 
-def start(data, *args):
+def start(data, *args, **popen):
     proc = subprocess.Popen(
         [sys.executable, "-m", "spool", "--no-open", *args],
         env=env(data),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        **popen,
     )
     LAUNCHED.append(proc)
     proc.lines = queue.Queue()
@@ -224,6 +225,14 @@ def test_closing_the_terminal_window_shuts_down_the_same_way(data):
     proc, workers = downloading(data)
     proc.send_signal(signal.SIGHUP)
     stopped_cleanly(proc, data, workers)
+
+
+def test_a_spool_started_with_nohup_outlives_its_terminal(data):
+    proc = start(data, preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))  # what nohup does
+    assert "Spool is running at" in readline(proc)
+    proc.send_signal(signal.SIGHUP)
+    time.sleep(0.5)
+    assert proc.poll() is None and (data / "spool.lock").exists()
 
 
 def test_tests_never_run_from_inside_the_repo(tmp_path):

@@ -52,7 +52,8 @@ def main(argv=None):
     write_private(lock, json.dumps({"port": port, "pid": os.getpid(), "token": token}))
     stops = [signal.SIGINT, signal.SIGTERM] + ([signal.SIGHUP] if hasattr(signal, "SIGHUP") else [])
     for stop in stops[1:]:  # SIGHUP: the terminal window was closed
-        signal.signal(stop, interrupt)
+        if signal.getsignal(stop) is not signal.SIG_IGN:  # nohup asked for it to be ignored, so it stays ignored
+            signal.signal(stop, interrupt)
     try:  # from here a stop (Ctrl+C, SIGTERM, SIGHUP) at any moment shuts down quietly
         engines.start()
         js.start()
