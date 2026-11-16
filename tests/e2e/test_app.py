@@ -1,5 +1,6 @@
 """The main flows a person uses, through the real server and the fake engine."""
 
+import json
 import re
 import sys
 import threading
@@ -1388,3 +1389,55 @@ def test_after_quit_the_tab_says_spool_stopped_and_how_to_start_it(app, spool):
     expect(app.get_by_text("Reconnecting…")).to_have_count(0)
     expect(app.get_by_label("Link to download")).to_have_count(0)
     expect(app.get_by_role("button")).to_have_count(0)
+
+
+STOPPED = "Spool has stopped. To start it again, run spool in your terminal. It opens a new tab."
+
+
+def stream(page, spool, stopped):
+    """Every request for the event stream gets a snapshot and, when stopped, the `stopped` event; then the stream
+    ends. Returns the list of requests made."""
+    made = []
+
+    def answer(route):
+        made.append(route.request.url)
+        body = f"event: snapshot\ndata: {json.dumps(spool[1].snapshot())}\n\n"
+        route.fulfill(content_type="text/event-stream", body=body + ("event: stopped\ndata: {}\n\n" if stopped else ""))
+
+    page.context.route("**/api/events", answer)
+    fresh_snapshot(page)
+    return made
+
+
+def test_the_stopped_event_stops_every_tab_reconnecting(app, spool):
+    other = app.context.new_page()
+    other.goto(spool[0])
+    other.get_by_label("Link to download").wait_for()
+    made = stream(app, spool, stopped=True)
+    expect(app.get_by_text(STOPPED)).to_be_visible()
+    expect(other.get_by_text(STOPPED)).to_be_visible()  # it does not read the stream itself
+    asked = len(made)
+    app.close()  # the other tab takes the lock, and must not open the stream again
+    other.wait_for_timeout(2500)
+    assert len(made) == asked
+    expect(other.get_by_text("Reconnecting…")).to_have_count(0)
+
+
+def test_a_stream_that_just_ends_keeps_reconnecting(app, spool):
+    made = stream(app, spool, stopped=False)
+    app.wait_for_timeout(2500)
+    assert len(made) >= 2
+    expect(app.get_by_text(STOPPED)).to_have_count(0)
+    expect(app.get_by_label("Link to download")).to_be_visible()
+
+
+def test_after_quit_the_stream_is_not_asked_for_again(app, spool):
+    made = []
+    app.on("request", lambda r: "/api/events" in r.url and made.append(r))
+    app.get_by_role("button", name="Settings", exact=True).click()
+    app.get_by_role("dialog", name="Settings").get_by_role("button", name="Quit Spool").click()
+    expect(app.get_by_text(STOPPED)).to_be_visible()
+    asked = len(made)
+    spool[1].close()  # the stream ends without a word, as from a server that stopped before saying so
+    app.wait_for_timeout(2500)
+    assert len(made) == asked

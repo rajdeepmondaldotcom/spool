@@ -89,6 +89,7 @@ function App() {
       setJobs((js) => (js.some((x) => x.id === j.id) ? js.map((x) => (x.id === j.id ? j : x)) : [j, ...js]));
     },
     removed: (id) => setJobs((js) => js.filter((x) => x.id !== id)),
+    stopped: () => setStopped(true),
   }), []);
   useEffect(() => {
     const visible = () => { if (!document.hidden) { setUnseen(false); api.refresh(); } };
@@ -227,7 +228,7 @@ function App() {
         <span>${undo.words}</span>
         <button class="link-button" ref=${undoButton} onClick=${putBack}>Undo</button>
       </div>`}
-    <${SettingsDialog} snap=${snap} handle=${settings} notify=${notify} running=${running.length} quitted=${() => setStopped(true)} />
+    <${SettingsDialog} snap=${snap} handle=${settings} notify=${notify} running=${running.length} />
     <div class="visually-hidden" role="status" aria-live="polite">${said}</div>`;
 }
 
@@ -733,7 +734,7 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
 }
 
 // handle.current.open(focusFolder) lets "Change folder" land on the folder field.
-function SettingsDialog({ snap, handle, notify, running, quitted }) {
+function SettingsDialog({ snap, handle, notify, running }) {
   const dialog = useRef(), folder = useRef();
   const [quitting, setQuitting] = useState(null); // null, "asking", or the sentence for why Spool did not quit
   const [draft, setDraft] = useState("");
@@ -762,7 +763,7 @@ function SettingsDialog({ snap, handle, notify, running, quitted }) {
   // A new tab with no way back to the site: a named window never matches from another site, and the handle
   // window.open returns would let that site navigate Spool's tab.
   const bookmark = `javascript:void(window.open(${JSON.stringify(`${location.origin}/#url=`)}+encodeURIComponent(location.href),"_blank","noopener"))`;
-  const quit = () => api.quit().then(() => { dialog.current.close(); quitted(); }).catch((e) => setQuitting(e.message));
+  const quit = () => api.quit().then(() => { dialog.current.close(); api.stopped(); }).catch((e) => setQuitting(e.message));
   // The question takes the Quit button's place, so focus moves to it and back.
   useLayoutEffect(() => {
     if (dialog.current.open) dialog.current.querySelector(quitting === "asking" ? ".quit-ask button" : ".quit")?.focus();
