@@ -33,12 +33,18 @@ export function presetName(id) {
 }
 
 const AUDIO = new Set(["audio", "mp3"]);
+const STEPS = { join: "Joining video and audio", tags: "Writing chapters and details", mp3: "Converting to MP3" };
 
 export function stageWords(job) {
-  if (job.stage === "processing") return job.preset === "mp3" ? "Converting to MP3" : job.part > 1 ? "Joining video and audio" : "Finishing";
+  if (job.stage === "processing") return STEPS[job.what] || (job.preset === "mp3" ? "Converting to MP3" : job.part > 1 ? "Joining video and audio" : "Finishing");
   if (job.stage === "downloading") return job.what === "audio" || AUDIO.has(job.preset) ? "Downloading audio" : "Downloading video";
   return "Starting";
 }
+
+// How far the processing step is, as a whole number; null unless the server names the step and its size (an older
+// server leaves the download's own numbers in place, which must not read as the step's).
+export const stepPercent = (job) => (job.stage === "processing" && STEPS[job.what] && job.total
+  ? Math.min(100, Math.floor((job.downloaded / job.total) * 100)) : null);
 
 // The server's one percentage for the whole job (0 to 1), as a whole number; null when it knows nothing yet.
 export const percent = (job) => (job.progress == null ? null : Math.min(100, Math.max(0, Math.floor(job.progress * 100))));

@@ -538,6 +538,36 @@ def test_running_rows_say_reconnecting_when_spool_drops(app, spool):
     expect(row.get_by_text("Reconnecting…")).to_be_visible()
 
 
+def processing(spool, title, **step):
+    """Moves the running job into its processing step with these values, as the server would report them. The fake
+    sends one progress line and then sleeps a minute, so nothing overwrites them during the test."""
+    jobs = spool[1]
+    end = time.time() + 15
+    while not any(j["title"] == title and j.get("stage") == "downloading" for j in jobs.snapshot()["jobs"]):
+        assert time.time() < end, f"{title} never started downloading"
+        time.sleep(0.1)
+    with jobs.lock:
+        job = next(j for j in jobs.jobs if j["title"] == title)
+        job.update({"stage": "processing", "speed": None, "eta": None, **step})
+        jobs._changed(job)
+
+
+def test_a_processing_step_shows_its_words_percentage_speed_and_time_left(app, spool):
+    add(spool, [("https://fake.test/slow?delay=60", "Fake slow video")])
+    processing(spool, "Fake slow video", what="join", downloaded=5_300_000, total=10_000_000, speed=9_100_000, eta=1860)
+    row = group(app, "Downloading").get_by_role("listitem")
+    expect(row.locator(".meta")).to_have_text("Joining video and audio53%9.1 MB/s31 min left")
+    pct = row.get_by_role("progressbar").get_attribute("value")
+    assert row.locator(".counter").inner_text().replace("\n", "") == f"{pct}%"  # still the whole job's progress
+
+
+def test_a_processing_step_from_an_older_server_looks_as_before(app, spool):
+    add(spool, [("https://fake.test/slow?delay=60", "Fake slow video")])
+    processing(spool, "Fake slow video", part=2, what="video")  # the download's own numbers stay behind
+    row = group(app, "Downloading").get_by_role("listitem")
+    expect(row.locator(".meta")).to_have_text("Joining video and audio")
+
+
 def test_a_tab_seen_again_asks_for_a_fresh_snapshot(app):
     with app.expect_request("**/api/events"):
         app.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
