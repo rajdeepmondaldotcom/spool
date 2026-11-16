@@ -1,0 +1,35 @@
+[project]
+name = "spool-dl"
+version = "0.1.0"
+description = "Save any video to your own disk. Paste a link, pick a quality, get the file."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE.md", "src/spool/static/vendor/LICENSE-*.txt", "src/spool/static/fonts/OFL.txt"]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+spool = "spool.__main__:main"
+spool-dl = "spool.__main__:main"
+
+[dependency-groups]
+dev = ["pytest", "pytest-playwright", "ruff"]
+
+[build-system]
+requires = ["uv_build>=0.9,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "spool"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["network: talks to the real engines and the internet (deselected by default)"]
+addopts = "-m 'not network' -W error::pytest.PytestUnhandledThreadExceptionWarning"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]  # the formatter wraps code; long selector strings stay whole
