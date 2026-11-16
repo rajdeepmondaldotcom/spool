@@ -17,7 +17,6 @@ A /Volumes/<no such drive>/... destination is "unplugged" on macOS; on Linux use
 import argparse
 import hashlib
 import io
-import os
 import shutil
 import sys
 import tempfile
@@ -78,12 +77,12 @@ def start(data_dir, port=0, fresh=False, github=None, ffmpeg=True, js_runtime="d
     """Start Spool on the fake engine in data_dir. Returns (httpd, url, jobs, engines).
 
     The tools are what the caller says, never what this machine's PATH has, so tests run the same everywhere."""
-    os.environ["SPOOL_DATA_DIR"] = str(data_dir)
-    from spool import server, system
+    from spool import server
     from spool.engines import Engines
     from spool.jobs import Jobs
 
-    data = system.data_dir()
+    data = Path(data_dir)  # never through SPOOL_DATA_DIR: that would outlive this server in the test process
+    data.mkdir(parents=True, exist_ok=True)
     if not fresh and not (data / "engines").exists():
         install_fake_engines(data)
     github = github or FakeGitHub(delay=2.0 if fresh else 0.0, latest=LATEST if fresh else INSTALLED)

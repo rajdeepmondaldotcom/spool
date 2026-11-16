@@ -28,8 +28,7 @@ def main(argv=None):
 
     data = system.data_dir()
     lock = data / "spool.lock"
-    token = load_token(data / "token")
-    url = running(lock, token)
+    url = running(lock)
     if url:
         print(f"Spool is already running at {url}", flush=True)
         if not args.no_open:
@@ -38,6 +37,8 @@ def main(argv=None):
 
     engines, js = Engines(data / "engines"), JsRuntime(data / "tools")
     jobs = Jobs(data, engines, tools=lambda: system.tools(js), setup=js.start)
+    # A new token every launch: an old tab's, or one a stranger on this port collected, opens nothing.
+    token = secrets.token_urlsafe(24)
     try:
         httpd = server.make_server(jobs, engines, token, PORT if args.port is None else args.port)
     except OSError as exc:
@@ -48,19 +49,26 @@ def main(argv=None):
         httpd = server.make_server(jobs, engines, token, 0)  # something else holds the default port
     port = httpd.server_address[1]
     url = f"http://127.0.0.1:{port}/#t={token}"  # a fragment never leaves the browser
-    write_private(lock, json.dumps({"port": port, "pid": os.getpid()}))
-    signal.signal(signal.SIGTERM, interrupt)
-    try:  # from here a stop (Ctrl+C or SIGTERM) at any moment shuts down quietly
+    write_private(lock, json.dumps({"port": port, "pid": os.getpid(), "token": token}))
+    stops = [signal.SIGINT, signal.SIGTERM] + ([signal.SIGHUP] if hasattr(signal, "SIGHUP") else [])
+    for stop in stops[1:]:  # SIGHUP: the terminal window was closed
+        signal.signal(stop, interrupt)
+    try:  # from here a stop (Ctrl+C, SIGTERM, SIGHUP) at any moment shuts down quietly
         engines.start()
         js.start()
         print(f"Spool is running at {url}", flush=True)
         print("Press Ctrl+C to stop it.", flush=True)
         if not args.no_open:
+            # shortcut: on Linux the browser's command line, which `ps` shows other users, carries this launch's
+            # token while that browser runs; a 0600 redirect file would hide it, but a confined (snap) browser
+            # can't read Spool's data folder. Upgrade if Spool is used on shared Linux machines.
             webbrowser.open(url + carrying(args.links))
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        for stop in stops:  # a second Ctrl+C must not cut the clean-up short and leave workers running
+            signal.signal(stop, signal.SIG_IGN)
         httpd.server_close()
         jobs.close()  # kills every worker's process group; their jobs read as interrupted next time
         lock.unlink(missing_ok=True)
@@ -71,30 +79,22 @@ def carrying(links):
     return "&url=" + quote(" ".join(links), safe="") if links else ""
 
 
-def load_token(path):
-    """One token per data folder, kept across launches so an open tab or bookmark keeps working."""
-    try:
-        token = path.read_text().strip()
-    except FileNotFoundError:
-        token = ""
-    if len(token) < 20:
-        token = secrets.token_urlsafe(24)
-        write_private(path, token)
-    return token
-
-
-def running(lock, token):
-    """The link of the Spool that owns this lockfile, if it still answers to our token."""
+def running(lock):
+    """The link of the Spool that wrote this lockfile, if its process is alive and it answers to its token."""
     # shortcut: two launches in the same instant can both start; a real lock (flock) if that ever bites
     try:
-        port = int(json.loads(lock.read_text())["port"])
-        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        saved = json.loads(lock.read_text())
+        port, pid, token = int(saved["port"]), int(saved["pid"]), str(saved["token"])
+        os.kill(pid, 0)  # a dead Spool's port may belong to anything now: never send it a token
+        # the event stream answers after a destination check, which can take CHECK_TIMEOUT on a sleeping drive
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=system.CHECK_TIMEOUT + 2)
         conn.request("GET", "/api/events", headers={"Host": f"127.0.0.1:{port}", "X-Spool-Token": token})
-        answered = conn.getresponse().status == 200
+        reply = conn.getresponse()
+        answered = reply.status == 200 and reply.getheader("Server", "").startswith("spool")
         conn.close()
         if answered:
             return f"http://127.0.0.1:{port}/#t={token}"
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError):  # PermissionError: that pid is another user's now
         pass
     return None
 

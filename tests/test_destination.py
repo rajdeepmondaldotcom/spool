@@ -271,6 +271,11 @@ def test_a_share_that_drops_is_not_responding_not_a_crash(tmp_path, monkeypatch)
     assert (check["ok"], check["problem"], check["free_bytes"]) == (False, "not_responding", None)
 
 
+def test_a_check_that_fails_in_a_way_nobody_foresaw_still_answers(tmp_path, monkeypatch):
+    monkeypatch.setattr(system, "probe_dest", lambda path: 1 / 0)
+    assert system.check_dest(tmp_path)["problem"] == "not_responding"
+
+
 def test_the_quick_check_writes_nothing_and_still_sees_a_folder_it_cannot_write(tmp_path, monkeypatch):
     monkeypatch.setattr(system.tempfile, "TemporaryFile", lambda **k: pytest.fail("the quick check wrote a file"))
     assert system.check_dest(tmp_path, write=False)["ok"] is True

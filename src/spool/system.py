@@ -51,7 +51,7 @@ def check_dest(path, write=True):
             thread.start()
     thread, started, result = flight
     thread.join(max(0.0, started + CHECK_TIMEOUT - time.monotonic()))
-    if thread.is_alive():
+    if thread.is_alive() or not result:  # still stuck, or the check itself failed
         p = Path(path)
         return {"path": str(p), "display": display(p), "ok": False, "problem": "not_responding", "free_bytes": None}
     return result
