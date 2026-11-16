@@ -17,8 +17,9 @@ def events(app):
     events.close()
 
 
-def add(app, url, preset="best"):
-    status, body = app.json("POST", "/api/jobs", {"entries": [{"url": url}], "preset": preset})
+def add(app, url, preset="best", id=None):
+    entry = {"url": url, **({"id": id} if id else {})}  # an id lets two jobs share a folder at once
+    status, body = app.json("POST", "/api/jobs", {"entries": [entry], "preset": preset})
     assert status == 201, body
     return body["jobs"][0]["id"]
 
@@ -154,9 +155,9 @@ def test_what_another_try_cannot_fix_is_not_tried_again(app, events, monkeypatch
 
 def test_a_waiting_job_holds_its_slot_and_cancel_works_at_once(app, events):
     app.jobs.waits = (30,) * 5
-    first, second = (add(app, f"https://fake.test/403-start/{n}?delay=0") for n in (1, 2))
+    first, second = (add(app, f"https://fake.test/403-start/{n}?delay=0", id=f"refused-{n}") for n in (1, 2))
     wait_for(events, first, waiting)
-    third = add(app, "https://fake.test/video?delay=0")
+    third = add(app, "https://fake.test/video?delay=0", id="vid-1")
     assert app.jobs.snapshot()["jobs"][0]["state"] == "queued"  # both slots are held by jobs that wait
     status, job = app.json("POST", f"/api/jobs/{first}/cancel")
     assert (status, job["state"], job["stage"], job["note"]) == (200, "cancelled", None, None)
