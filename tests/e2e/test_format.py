@@ -17,7 +17,26 @@ CASES = [
     ("stageWords", [{"stage": "downloading", "part": 1, "preset": "best"}], "Downloading video"),
     ("stageWords", [{"stage": "downloading", "part": 2, "preset": "best"}], "Downloading sound"),
     ("stageWords", [{"stage": "processing", "preset": "mp3"}], "Converting to MP3"),
-    ("destMissing", ["T7 › Spool", "/Volumes/T7/Spool"], "T7 isn't connected. Plug it in, or choose another folder."),
+    (
+        "destProblem",
+        [{"problem": "unplugged", "path": "/Volumes/T7/Spool", "display": "T7 › Spool"}],
+        "T7 isn't connected. Plug it in, or choose another folder.",
+    ),
+    (
+        "destProblem",
+        [{"problem": "missing", "path": "/x/Old", "display": "x › Old"}],
+        "Old doesn't exist. Choose another folder.",
+    ),
+    (
+        "destProblem",
+        [{"problem": "not_a_folder", "path": "/x/a.txt", "display": "a.txt"}],
+        "a.txt is a file, not a folder.",
+    ),
+    (
+        "destProblem",
+        [{"problem": "not_responding", "path": "/Volumes/NAS/Films", "display": "NAS › Films"}],
+        "NAS isn't answering. If macOS is asking whether Spool may use it, choose Allow.",
+    ),
     ("links", ["https://a.test/1\n  http://b.test x ftp://c.test"], ["https://a.test/1", "http://b.test"]),
 ]
 

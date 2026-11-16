@@ -3,6 +3,7 @@
 import re
 
 import pytest
+import serve_fake  # on the path through conftest
 from playwright.sync_api import expect
 
 VIDEO = "https://fake.test/video"
@@ -49,17 +50,29 @@ def test_pick_two_of_a_playlist_and_download_them(app):
     expect(finished.get_by_text("Fake video 2")).to_have_count(0)
 
 
-def test_a_refused_download_says_what_happened_and_offers_the_fix(app):
+def test_a_refused_download_offers_the_engine_update_when_one_exists(app):
     look_up(app, "https://fake.test/403")
     app.get_by_role("region", name="Fake refused video").get_by_role("button", name="Download").click()
 
     stopped = app.get_by_role("region", name="Stopped")
-    expect(stopped.get_by_text("The site refused this download. Updating the engine usually fixes it.")).to_be_visible(
+    expect(stopped.get_by_text("The site refused this download. It often works on a second try.")).to_be_visible(
         timeout=15000
     )
-    expect(stopped.get_by_role("button", name="Update engine and retry")).to_be_visible()
-    expect(stopped.get_by_role("button", name="Retry", exact=True)).to_be_visible()
+    expect(stopped.get_by_role("button", name="Update engine and retry")).to_have_class("fill")
+    expect(stopped.get_by_role("button", name="Retry", exact=True)).to_have_class("secondary")
     expect(stopped.get_by_role("button", name="Show log")).to_be_visible()
+
+
+def test_a_refused_download_with_the_latest_engine_offers_retry(app, spool):
+    engines = spool[1].engines
+    engines.update("yt-dlp")
+    expect(app.get_by_role("contentinfo").get_by_text("Up to date")).to_be_visible(timeout=15000)
+    look_up(app, "https://fake.test/403")
+    app.get_by_role("region", name="Fake refused video").get_by_role("button", name="Download").click()
+
+    stopped = app.get_by_role("region", name="Stopped")
+    expect(stopped.get_by_role("button", name="Retry", exact=True)).to_have_class("fill", timeout=15000)
+    expect(stopped.get_by_role("button", name="Update engine and retry")).to_have_count(0)
 
 
 def test_a_link_the_engine_cannot_read_offers_the_other_engine(app):
@@ -125,11 +138,9 @@ def test_pasting_several_links_queues_them_all(app):
     expect(app.get_by_role("region", name="Finished").get_by_role("listitem")).to_have_count(3, timeout=15000)
 
 
-def test_a_missing_drive_blocks_download_and_says_how_to_fix_it(app, spool):
-    spool[1].update_settings({"dest": "/Volumes/NoSuchDrive/Spool"})
-    problem = app.get_by_role("alert").filter(
-        has_text="NoSuchDrive isn't connected. Plug it in, or choose another folder."
-    )
+def test_a_missing_folder_blocks_download_and_says_how_to_fix_it(app, spool, tmp_path):
+    spool[1].update_settings({"dest": str(tmp_path / "gone")})
+    problem = app.get_by_role("alert").filter(has_text="gone doesn't exist. Choose another folder.")
     expect(problem).to_be_visible()
     expect(problem.get_by_role("button", name="Try again")).to_be_visible()
     expect(problem.get_by_role("button", name="Change folder")).to_be_visible()
@@ -137,7 +148,13 @@ def test_a_missing_drive_blocks_download_and_says_how_to_fix_it(app, spool):
     look_up(app, VIDEO)
     download = app.get_by_role("region", name="Fake video 1").get_by_role("button", name="Download")
     expect(download).to_be_disabled()
-    expect(download).to_have_accessible_description(re.compile("NoSuchDrive isn't connected"))
+    expect(download).to_have_accessible_description(re.compile("gone doesn't exist"))
+
+
+def test_a_file_chosen_as_the_folder_says_so(app, spool, tmp_path):
+    (tmp_path / "notes.txt").write_text("not a folder")
+    spool[1].update_settings({"dest": str(tmp_path / "notes.txt")})
+    expect(app.get_by_role("alert").filter(has_text="is a file, not a folder.")).to_be_visible()
 
 
 def test_cancel_a_running_download_then_resume_it(app):
@@ -203,10 +220,10 @@ def test_settings_save_a_typed_folder_and_default_quality(app, tmp_path):
     folder = dialog.get_by_label("Folder")
     folder.fill(str(tmp_path / "missing"))
     dialog.get_by_role("button", name="Save folder").click()
-    expect(dialog.get_by_text("isn't connected. Plug it in, or choose another folder.")).to_be_visible()
+    expect(dialog.get_by_text("missing doesn't exist. Choose another folder.")).to_be_visible()
     app.keyboard.press("Escape")
     expect(dialog).to_be_hidden()
-    expect(app.get_by_role("alert").filter(has_text="missing isn't connected")).to_be_visible()
+    expect(app.get_by_role("alert").filter(has_text="missing doesn't exist")).to_be_visible()
     expect(
         app.get_by_text("Cmd+Enter downloads at 720p").or_(app.get_by_text("Ctrl+Enter downloads at 720p"))
     ).to_be_visible()
@@ -231,7 +248,7 @@ def test_a_failed_row_fills_only_its_suggested_fix(app):
     app.get_by_role("region", name="Fake refused video").get_by_role("button", name="Download").click()
     stopped = app.get_by_role("region", name="Stopped")
     fix = stopped.get_by_role("button", name="Update engine and retry")
-    expect(fix).to_have_class("fill", timeout=15000)
+    expect(fix).to_have_class("fill", timeout=15000)  # a newer engine exists in the fake
     expect(stopped.get_by_role("button", name="Retry", exact=True)).to_have_class("secondary")
     expect(stopped.get_by_role("button", name="Show log")).to_have_class("quiet")
     expect(stopped.get_by_role("button", name="Remove")).to_have_class("quiet")
@@ -253,3 +270,75 @@ def test_a_download_bigger_than_the_free_space_is_flagged(app):
     expect(app.get_by_text("This needs about")).to_be_visible()
     # A warning, not a block: the estimate can be wrong and the choice is the user's.
     expect(app.get_by_role("button", name="Download", exact=True)).to_be_enabled()
+
+
+def test_ticking_one_entry_of_a_shared_link_item_leaves_the_others(app):
+    # A multi-file item: every entry shares one link and differs only by its position.
+    def shared(route):
+        data = route.fetch().json()
+        for n, entry in enumerate(data["entries"], 1):
+            entry.update(url="https://fake.test/playlist", item=n)
+        route.fulfill(json=data)
+
+    app.route("**/api/probe", shared)
+    look_up(app, "https://fake.test/playlist")
+    tray = app.get_by_role("region", name="Fake playlist")
+    tray.get_by_role("checkbox", name=re.compile("Fake video 2")).uncheck()
+    expect(tray.get_by_text("2 of 3 selected")).to_be_visible()
+    expect(tray.get_by_role("checkbox", name=re.compile("Fake video 1"))).to_be_checked()
+
+    with app.expect_request("**/api/jobs") as sent:
+        tray.get_by_role("button", name="Download 2").click()
+    assert [e["item"] for e in sent.value.post_data_json["entries"]] == [1, 3]
+
+
+def test_a_probe_engine_error_shows_the_engines_own_words(app):
+    app.route(
+        "**/api/probe",
+        lambda route: route.fulfill(
+            status=422, json={"error": {"kind": "engine", "message": "ERROR: [fake] boom", "hint": None}}
+        ),
+    )
+    look_up(app, VIDEO)
+    error = app.get_by_role("alert").filter(has_text="ERROR: [fake] boom")
+    expect(error).to_be_visible()
+    expect(error).not_to_contain_text("log")
+
+
+def test_a_file_saved_to_another_folder_names_that_folder(app, spool, tmp_path):
+    look_up(app, VIDEO)
+    app.get_by_role("region", name="Fake video 1").get_by_role("button", name="Download").click()
+    finished = app.get_by_role("region", name="Finished")
+    expect(finished.get_by_role("listitem")).to_have_count(1, timeout=15000)
+    expect(finished.locator(".folder")).to_have_count(0)
+
+    (tmp_path / "Elsewhere").mkdir()
+    spool[1].update_settings({"dest": str(tmp_path / "Elsewhere")})
+    expect(finished.get_by_role("listitem").get_by_text("downloads")).to_be_visible()
+
+
+def test_a_tab_with_an_unknown_token_says_how_to_sign_in(page, spool):
+    page.goto(spool[0].replace("#t=fake-token", "#t=wrong"))
+    expect(page.get_by_text("This tab isn't signed in to Spool.")).to_be_visible()
+    expect(page).to_have_url(re.compile(r"/$"))  # the token left the address bar
+
+
+def test_a_tab_reconnects_after_spool_restarts(page, tmp_path):
+    httpd, url, jobs, _ = serve_fake.start(tmp_path)
+    port = httpd.server_address[1]
+    page.goto(url)
+    page.get_by_label("Link to download").wait_for()
+    httpd.shutdown()
+    httpd.server_close()
+    jobs.close()
+    expect(page.get_by_text("Reconnecting…")).to_be_visible()
+
+    httpd, url, jobs, _ = serve_fake.start(tmp_path, port=port)
+    try:
+        expect(page.get_by_text("Reconnecting…")).to_be_hidden(timeout=10000)
+        look_up(page, VIDEO)  # the token kept from the first load still works
+        expect(page.get_by_role("region", name="Fake video 1")).to_be_visible()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        jobs.close()

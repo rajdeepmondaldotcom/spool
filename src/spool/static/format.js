@@ -47,39 +47,45 @@ export function percent(job) {
 export const otherEngine = (name) => (name === "yt-dlp" ? "youtube-dl" : "yt-dlp");
 
 // Failure wording by error kind (design brief, "Words"). Returns the message and the fix button, if any.
-export function failure(error, { engine, dest }) {
+// `newer`: a newer engine exists, so updating is worth offering. `probe`: a probe has no log to point at.
+export function failure(error, { engine, dest, newer = false, probe = false }) {
   const other = otherEngine(engine);
+  if (error.hint === "install_js_runtime") return ["YouTube needs a JavaScript runtime with yt-dlp. Install deno, node or bun.", "install_js_runtime"];
   switch (error.kind) {
-    case "blocked": return ["The site refused this download. Updating the engine usually fixes it.", "update_engine"];
+    case "blocked": return ["The site refused this download. It often works on a second try.", newer ? "update_engine" : "retry"];
+    case "live": return ["This is live now. Download it after it ends.", null];
     case "unavailable": return ["This video is private, removed, or needs a sign-in. Spool can't download it.", null];
     case "unsupported": return [`${engine} can't read this link.`, "try_other_engine", other];
     case "empty": return [`${engine} found nothing at this link.`, "try_other_engine", other];
     case "network": return ["Couldn't reach the site. Check your connection.", "retry"];
-    case "dest_missing": return [destMissing(folderName(dest), dest), "check_dest"];
-    case "dest_full": return [`${/^\/Volumes\/([^/]+)/.exec(dest || "")?.[1] || folderName(dest)} is full. Free some space, or choose another folder.`, "check_dest"];
+    case "dest_unplugged": return [`${drive(dest)} isn't connected. Plug it in, or choose another folder.`, "check_dest"];
+    case "dest_missing": return [`${folderName(dest)} doesn't exist. Choose another folder.`, "check_dest"];
+    case "dest_not_folder": return [`${dest} is a file, not a folder.`, "check_dest"];
+    case "dest_full": return [`${drive(dest)} is full. Free some space, or choose another folder.`, "check_dest"];
     case "dest_denied": return [`Spool isn't allowed to write to ${folderName(dest)}.`, "check_dest"];
     case "no_ffmpeg": return ["This quality needs ffmpeg to join video and sound.", "install_ffmpeg"];
     case "interrupted": return ["Spool was closed before this finished.", "resume"];
     case "invalid_link": return ["That isn't a link Spool can use. Paste a link that starts with http or https.", null];
     case "engine_not_ready": return [`${engine} isn't ready yet. Wait for it to finish installing.`, null];
-    case "engine": return ["The engine stopped with an error. The log has the details.", "show_log"];
+    case "engine": return probe ? [error.message || "The engine stopped with an error.", "retry"] : ["The engine stopped with an error. The log has the details.", "show_log"];
     default: return [error.message || "Something went wrong.", "retry"];
   }
 }
 
-const folderName = (path = "") => path.split(/[\\/]/).filter(Boolean).pop() || path;
-
-// "T7 isn't connected" for a drive under /Volumes, otherwise the folder's display name.
-export function destMissing(display, path = "") {
-  const drive = /^\/Volumes\/([^/]+)/.exec(path)?.[1];
-  return `${drive || display} isn't connected. Plug it in, or choose another folder.`;
-}
+export const folderName = (path = "") => path.split(/[\\/]/).filter(Boolean).pop() || path;
+// The drive's name for a folder under /Volumes, otherwise the folder's own name.
+const drive = (path = "") => /^\/Volumes\/([^/]+)/.exec(path)?.[1] || folderName(path);
 
 export function destProblem(dest) {
-  if (dest.problem === "missing") return destMissing(dest.display, dest.path);
-  if (dest.problem === "not_a_folder") return `${dest.display} isn't a folder. Choose another folder.`;
-  if (dest.problem === "not_writable") return `Spool isn't allowed to write to ${dest.display}. Choose another folder.`;
-  return "";
+  const name = dest.display || folderName(dest.path);
+  switch (dest.problem) {
+    case "unplugged": return `${drive(dest.path)} isn't connected. Plug it in, or choose another folder.`;
+    case "missing": return `${folderName(dest.path)} doesn't exist. Choose another folder.`;
+    case "not_a_folder": return `${name} is a file, not a folder.`;
+    case "not_writable": return `Spool isn't allowed to write to ${name}. Choose another folder.`;
+    case "not_responding": return `${drive(dest.path)} isn't answering. If macOS is asking whether Spool may use it, choose Allow.`;
+    default: return dest.problem ? `${name} can't be used right now. Choose another folder.` : "";
+  }
 }
 
 export const INSTALL = {

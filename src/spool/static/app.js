@@ -19,6 +19,7 @@ const Reel = ({ turning }) => html`
   <svg class="reel ${turning ? "turning" : ""}" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path d=${REEL} /></svg>`;
 
 const isEditable = (el) => el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
+const newerEngine = (snap, name) => { const e = snap.engines[name]; return !!(e?.latest && e.latest !== e.version); };
 const revealWord = (platform) => (platform === "darwin" ? "Show in Finder" : "Show in folder");
 
 function App() {
@@ -26,6 +27,7 @@ function App() {
   const [jobs, setJobs] = useState([]);
   const [connected, setConnected] = useState(true);
   const [said, setSaid] = useState("");
+  const [signedOut, setSignedOut] = useState(false);
   const seen = useRef({});
   const pending = useRef(null);
   const lastRow = useRef(null);
@@ -34,6 +36,7 @@ function App() {
 
   const say = (text) => { setSaid(""); setTimeout(() => setSaid(text), 50); };
 
+  useEffect(() => api.onUnauthorized(() => setSignedOut(true)), []);
   useEffect(() => api.listen({
     connected: setConnected,
     snapshot: (s) => {
@@ -84,6 +87,12 @@ function App() {
       : running.length ? `${f.percent(running[0]) ?? 0}% Spool` : "Spool";
   });
 
+  // A tab whose token Spool does not know (another machine's link, or a token that changed) can do nothing.
+  if (signedOut) return html`
+    <main class="signed-out measure">
+      <h1>Spool</h1>
+      <p>This tab isn't signed in to Spool. Run <code>spool</code> in your terminal and it opens the right link.</p>
+    </main>`;
   if (!snap) return html`<p class="connecting">Connecting to Spool…</p>`;
 
   const ctx = { snap, say, whenUpdated, field, openSettings: (focusFolder) => settings.current.open(focusFolder) };
@@ -124,7 +133,7 @@ function Deck({ snap, say, whenUpdated, field, openSettings, turning }) {
       const data = await api.probe(link.trim(), useEngine);
       const ids = data.entries[0].presets.map((p) => p.id);
       setPreset(ids.includes(snap.settings.preset) ? snap.settings.preset : "best");
-      setPicked(new Set(data.entries.map((e) => e.url)));
+      setPicked(new Set(data.entries.map((e, i) => i)));
       setLook({ status: "preview", data });
       say(`Details ready: ${data.title}`);
     } catch (error) {
@@ -150,13 +159,13 @@ function Deck({ snap, say, whenUpdated, field, openSettings, turning }) {
 
   const download = () => {
     const { data } = look;
-    const entries = data.kind === "playlist" ? data.entries.filter((e) => picked.has(e.url)) : data.entries;
+    const entries = data.kind === "playlist" ? data.entries.filter((e, i) => picked.has(i)) : data.entries;
     queue(entries, preset, data.engine);
   };
 
   // Cmd+Enter (Ctrl+Enter elsewhere): skip the preview and download at the default quality.
   const quick = () => {
-    if (look.status === "preview") return queue(look.data.entries.filter((e) => picked.has(e.url) || look.data.kind === "video"), snap.settings.preset, look.data.engine);
+    if (look.status === "preview") return queue(look.data.entries.filter((e, i) => picked.has(i) || look.data.kind === "video"), snap.settings.preset, look.data.engine);
     const ls = f.links(url);
     if (!ls.length) return setLook({ status: "error", error: { kind: url.trim() ? "invalid_link" : "empty_field" } });
     if (ls.length > 1) return queue(ls.map((u) => ({ url: u })), snap.settings.preset);
@@ -267,7 +276,7 @@ function EngineInstall({ engine, name }) {
 
 function ProbeError({ error, look, snap, whenUpdated, lookUp }) {
   if (error.kind === "empty_field") return html`<p id="link-error" class="deck-message" role="alert"><${Icon} d=${ICONS.alert} />Paste a link first.</p>`;
-  const [message, fix, other] = f.failure(error, { engine: look.engine, dest: snap.settings.dest });
+  const [message, fix, other] = f.failure(error, { engine: look.engine, dest: snap.settings.dest, newer: newerEngine(snap, look.engine), probe: true });
   const busy = snap.engines[look.engine]?.busy;
   const button = {
     update_engine: [busy ? "Updating…" : "Update engine and retry", () => whenUpdated(look.engine, () => lookUp(look.url, look.engine))],
@@ -302,11 +311,12 @@ function Tray({ data, preset, setPreset, picked, setPicked, dest, busy, error, d
   const playlist = data.kind === "playlist";
   const first = data.entries[0];
   const live = !playlist && first.live;
-  const n = playlist ? data.entries.filter((e) => picked.has(e.url)).length : 1;
+  const n = playlist ? picked.size : 1;
   const need = first.presets.find((p) => p.id === preset)?.size;
   const tight = !live && dest.ok && need != null && dest.free_bytes != null && need > dest.free_bytes;
   const why = live ? "live-note" : !dest.ok ? "dest-problem" : tight ? "space-note" : undefined;
-  const toggle = (u) => { const s = new Set(picked); s.has(u) ? s.delete(u) : s.add(u); setPicked(s); };
+  // Picked by position: the entries of one multi-file item can all share a URL.
+  const toggle = (i) => { const s = new Set(picked); s.has(i) ? s.delete(i) : s.add(i); setPicked(s); };
 
   return html`
     <section class="tray" aria-labelledby="tray-title">
@@ -323,13 +333,13 @@ function Tray({ data, preset, setPreset, picked, setPicked, dest, busy, error, d
       ${playlist && html`
         <div class="picks">
           <div class="pick-actions">
-            <button class="secondary" onClick=${() => setPicked(new Set(data.entries.map((e) => e.url)))}>Select all</button>
+            <button class="secondary" onClick=${() => setPicked(new Set(data.entries.map((e, i) => i)))}>Select all</button>
             <button class="secondary" onClick=${() => setPicked(new Set())}>Select none</button>
           </div>
           <ul class="checklist" aria-label="Videos in ${data.title}">
-            ${data.entries.map((e) => html`
-              <li key=${e.url}><label>
-                <input type="checkbox" checked=${picked.has(e.url)} onChange=${() => toggle(e.url)} />
+            ${data.entries.map((e, i) => html`
+              <li key=${i}><label>
+                <input type="checkbox" checked=${picked.has(i)} onChange=${() => toggle(i)} />
                 <span class="clamp" title=${e.title}>${e.title}</span>
                 <span class="dim num">${f.duration(e.duration)}</span>
               </label></li>`)}
@@ -439,7 +449,8 @@ function Row({ job, snap, say, whenUpdated, openSettings }) {
         ${job.thumbnail ? html`<img class="thumb small" src=${job.thumbnail} alt="" width="64" height="36" loading="lazy" />` : html`<div class="thumb small" />`}
         <div class="body">
           ${title}
-          <p class="meta dim"><span><${Icon} d=${ICONS.check} />Done</span><span class="num">${f.bytes(job.size)}</span></p>
+          <p class="meta dim"><span><${Icon} d=${ICONS.check} />Done</span><span class="num">${f.bytes(job.size)}</span>
+            ${job.dest && job.dest !== snap.settings.dest && html`<span class="folder" title=${job.dest}><${Icon} d=${ICONS.folder} /><span class="visually-hidden">In </span>${f.folderName(job.dest)}</span>`}</p>
         </div>
         <div class="actions">
           ${job.file_exists && !gone ? html`<button class="secondary" aria-describedby=${tid} onClick=${show}>${revealWord(snap.tools.platform)}</button>`
@@ -465,8 +476,11 @@ function Row({ job, snap, say, whenUpdated, openSettings }) {
 
   // Failed.
   const error = job.error || { kind: "engine" };
-  const [message, kindFix, other] = f.failure(error, { engine: job.engine, dest: job.dest });
-  const fix = error.hint || kindFix;
+  const newer = newerEngine(snap, job.engine);
+  const [message, kindFix, other] = f.failure(error, { engine: job.engine, dest: job.dest, newer });
+  // The server's hint wins, except that updating is only offered when a newer engine exists.
+  const fix = error.hint === "update_engine" && !newer ? kindFix : error.hint || kindFix;
+  const live = error.kind === "live";
   const showLog = async () => {
     if (logText != null) return setLogText(null);
     try { setLogText(await api.log(job.id)); } catch (e) { say(e.message); }
@@ -486,9 +500,9 @@ function Row({ job, snap, say, whenUpdated, openSettings }) {
         <div class="row-actions">
           ${fixButton && html`<button class="fill" aria-describedby=${tid} onClick=${fixButton[1]}>${fixButton[0]}</button>`}
           ${copyFix && html`<${CopyCommand} command=${f.installCommand(copyFix, snap.tools.platform)} label="Copy install command" cls="fill" />`}
-          <button class=${fixButton || copyFix ? "secondary" : "fill"} aria-describedby=${tid} onClick=${() => act(() => api.retry(job.id))}>${error.kind === "interrupted" ? "Resume" : "Retry"}</button>
+          ${!live && html`<button class=${fixButton || copyFix ? "secondary" : "fill"} aria-describedby=${tid} onClick=${() => act(() => api.retry(job.id))}>${error.kind === "interrupted" ? "Resume" : "Retry"}</button>
           <button class="quiet" aria-describedby=${tid} aria-expanded=${logText != null ? "true" : "false"} aria-controls="log-${job.id}" onClick=${showLog}>
-            ${logText != null ? "Hide log" : "Show log"}</button>
+            ${logText != null ? "Hide log" : "Show log"}</button>`}
           ${remove}
         </div>
         ${logText != null && html`<pre class="log" id="log-${job.id}" tabindex="0" role="region" aria-label="Engine log">${logText || "The log is empty."}</pre>`}
