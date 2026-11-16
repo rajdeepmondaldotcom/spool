@@ -2,7 +2,9 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -208,3 +210,17 @@ def test_selectors_fit_the_class_in_either_orientation_and_fall_back_to_height()
         "/best[height<=3840][width<=3840]/best[height<=2160]/best"
     )
     assert selector("480", False) == "best[height<=854][width<=854]/best[height<=480]/best"
+
+
+def test_a_destination_deleted_just_before_the_engine_starts_is_not_recreated(tmp_path):
+    drive = tmp_path / "Drive"
+    drive.mkdir()
+    url = "https://fake.test/vanish?delay=0&rm=" + quote(str(drive))  # the fake deletes exactly this folder
+    error = last(run("download", url, dest=str(drive), preset="best"))
+    assert error["event"] == "error"
+    assert not drive.exists()
+
+
+def test_files_carry_the_download_time_not_the_upload_time(tmp_path):
+    done = last(run("download", "https://fake.test/video?delay=0", dest=str(tmp_path), preset="best"))
+    assert abs(os.path.getmtime(done["path"]) - time.time()) < 60

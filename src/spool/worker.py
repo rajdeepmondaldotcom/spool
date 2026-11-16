@@ -62,6 +62,7 @@ TITLE = {
 HEIGHTS = (2160, 1440, 1080, 720, 480, 360, 240)
 FLAT_PRESETS = ("best", "1080", "720", "480", "audio")  # a flat playlist listing has no formats to read
 LABELS = {"best": "Best", "audio": "Audio", "mp3": "MP3"}
+CLASS = {str(h): f" {h}p" for h in HEIGHTS}  # two classes of one video must not share a file name
 
 
 def preset(pid, size=None):
@@ -170,13 +171,19 @@ def download(engine, module, params, spec):
 
     class Capture(PostProcessor):
         def run(self, information):
-            final["path"] = information.get("filepath")
+            path = information.get("filepath")
+            final["path"] = path and os.path.abspath(path)
             details(information)  # youtube-dl's hooks carry no info, so this is where it tells us
             return [], information
 
     part = {"n": 0, "last": None}
+    seen = set()
 
     def hook(d):
+        if d.get("status") == "downloading":  # only what this job writes; "already downloaded" is someone's file
+            for name in {d.get("filename"), d.get("tmpfilename")} - seen - {None}:
+                seen.add(name)
+                emit(event="file", path=os.path.abspath(name))
         if part["n"] == 0 and d.get("info_dict"):
             details(d["info_dict"])  # yt-dlp tells us as soon as the first part starts
         if d.get("status") == "downloading" and part["last"] != "downloading":
@@ -194,7 +201,8 @@ def download(engine, module, params, spec):
 
     params.update(
         format=selector(spec["preset"], spec["ffmpeg"]),
-        outtmpl=os.path.join(spec["dest"], TITLE[module] + " [%(id)s].%(ext)s"),
+        outtmpl=TITLE[module] + " [%(id)s]" + CLASS.get(spec["preset"], "") + ".%(ext)s",  # relative to dest
+        updatetime=False,  # stamp files with the download time, not the upload time
         progress_hooks=[hook],
         noplaylist=True,
         retries=10,
@@ -209,8 +217,10 @@ def download(engine, module, params, spec):
             if module == "yt_dlp"
             else {"key": "FFmpegMetadata"}
         )
-    if not os.path.isdir(spec["dest"]):  # engines create missing folders; a missing drive root must stay missing
-        raise RuntimeError("The destination folder is missing.")
+    try:  # from inside dest, an engine cannot recreate it: a path relative to a deleted folder goes nowhere
+        os.chdir(spec["dest"])
+    except OSError:
+        raise RuntimeError("The destination folder is missing.") from None
     with engine.YoutubeDL(params) as ydl:
         if module == "yt_dlp":
             ydl.add_post_processor(Capture(), when="after_move")

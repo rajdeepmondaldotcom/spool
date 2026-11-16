@@ -249,3 +249,54 @@ def test_details_the_entry_supplied_are_never_overwritten(app, events):
     job = app.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})[1]["jobs"][0]
     done = wait_for(events, job["id"], lambda d: d["state"] == "done")
     assert (done["title"], done["duration"], done["uploader"]) == ("My name for it", 7, "Fake Channel")
+
+
+# Files and names
+
+
+def test_two_presets_of_one_video_write_two_files(app, events):
+    ids = [add(app, "https://fake.test/video?delay=0", preset) for preset in ("best", "720", "audio")]
+    done = [wait_for(events, i, lambda d: d["state"] == "done") for i in ids]
+    names = [os.path.basename(d["path"]) for d in done]
+    assert names == ["Fake video 1 [vid-1].mp4", "Fake video 1 [vid-1] 720p.mp4", "Fake video 1 [vid-1].m4a"]
+
+
+def test_a_job_identical_to_one_still_going_is_that_job(app, events):
+    first = add(app, "https://fake.test/slow?delay=0.3")
+    assert add(app, "https://fake.test/slow?delay=0.3") == first
+    assert add(app, "https://fake.test/slow?delay=0.3", "720") != first
+    assert len(app.jobs.snapshot()["jobs"]) == 2
+
+
+def test_remove_cleans_what_the_engine_wrote_even_with_a_slash_in_the_id(app, events):
+    job_id = add(app, "https://fake.test/403/a%2Fb?delay=0")
+    wait_for(events, job_id, lambda d: d["state"] == "failed")
+    assert [p.name for p in app.dest.iterdir()] == ["Fake refused video [refused-a_b].f137.mp4.part"]
+    assert app.request("DELETE", f"/api/jobs/{job_id}")[0] == 204
+    assert list(app.dest.iterdir()) == []
+
+
+def test_remove_cleans_a_job_added_from_a_pasted_link(app, events):
+    job = app.json("POST", "/api/jobs", {"entries": [{"url": "https://fake.test/403?delay=0"}], "preset": "best"})
+    job_id = job[1]["jobs"][0]["id"]
+    wait_for(events, job_id, lambda d: d["state"] == "failed")
+    assert app.request("DELETE", f"/api/jobs/{job_id}")[0] == 204
+    assert list(app.dest.iterdir()) == []
+
+
+def test_remove_cleans_a_half_written_mp3(app, events):
+    job_id = add(app, "https://fake.test/video?delay=0.1", "mp3")
+    wait_for(events, job_id, lambda d: d["stage"] == "processing")
+    time.sleep(0.2)  # the fake is writing the .mp3 now
+    assert "Fake video 1 [vid-1].mp3" in [p.name for p in app.dest.iterdir()]
+    app.json("POST", f"/api/jobs/{job_id}/cancel")
+    assert app.request("DELETE", f"/api/jobs/{job_id}")[0] == 204
+    assert list(app.dest.iterdir()) == []
+
+
+def test_remove_never_touches_another_jobs_finished_file(app, events):
+    done = wait_for(events, add(app, "https://fake.test/audio?delay=0", "audio"), lambda d: d["state"] == "done")
+    failed = add(app, "https://fake.test/403?delay=0")
+    wait_for(events, failed, lambda d: d["state"] == "failed")
+    assert app.request("DELETE", f"/api/jobs/{failed}")[0] == 204
+    assert [p.name for p in app.dest.iterdir()] == [os.path.basename(done["path"])]

@@ -1,10 +1,8 @@
 """The queue: jobs and their states, settings, the one state file, live events and plain-word errors."""
 
-import glob
 import json
 import os
 import queue
-import re
 import secrets
 import subprocess
 import sys
@@ -109,10 +107,13 @@ class Jobs:
         dest_problem(system.check_dest(dest), status=409)
         new = [new_job(e, preset, engine, dest) for e in entries]
         with self.lock:
+            added = []
             for job in new:
-                self.jobs.insert(0, job)
-                self._changed(job)
-            added = [dict(j) for j in new]
+                same = next((j for j in self.jobs if j["state"] in ("queued", "running") and key(j) == key(job)), None)
+                if same is None:
+                    self.jobs.insert(0, job)
+                    self._changed(job)
+                added.append(dict(same or job))
             self._pump()
         return added
 
@@ -175,13 +176,10 @@ class Jobs:
                 self.jobs.remove(job)
             self._publish("job_removed", {"id": job_id})
             self._save()
-            shared = any(
-                j["entry_id"] == job["entry_id"] and j["dest"] == job["dest"] and j["state"] in ("queued", "running")
-                for j in self.jobs
-            )
+            keep = {job["path"]} | {j["path"] for j in self.jobs}
+            keep |= {f for j in self.jobs if j["state"] in ("queued", "running") for f in j["files"]}
         (self.logs / f"{job_id}.log").unlink(missing_ok=True)
-        if not shared:
-            remove_leftovers(job)
+        remove_leftovers(job, keep)
 
     def reveal(self, job_id):
         with self.lock:
@@ -321,6 +319,9 @@ class Jobs:
                     self._progress(job, event)
                 elif event["event"] == "meta":
                     self._details(job, event)
+                elif event["event"] == "file":
+                    with self.lock:
+                        job["files"].append(event["path"])
                 else:
                     result = event
                     break  # a child the engine left behind may hold the pipe open; this was the last word
@@ -424,6 +425,11 @@ def dest_problem(check, status=None):
         raise Problem(status, "dest_denied", f"Spool cannot write to {check['display']}.", "check_dest")
 
 
+def key(job):
+    """Jobs with the same key would write the same file."""
+    return job["url"], job["preset"], job["dest"]
+
+
 def parse(line):
     try:
         event = json.loads(line)
@@ -470,6 +476,7 @@ def new_job(entry, preset, engine, dest):
         "path": None,
         "size": None,
         "file_exists": False,
+        "files": [],  # every name the engine wrote, temporary ones included: what Remove cleans up
         "error": None,
         "created": time.time(),
         "finished": None,
@@ -565,14 +572,15 @@ def classify(message):
     return "engine", f"The engine failed: {first}" if first else "The engine stopped unexpectedly.", "update_engine"
 
 
-LEFTOVER = re.compile(r"\.(f[\w-]+\.\w+.*|temp\.\w+|\w+\.(part|ytdl).*)")  # what follows "[id]" in a partial file
-
-
-def remove_leftovers(job):
-    if not job["entry_id"]:
-        return
-    tag = f"[{job['entry_id']}]"
-    for f in Path(job["dest"]).glob(f"*{glob.escape(tag)}.*"):
-        tail = f.name[f.name.rindex(tag) + len(tag) :]
-        if str(f) != job["path"] and LEFTOVER.fullmatch(tail) and f.is_file():
-            f.unlink(missing_ok=True)
+def remove_leftovers(job, keep):
+    """Delete what the engine wrote for this job, except any finished file and what a running job still uses."""
+    names = set()
+    for f in job["files"]:
+        names |= {f, f + ".part", f + ".ytdl"}
+        if job["preset"] == "mp3" and job["state"] != "done":  # ffmpeg's half-written .mp3 looks finished
+            mp3 = os.path.splitext(f.removesuffix(".part"))[0] + ".mp3"
+            if os.path.exists(mp3) and os.path.getmtime(mp3) >= job["created"]:  # never an older job's mp3
+                names.add(mp3)
+    for name in names - keep:
+        if os.path.dirname(name) == job["dest"] and os.path.isfile(name):
+            os.unlink(name)

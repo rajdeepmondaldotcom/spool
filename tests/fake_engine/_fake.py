@@ -7,10 +7,12 @@ extract_info, download, add_post_processor, progress hooks and the logger.
 
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 THUMB = (
     "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 9'%3E"
@@ -145,6 +147,7 @@ def video(url, n, title=None, formats=VIDEO_FORMATS, **extra):
         "webpage_url": url,
         "formats": formats,
         "is_live": False,
+        "timestamp": 1_100_000_000,  # uploaded in 2004: engines stamp files with this unless updatetime is off
         **extra,
     }
 
@@ -165,7 +168,7 @@ def scenario(url):
     parts = urlsplit(url)
     path = [p for p in parts.path.split("/") if p]
     name = path[0] if parts.hostname == "fake.test" and path else ""
-    n = path[1] if len(path) > 1 else "1"
+    n = unquote(path[1]) if len(path) > 1 else "1"
     delay = parse_qs(parts.query).get("delay")
     delay = float(delay[0]) if delay else None
     if name == "video":
@@ -180,6 +183,8 @@ def scenario(url):
             **video(url, n, "Fake slow video", SLOW_FORMATS),
             "id": f"slow-{n}",
         }, delay if delay is not None else 0.5
+    if name == "vanish":  # the destination is deleted after Spool checked it and before the engine writes
+        return {**video(url, n), "_rm": parse_qs(parts.query)["rm"][0]}, delay or 0
     if name == "403":
         return {**video(url, n, "Fake refused video"), "id": f"refused-{n}", "_refuse": True}, delay or 0
     if name == "live":
@@ -261,12 +266,27 @@ class YoutubeDL:
         elif cut:
             title = title[: int(cut.group(1))]
         tmpl = re.sub(r"%\(title\)(\.\d+)?[sB]", lambda m: title.replace("%", "%%"), tmpl)
-        name = tmpl % {"id": info["id"], "ext": ext}
+        name = tmpl % {"id": info["id"].replace("/", "_"), "ext": ext}  # the engines clean ids for file names too
         if len(os.path.basename(name + ".part").encode()) > 255:
             raise OSError(63, "File name too long", name)
         return name
 
+    def remove_test_folder(self, path):
+        """Delete the one folder a test named, and only inside the system temp folder (never "here")."""
+        path, temp = os.path.realpath(path), os.path.realpath(tempfile.gettempdir())
+        if os.path.commonpath([path, temp]) != temp or len(path) <= len(temp) + 1:
+            raise RuntimeError(f"refusing to delete {path}: not inside {temp}")
+        shutil.rmtree(path)
+
+    def open(self, name, mode):
+        folder = os.path.dirname(name)
+        if folder:
+            os.makedirs(folder, exist_ok=True)  # as the engines do: a full path recreates a deleted folder
+        return open(name, mode)
+
     def download_one(self, info, delay):
+        if info.get("_rm"):
+            self.remove_test_folder(info["_rm"])
         fmt = self.params.get("format", "best")
         mp3 = any(p.get("key") == "FFmpegExtractAudio" for p in self.params.get("postprocessors", []))
         formats = {f["format_id"]: f for f in info["formats"]}
@@ -291,19 +311,25 @@ class YoutubeDL:
             if len(files) == 2:
                 self.log(f'[Merger] Merging formats into "{final}"')
                 time.sleep(delay)
-                with open(final, "wb") as out:
+                with self.open(final, "wb") as out:
                     for f in files:
                         with open(f, "rb") as src:
                             out.write(src.read())
                         os.remove(f)
-            elif mp3:
+            elif mp3:  # ffmpeg writes the .mp3 as it goes, so a cut leaves a short file that looks finished
                 self.log(f"[ExtractAudio] Destination: {final}")
-                time.sleep(delay)
-                os.replace(files[0], final)
+                with self.open(final, "wb") as out:
+                    out.write(b"\0" * 1000)
+                    out.flush()
+                    time.sleep(delay * 10)
+                    out.write(b"\0" * 1000)
+                os.remove(files[0])
             else:
                 os.replace(files[0], final)
         order = [pp for _, pp in sorted(self.pps, key=lambda x: x[0])]
         self.log("[fake] ran: " + ", ".join(getattr(pp, "key", type(pp).__name__) for pp in order))
+        if self.params.get("updatetime", True) and info.get("timestamp"):
+            os.utime(final, (info["timestamp"], info["timestamp"]))
         for pp in order:
             pp.run({**info, "filepath": final})
 
@@ -317,7 +343,7 @@ class YoutubeDL:
         step = total // self.STEPS
         if info["id"].startswith("slow"):  # a child of our own, as ffmpeg would be, for cancel to kill
             subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdout=subprocess.DEVNULL)
-        with open(part, "ab") as out:
+        with self.open(part, "ab") as out:
             while done < total:
                 if info.get("_refuse") and done >= step * 3:
                     self.fail("ERROR: unable to download video data: HTTP Error 403: Forbidden")
@@ -332,7 +358,8 @@ class YoutubeDL:
                     total_bytes=total,
                     speed=step / delay if delay else None,
                     eta=int((total - done) / step * delay),
-                    filename=part,
+                    filename=name,
+                    tmpfilename=part,
                 )
                 time.sleep(delay)
         os.replace(part, name)
