@@ -77,10 +77,11 @@ def test_a_video_offers_best_its_real_heights_and_audio_with_size_estimates():
     sizes, order = presets("https://fake.test/video")
     assert order == ["best", "720", "480", "360", "audio", "mp3"]  # 1080 is what Best gives: offered once
     assert best_detail("https://fake.test/video") == "1080p"
-    # yt-dlp's rule: largest short side, then H.264, then size: at 1080 the H.264 HLS stream (9000 kbit/s for 95 s)
-    # outranks the smaller H.264 file; the AAC m4a outranks opus; at 360 the combined stream has its own sound
+    # yt-dlp's rule: largest short side, then H.264, then a known size: at 1080 the H.264 file outranks the H.264
+    # HLS stream, which has a higher bitrate but no size; the AAC m4a outranks opus; at 360 the combined stream
+    # has its own sound
     assert sizes == {
-        "best": 9000 * 125 * 95 + 400_000,
+        "best": 3_000_000 + 400_000,
         "720": 1_500_000 + 400_000,
         "480": 800_000 + 400_000,
         "360": 600_000,  # the combined stream: the engine takes no second sound
