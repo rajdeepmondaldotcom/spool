@@ -21,11 +21,15 @@ Save videos from YouTube and over a thousand other sites to your own disk. Paste
 
    On Windows, use the command on [uv's install page](https://docs.astral.sh/uv/getting-started/installation/).
 
+   Then close Terminal and open it again, so it finds `uv`.
+
 2. Install Spool:
 
    ```
    uv tool install git+https://github.com/rajdeepmondaldotcom/spool
    ```
+
+   If Terminal later says `spool: command not found`, run `uv tool update-shell` and open Terminal again.
 
 3. Add the free helper that joins video and audio. The top qualities and MP3 need it.
 
@@ -47,7 +51,7 @@ Type `spool` and press Enter. A browser tab opens.
 
 The file lands in your Downloads folder. To save somewhere else, including an external drive, press Change next to the folder name.
 
-Keep the Terminal window open while Spool works. Press Ctrl+C in it to stop Spool. Downloads that were running pick up where they stopped the next time you start it.
+Keep the Terminal window open while Spool works. Press Ctrl+C in it to stop Spool. The next time you start it, press Resume on a download that was running and it continues from where it stopped.
 
 ## Faster ways in
 
@@ -65,7 +69,7 @@ Keep the Terminal window open while Spool works. Press Ctrl+C in it to stop Spoo
 - The title, channel, date and chapter markers are saved inside the file.
 - Files are named `Title [id].ext`. A fixed quality adds itself, as in `Title [id] 720p.mp4`, so two qualities of one video can sit side by side.
 - Spool warns you before a download when the file won't fit, and says so when a drive is unplugged or full.
-- Cancel and resume. A download interrupted by closing Spool resumes from where it stopped.
+- Cancel and resume. A download you cancelled, or one cut short by closing Spool, continues from where it stopped when you press Resume.
 - When a site changes how it serves video, Spool updates its engine the next time it starts.
 
 ## Update and uninstall

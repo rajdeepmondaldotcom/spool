@@ -13,8 +13,8 @@ The words the code uses. Where the screen uses a plainer word, it is in brackets
 | **Job** | One entry being downloaded with one preset to one destination. Jobs are what the queue holds. |
 | **State** | Where a job is in its life: `queued`, `running`, `done`, `failed` or `cancelled`. |
 | **Stage** | What a running job is doing right now: `starting`, `downloading` or `processing`. |
-| **Part** | One stream of a running job. Most video jobs have two parts, picture then sound, joined at the end. |
-| **Engine** | The program Spool runs to fetch a video. Spool keeps its own copies of two, a main one and a backup. |
+| **Part** | One stream of a running job. Most video jobs have two parts, the video stream then the audio stream, joined at the end. |
+| **Engine** | The program Spool runs to fetch a video. Spool keeps its own copies of two and uses the second when the first fails on a link. |
 | **Worker** | A child process that runs one engine call (a probe or a download) and reports as JSON lines. |
 | **Destination** (folder) | The folder finished files are saved to. |
 | **Snapshot** | The whole state the browser needs, sent when it connects: settings, destination, engines, tools and jobs. |
