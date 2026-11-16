@@ -78,12 +78,12 @@ def test_a_video_offers_best_its_real_heights_and_audio_with_size_estimates():
     assert order == ["best", "720", "480", "360", "audio", "mp3"]  # 1080 is what Best gives: offered once
     assert best_detail("https://fake.test/video") == "1080p"
     # yt-dlp's rule: largest short side, then H.264, then size: at 1080 the H.264 HLS stream (9000 kbit/s for 95 s)
-    # outranks the smaller H.264 file; the AAC m4a outranks opus; at 360 the combined stream is merged with it too
+    # outranks the smaller H.264 file; the AAC m4a outranks opus; at 360 the combined stream has its own sound
     assert sizes == {
         "best": 9000 * 125 * 95 + 400_000,
         "720": 1_500_000 + 400_000,
         "480": 800_000 + 400_000,
-        "360": 600_000 + 400_000,
+        "360": 600_000,  # the combined stream: the engine takes no second sound
         "audio": 400_000,
         "mp3": 95 * 128_000 // 8,  # the duration at the usual 128 kbit/s
     }
@@ -291,3 +291,142 @@ def test_a_wide_screen_video_gets_the_class_above_its_short_side():
     entry = worker.entry({"id": "x", "title": "Wide", "formats": [*video, sound]}, ffmpeg=True)
     assert [p["id"] for p in entry["presets"]] == ["best", "720", "audio", "mp3"]
     assert entry["presets"][0]["detail"] == "1080p"
+
+
+# Progress across parts (yt-dlp's hooks name only the part they are on)
+
+
+def test_progress_rises_across_the_video_and_the_audio_part(tmp_path):
+    events = run("download", "https://fake.test/video?delay=0", dest=str(tmp_path), preset="best")
+    progress = [(e["part"], e["progress"]) for e in events if e["event"] == "progress" and e["progress"] is not None]
+    values = [p for _, p in progress]
+    assert values == sorted(values), "progress went backwards"
+    assert max(p for part, p in progress if part == 1) < 0.95  # the video part is not the whole job
+    assert values[-1] == 1.0
+
+
+def test_a_part_number_past_the_list_does_not_crash():
+    from spool.worker import where
+
+    hook = {"status": "downloading", "downloaded_bytes": 1, "total_bytes": 2, "info_dict": {"format_id": "x"}}
+    progress, _ = where(hook, 3, {"preset": "best", "ffmpeg": True}, [{"format_id": "a"}, {"format_id": "b"}])
+    assert 0 <= progress <= 1
+
+
+# Every file the job writes is named, so Remove can clean it
+
+
+def test_a_merge_cut_short_leaves_only_files_the_job_named(tmp_path):
+    events = run("download", "https://fake.test/video?delay=0&fail=merge", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "error"
+    named = {e["path"] for e in events if e["event"] == "file"}
+    left = {str(p) for p in tmp_path.iterdir()}
+    assert any(p.endswith(".temp.mp4") for p in left)
+    assert left <= named
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symbolic links need extra rights on Windows")
+def test_names_keep_the_destination_as_given_through_a_symbolic_link(tmp_path):
+    (tmp_path / "real").mkdir()
+    (tmp_path / "link").symlink_to(tmp_path / "real")
+    dest = str(tmp_path / "link")
+    events = run("download", "https://fake.test/video?delay=0", dest=dest, preset="best")
+    paths = [e["path"] for e in events if e["event"] in ("file", "done")]
+    assert last(events)["event"] == "done"
+    assert {os.path.dirname(p) for p in paths} == {dest}
+
+
+# File names
+
+
+def test_a_title_of_characters_the_engine_widens_still_fits(tmp_path):
+    done = last(run("download", "https://fake.test/pipes?delay=0", dest=str(tmp_path), preset="best"))
+    assert done["event"] == "done", done
+    assert len(os.path.basename(done["path"]).encode()) + len(".f137.mp4.part") < 255
+
+
+def test_a_class_file_is_named_for_the_class_it_got(tmp_path):
+    """A playlist offers 720 for every entry; a video whose top is 480 is saved, and named, as 480p."""
+    done = last(run("download", "https://fake.test/four-three?delay=0", dest=str(tmp_path), preset="720"))
+    assert os.path.basename(done["path"]) == "Fake 4:3 video [43-1] 480p.mp4".replace(":", "：")
+
+
+# What is offered can be saved
+
+
+@pytest.mark.parametrize("ffmpeg", [True, False])
+@pytest.mark.parametrize("url", ["https://fake.test/video", "https://fake.test/no-combined", "https://fake.test/audio"])
+def test_every_quality_offered_downloads(tmp_path, url, ffmpeg):
+    _, order = presets(url, ffmpeg=ffmpeg)
+    for preset in order:
+        if preset == "mp3":
+            continue  # its file is whatever the audio part gave
+        dest = tmp_path / preset
+        dest.mkdir()
+        done = last(run("download", url + "?delay=0", dest=str(dest), preset=preset, ffmpeg=ffmpeg))
+        assert done["event"] == "done", (preset, done)
+
+
+def test_without_ffmpeg_a_playlist_offers_no_classes():
+    entry = last(run("probe", "https://fake.test/playlist", ffmpeg=False))["entries"][0]
+    assert [p["id"] for p in entry["presets"]] == ["best", "audio"]
+
+
+# Lists
+
+
+def test_a_link_that_is_a_list_of_videos_fails_as_a_playlist(tmp_path):
+    error = last(run("download", "https://fake.test/channel?delay=0", dest=str(tmp_path), preset="best"))
+    assert (error["event"], error["kind"]) == ("error", "playlist")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("engine", ["yt-dlp", "youtube-dl"])
+def test_a_playlist_link_without_an_item_saves_nothing(tmp_path, engine):
+    error = last(
+        run("download", "https://fake.test/playlist?delay=0", engine=engine, dest=str(tmp_path), preset="best")
+    )
+    assert error.get("kind") == "playlist"
+    assert list(tmp_path.iterdir()) == []
+
+
+# Kinds the worker knows
+
+
+def test_a_live_stream_fails_with_its_kind(tmp_path):
+    error = last(run("download", "https://fake.test/live", dest=str(tmp_path), preset="best"))
+    assert (error["event"], error["kind"]) == ("error", "live")
+
+
+def test_a_missing_javascript_runtime_is_named_only_for_what_it_causes(tmp_path):
+    error = last(run("download", "https://fake.test/needs-js", dest=str(tmp_path), preset="best"))
+    assert error["kind"] == "no_js"
+    error = last(run("download", "https://fake.test/needs-js-403?delay=0", dest=str(tmp_path), preset="best"))
+    assert "kind" not in error
+    assert "javascript" not in error["message"].lower()
+
+
+def test_a_relative_engine_path_still_loads_after_moving_into_the_destination(tmp_path):
+    from serve_fake import fake_engine_zip
+
+    (tmp_path / "engine").write_bytes(fake_engine_zip())
+    (tmp_path / "out").mkdir()
+    spec = {"engine": "yt-dlp", "engine_path": "engine", "mode": "download", "url": "https://fake.test/video?delay=0"}
+    spec |= {"ffmpeg": True, "dest": str(tmp_path / "out"), "preset": "best"}
+    out = subprocess.run(
+        [sys.executable, "-I", str(WORKER)], input=json.dumps(spec), capture_output=True, text=True, cwd=tmp_path
+    ).stdout
+    assert last([json.loads(line) for line in out.splitlines()])["event"] == "done"
+
+
+def test_the_fake_deletes_a_folder_only_inside_the_tests_own(tmp_path):
+    (tmp_path / "home").mkdir()
+    (tmp_path / "other").mkdir()  # in the system temp folder, but not this test's folder
+    code = "import sys; sys.path.insert(0, sys.argv[1]); import _fake; _fake.YoutubeDL({'socket_timeout': 1}).remove_test_folder(sys.argv[2])"
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", code, str(FAKE), str(tmp_path / "other")],
+        cwd=tmp_path / "home",
+        capture_output=True,
+    )
+    assert out.returncode != 0
+    assert (tmp_path / "other").exists()

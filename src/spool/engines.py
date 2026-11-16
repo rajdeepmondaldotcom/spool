@@ -1,11 +1,13 @@
 """Engines are files Spool manages: fetched from the official release, checksum-verified, versioned, switched last."""
 
+import functools
 import hashlib
 import io
 import os
 import platform
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -18,12 +20,24 @@ RELEASES = {
     "yt-dlp": "https://github.com/yt-dlp/yt-dlp/releases",
     "youtube-dl": "https://github.com/ytdl-org/ytdl-nightly/releases",
 }
-TAG = re.compile(r"[\w.\-]{1,64}")
+MODULE = {"yt-dlp": "yt_dlp", "youtube-dl": "youtube_dl"}
+TAG = re.compile(r"v?\d[\w.\-]{0,62}", re.ASCII)  # a version: never ".", "..", "current" or "latest"
+LIMIT = 300 << 20  # bytes in one fetched or unpacked file; deno's program, the largest, is about 80 MB
 
 
 def http_get(url):
     with urllib.request.urlopen(url, timeout=120) as r:
-        return r.read()
+        data = r.read(LIMIT + 1)
+    if len(data) > LIMIT:
+        raise ValueError(f"{url} is larger than {LIMIT} bytes")
+    return data
+
+
+def log(folder, what, exc):
+    """Keep a failure's cause in folder/update.log: the page's sentence is plain, and the terminal names no program."""
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / "update.log", "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {what}: {exc!r}\n")
 
 
 def final_url(url):
@@ -46,8 +60,10 @@ class Engines:
         self.on_change = lambda: None  # called, outside the lock, whenever status() would answer differently
 
     def version(self, name):
+        """The current version, while its file is there: a deleted file is installed again."""
         current = self.root / name / "current"
-        return current.read_text().strip() if current.exists() else None
+        tag = current.read_text().strip() if current.exists() else None
+        return tag if tag and (self.root / name / tag).exists() else None
 
     def path(self, name):
         """The installed engine file, or None."""
@@ -104,12 +120,15 @@ class Engines:
             tag = self._latest(name)
             if tag != self.version(name):
                 self._install(name, tag)
-        except ChecksumMismatch:
-            error = "The engine Spool downloaded didn't match its published checksum, so Spool kept the one it had."
-        except OSError:
-            error = "Spool couldn't update its engine. Check your internet connection."
-        except Exception:
-            error = "Spool couldn't update its engine."
+        except Exception as exc:
+            log(self.root, f"update {name}", exc)
+            error = (
+                "The engine Spool downloaded didn't match its published checksum, so Spool kept the one it had."
+                if isinstance(exc, ChecksumMismatch)
+                else "Spool couldn't update its engine. Check your internet connection."
+                if isinstance(exc, OSError)
+                else "Spool couldn't update its engine."
+            )
         with self.lock:
             self.busy[name] = None
             self.error[name] = error
@@ -128,6 +147,18 @@ class Engines:
         folder.mkdir(parents=True, exist_ok=True)
         # the old file stays until the next start: a running worker may still be reading it
         write_atomic(folder / tag, data)
+        loads = False
+        try:  # a release that cannot load on this Python never becomes current
+            code = "import sys; sys.path.insert(0, sys.argv[1]); import " + MODULE[name]
+            check = subprocess.run(
+                [sys.executable, "-I", "-c", code, str(folder / tag)], capture_output=True, timeout=120
+            )
+            loads = check.returncode == 0
+        finally:
+            if not loads:
+                (folder / tag).unlink()
+        if not loads:
+            raise RuntimeError(f"{tag} does not load: {check.stderr.decode(errors='replace').strip()[-500:]}")
         write_atomic(folder / "current", tag.encode())
 
 
@@ -144,6 +175,19 @@ DENO_TARGETS = {  # (sys.platform, machine) -> the release's target name
     ("win32", "AMD64"): "x86_64-pc-windows-msvc",
 }
 JS_ON_PATH = ("deno", "node", "bun")
+JS_FLOORS = {"deno": (2, 3, 0), "node": (22, 0, 0), "bun": (1, 2, 11)}  # yt-dlp's own, in yt_dlp/utils/_jsruntime.py
+SHA256 = re.compile(r"\b[0-9a-fA-F]{64}\b")  # deno's .sha256sum is "<hex>  <name>", or PowerShell's list on Windows
+
+
+@functools.cache  # shortcut: a runtime upgraded in place is seen at the next launch; fine for a local app
+def new_enough(name, path):
+    """Whether a runtime on PATH is one the engine will use: an older one is skipped and YouTube fails."""
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    found = re.search(r"(\d+)\.(\d+)\.(\d+)", out)
+    return bool(found) and tuple(map(int, found.groups())) >= JS_FLOORS[name]
 
 
 class JsRuntime:
@@ -154,48 +198,63 @@ class JsRuntime:
         self.root, self.fetch, self.resolve, self.which = Path(root) / "deno", fetch, resolve, which
         self.lock = threading.Lock()
         self.setup = None  # None, "installing" or "failed"
+        self.busy = self.checked = False  # a fetch is running; the latest release was looked up this run
 
     def tools(self):
         """{js_runtime, js_setup, js_path}: js_path is Spool's own deno, None for a runtime on PATH."""
-        on_path = next((name for name in JS_ON_PATH if self.which(name)), None)
+        on_path = next((n for n in JS_ON_PATH if (path := self.which(n)) and new_enough(n, path)), None)
         current = self.root / "current"
         own = self.root / current.read_text().strip() / exe() if not on_path and current.exists() else None
+        own = own if own and own.exists() else None
         with self.lock:
             return {"js_runtime": on_path or (own and "deno"), "js_setup": self.setup, "js_path": own and str(own)}
 
     def start(self):
-        """Fetch deno in the background if nothing else will do. Safe to call often: one fetch at a time."""
+        """Fetch deno in the background if nothing on PATH will do, and a newer one once a run. Safe to call often:
+        one fetch at a time, and a failed first fetch is tried again."""
+        tools = self.tools()
         with self.lock:
-            if self.setup == "installing":
+            if self.busy or (tools["js_runtime"] and (not tools["js_path"] or self.checked)):
                 return
-            self.setup = "installing"
-        if self.tools()["js_runtime"]:
-            with self.lock:
-                self.setup = None
-            return
+            self.busy = True
+            if not tools["js_path"]:  # while an older own deno serves, nothing is being set up
+                self.setup = "installing"
         threading.Thread(target=self._install, daemon=True).start()
 
     def _install(self):
+        setup = None
         try:
             tag = self.resolve(f"{DENO}/latest").rstrip("/").rsplit("/", 1)[-1]
-            asset = f"deno-{DENO_TARGETS[(sys.platform, platform.machine())]}.zip"
             if not TAG.fullmatch(tag):
                 raise ValueError(f"unexpected release tag {tag!r}")
-            expected = self.fetch(f"{DENO}/download/{tag}/{asset}.sha256sum").decode().split()[0]
-            data = self.fetch(f"{DENO}/download/{tag}/{asset}")
-            if hashlib.sha256(data).hexdigest() != expected.lower():
-                raise ChecksumMismatch()
-            program = zipfile.ZipFile(io.BytesIO(data)).read(exe())  # the one file, never a path from the archive
-            folder = self.root / tag
-            folder.mkdir(parents=True, exist_ok=True)
-            write_atomic(folder / exe(), program)
-            os.chmod(folder / exe(), 0o700)
+            if not (self.root / tag / exe()).exists():
+                self._fetch(tag)
             write_atomic(self.root / "current", tag.encode())
-            setup = None
-        except Exception:  # offline, a bad download, an unknown platform: say so, and a later start tries again
-            setup = "failed"
+            for old in self.root.iterdir():  # older versions; one a worker still runs keeps going on POSIX
+                if old.is_dir() and old.name != tag and TAG.fullmatch(old.name):
+                    shutil.rmtree(old, ignore_errors=True)
+        except Exception as exc:  # offline, a bad download, an unknown platform: say so, and a later start tries again
+            log(self.root, "fetch deno", exc)
+            setup = None if self.tools()["js_path"] else "failed"
         with self.lock:
-            self.setup = setup
+            self.setup, self.busy, self.checked = setup, False, True
+
+    def _fetch(self, tag):
+        asset = f"deno-{DENO_TARGETS[(sys.platform, platform.machine())]}.zip"
+        expected = SHA256.search(self.fetch(f"{DENO}/download/{tag}/{asset}.sha256sum").decode())
+        if not expected:
+            raise ValueError(f"no checksum for {asset}")
+        data = self.fetch(f"{DENO}/download/{tag}/{asset}")
+        if hashlib.sha256(data).hexdigest() != expected.group().lower():
+            raise ChecksumMismatch()
+        archive = zipfile.ZipFile(io.BytesIO(data))
+        if archive.getinfo(exe()).file_size > LIMIT:
+            raise ValueError(f"{exe()} in {asset} is larger than {LIMIT} bytes")
+        program = archive.read(exe())  # the one file, never a path from the archive
+        folder = self.root / tag
+        folder.mkdir(parents=True, exist_ok=True)
+        write_atomic(folder / exe(), program)
+        os.chmod(folder / exe(), 0o700)
 
 
 def exe():

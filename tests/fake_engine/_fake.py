@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from importlib import import_module
 from urllib.parse import parse_qs, unquote, urlsplit
 
 THUMB = (
@@ -124,6 +125,7 @@ AUDIO_FORMATS = [
     {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "abr": 129, "filesize": 500_000},
     {"format_id": "251", "ext": "webm", "vcodec": "none", "acodec": "opus", "abr": 135, "filesize": 480_000},
 ]
+NO_COMBINED_FORMATS = [f for f in VIDEO_FORMATS if f["format_id"] != "18"]  # every stream is picture or sound
 SLOW_FORMATS = [
     {
         "format_id": "18",
@@ -134,6 +136,9 @@ SLOW_FORMATS = [
         "filesize": 4_000_000,
     },
 ]
+
+
+HOME = os.path.realpath(os.getcwd())  # the engine is imported before the worker moves: the test's own tmp_path
 
 
 class Named:
@@ -194,7 +199,8 @@ def scenario(url):
     delay = parse_qs(parts.query).get("delay")
     delay = float(delay[0]) if delay else None
     if name == "video":
-        return video(url, n), delay if delay is not None else 0.15
+        fail = parse_qs(parts.query).get("fail") == ["merge"]  # the merge breaks half way through its file
+        return {**video(url, n), "_fail_merge": fail}, delay if delay is not None else 0.02
     if name == "audio":
         return {
             **video(url, n, "Fake audio track", AUDIO_FORMATS),
@@ -232,6 +238,16 @@ def scenario(url):
     if name == "hls":  # streams with a bitrate but no file size
         hls = [{"format_id": "hls-720", "ext": "mp4", "height": 720, "tbr": 800, "protocol": "m3u8_native"}]
         return {**video(url, n, "Fake streamed video", hls), "id": f"hls-{n}"}, 0
+    if name == "no-combined":  # a site that never offers picture and sound in one stream
+        return {**video(url, n, "Fake split video", NO_COMBINED_FORMATS), "id": f"split-{n}"}, delay or 0
+    if name == "pipes":  # each of these characters becomes a 3-byte one in a yt-dlp file name
+        return {**video(url, n, "a|" * 150), "id": f"pipes-{n}"}, delay or 0
+    if name == "channel":  # a channel's entries are its tabs, each a list of videos
+        tabs = [
+            {"_type": "url", "id": f"tab-{t}", "url": f"https://fake.test/playlist/{t}", "title": t}
+            for t in ("Videos", "Shorts")
+        ]
+        return {"_type": "playlist", "id": "chan", "title": "Fake channel", "entries": tabs}, delay or 0
     if name == "playlist":
         return {"_type": "playlist", "id": "pl-1", "title": "Fake playlist", "entries": [flat(i) for i in (1, 2, 3)]}, 0
     if name == "shared-playlist":  # archive.org multi-file items: every entry carries the item's own link
@@ -253,9 +269,24 @@ def scenario(url):
         )
     if name == "needs-js":  # YouTube without deno, node, bun or quickjs, as the tester saw it
         return {**video(url, n, "Fake video needing JavaScript"), "id": f"js-{n}", "_needs_js": True}, 0
+    if name == "needs-js-403":  # the JavaScript warning, then a failure it did not cause
+        return {
+            **video(url, n, "Fake refused video"),
+            "id": f"js-{n}",
+            "_needs_js": "warn",
+            "_refuse_at": 0,
+            "_once": False,
+        }, 0
     if name == "unavailable":
         raise DownloadError(f"ERROR: [fake] {n}: Video unavailable. This video has been removed by the uploader")
     raise DownloadError(f"ERROR: Unsupported URL: {url}")
+
+
+FULL_WIDTH = {**{c: chr(ord(c) + 0xFEE0) for c in '"*:<>?|'}, "/": "⧸", "\\": "⧹"}  # yt-dlp's file names
+
+
+def has(f, codec):
+    return f.get(codec) != "none"
 
 
 class YoutubeDL:
@@ -273,6 +304,8 @@ class YoutubeDL:
 
     def __init__(self, params=None):
         self.params = params or {}
+        if "socket_timeout" not in self.params:  # youtube-dl would wait 10 minutes for a host that stops answering
+            raise TypeError("the fake engine wants a socket_timeout")
         self.pps = []  # (when rank, post-processor) in the order the engine runs them
         for p in self.params.get("postprocessors", []):
             options = set(p) - {"key", "when"}
@@ -315,11 +348,20 @@ class YoutubeDL:
                 "a JS runtime has been deprecated, and some formats may be missing. See  "
                 "https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one"
             )
+            if info["_needs_js"] == "warn":
+                return
             self.fail(
                 f"ERROR: [youtube] {info['id']}: Requested format is not available. Use --list-formats for a list of available formats"
             )
 
+    def skipped(self, info):
+        refused = self.params.get("match_filter") and self.params["match_filter"](info, incomplete=False)
+        if refused:
+            self.log(f"[download] {refused}, skipping ..")  # the engines skip quietly; no error
+        return refused
+
     def download(self, urls):
+        import_module(self.NAME.replace("-", "_") + ".downloader")  # the engines load their parts as they need them
         for url in urls:
             try:
                 info, delay = self.scenario(url)
@@ -329,32 +371,60 @@ class YoutubeDL:
             if info.get("_type") != "playlist":
                 self.download_one(info, delay)
                 continue
+            if self.NAME == "yt-dlp" and self.skipped(
+                {"playlist_count": len(info["entries"]), "playlist_id": info["id"]}
+            ):
+                continue  # yt-dlp asks about the list itself first
             wanted = self.params.get("playlist_items")  # without it, an engine downloads every entry
             for i, e in enumerate(info["entries"], 1):
                 if wanted is None or str(i) == wanted:
-                    self.download_one({**video(url, str(i), e["title"]), "id": e["id"]}, delay)
+                    self.download_one({**video(url, str(i), e["title"]), "id": e["id"], "playlist_index": i}, delay)
         return 0
 
+    def evaluate_outtmpl(self, tmpl, info, sanitize=False):
+        """The engines' template fields: %(a,b|default).N(s|B). yt-dlp cuts a value and then cleans it for a file
+        name; youtube-dl cleans and then cuts."""
+
+        def field(m):
+            names, default, n, conv = m.group(1).split(","), m.group(2), m.group(3), m.group(4)
+            value = str(next((info[k] for k in names if info.get(k) is not None), "NA" if default is None else default))
+            clean = (lambda v: v) if not sanitize else self.clean_id if names == ["id"] else self.clean
+            if self.NAME == "youtube-dl":
+                value = clean(value)
+            if n and conv == "B":
+                value = value.encode()[: int(n)].decode(errors="ignore")
+            elif n:
+                value = value[: int(n)]
+            return (value if self.NAME == "youtube-dl" else clean(value)).replace("%", "%%")
+
+        return re.sub(r"%\(([\w,]+)(?:\|([^)]*))?\)(?:\.(\d+))?([sB])", field, tmpl) % ()
+
+    def clean(self, value):
+        if self.NAME == "youtube-dl":
+            return re.sub(r"[\\/|*<>]", "_", value).replace("?", "").replace(":", " -").replace('"', "'")
+        return "".join(FULL_WIDTH.get(c, c) for c in value)
+
+    def clean_id(self, value):
+        return re.sub(r"[\\/|*<>]", "_", value)
+
+    def prepare_filename(self, info):
+        return self.name(info, info["ext"])
+
     def name(self, info, ext):
-        """The engines' template: %(title)s, %(title).Ns (characters) or %(title).NB (bytes, yt-dlp only)."""
-        title = info["title"].replace("/", "_")
-        tmpl = self.params["outtmpl"]
-        cut = re.search(r"%\(title\)\.(\d+)([sB])", tmpl)
-        if cut and cut.group(2) == "B":
-            title = title.encode()[: int(cut.group(1))].decode(errors="ignore")
-        elif cut:
-            title = title[: int(cut.group(1))]
-        tmpl = re.sub(r"%\(title\)(\.\d+)?[sB]", lambda m: title.replace("%", "%%"), tmpl)
-        name = tmpl % {"id": info["id"].replace("/", "_"), "ext": ext}  # the engines clean ids for file names too
+        name = self.evaluate_outtmpl(self.params["outtmpl"], {**info, "ext": ext}, sanitize=True)
         if len(os.path.basename(name + ".part").encode()) > 255:
             raise OSError(63, "File name too long", name)
         return name
 
     def remove_test_folder(self, path):
-        """Delete the one folder a test named, and only inside the system temp folder (never "here")."""
-        path, temp = os.path.realpath(path), os.path.realpath(tempfile.gettempdir())
-        if os.path.commonpath([path, temp]) != temp or len(path) <= len(temp) + 1:
-            raise RuntimeError(f"refusing to delete {path}: not inside {temp}")
+        """Delete the one folder a test named, and only inside that test's own folder."""
+        path = os.path.realpath(path)
+        if os.path.commonpath([path, HOME]) != HOME or path == HOME:
+            raise RuntimeError(f"refusing to delete {path}: not inside {HOME}")
+        if os.path.commonpath([HOME, os.path.realpath(tempfile.gettempdir())]) != os.path.realpath(
+            tempfile.gettempdir()
+        ):
+            raise RuntimeError(f"refusing to delete {path}: the test's folder {HOME} is not a temp folder")
         shutil.rmtree(path)
 
     def open(self, name, mode):
@@ -363,24 +433,69 @@ class YoutubeDL:
             os.makedirs(folder, exist_ok=True)  # as the engines do: a full path recreates a deleted folder
         return open(name, mode)
 
+    def select(self, info, fmt):
+        """The streams for a format selector, as yt-dlp chooses them; fails as it does when nothing fits."""
+        formats = info["formats"]
+        sort = self.params.get("format_sort") or []
+        n = next((int(s[4:]) for s in sort if s.startswith("res:")), None)
+
+        def rank(f):  # shortcut: res, H.264 and the file size only; a stream with no file size ranks last
+            side = min(f["width"], f["height"]) if f.get("width") and f.get("height") else f.get("height") or 0
+            return (
+                side if n is None or side <= n else -side,
+                str(f.get("vcodec")).startswith("avc1"),
+                f.get("filesize") or 0,
+            )
+
+        def pick(atom):
+            kind, ext = atom.split("[")[0], re.search(r"\[ext=(\w+)\]", atom)
+            if kind == "bv*":
+                found = [f for f in formats if has(f, "vcodec")]
+            elif kind in ("ba", "bestaudio"):
+                found = [f for f in formats if has(f, "acodec") and not has(f, "vcodec")]
+            else:  # b, best: picture and sound, unless every stream has only one of them
+                found = [f for f in formats if has(f, "vcodec") and has(f, "acodec")]
+                if not found and (all(has(f, "vcodec") for f in formats) or all(has(f, "acodec") for f in formats)):
+                    found = formats
+            found = [f for f in found if not ext or f["ext"] == ext.group(1)]
+            return max(found, key=rank, default=None)
+
+        for alternative in fmt.split("/"):
+            parts = [pick(atom) for atom in alternative.split("+")]
+            if all(parts):
+                return parts[:1] if len(parts) == 2 and has(parts[0], "acodec") else parts  # never a second sound
+        self.fail(
+            f"ERROR: [fake] {info['id']}: Requested format is not available. Use --list-formats for a list of available formats"
+        )
+
+    def chosen(self, info):
+        fmt = self.params.get("format", "best")
+        if self.NAME == "yt-dlp":
+            return self.select(info, fmt)
+        formats = {f["format_id"]: f for f in info["formats"]}  # shortcut: youtube-dl's selectors, by format id
+        if fmt.startswith("bestaudio") or "137" not in formats:
+            return [formats["140"] if "140" in formats else info["formats"][0]]
+        return [formats["137"], formats["140"]] if "+" in fmt else [formats["18"]]
+
     def download_one(self, info, delay):
-        refused = self.params.get("match_filter") and self.params["match_filter"](info, incomplete=False)
-        if refused:
-            self.log(f"[download] {refused}, skipping ..")  # the engines skip quietly; no error
+        if self.skipped(info):
             return
         if info.get("_rm"):
             self.remove_test_folder(info["_rm"])
-        fmt = self.params.get("format", "best")
         mp3 = any(p.get("key") == "FFmpegExtractAudio" for p in self.params.get("postprocessors", []))
-        formats = {f["format_id"]: f for f in info["formats"]}
-        if fmt.startswith("bestaudio") or "137" not in formats:
-            parts = [formats["140"] if "140" in formats else info["formats"][0]]
-        elif "+" in fmt:
-            parts = [formats["137"], formats["140"]]
+        parts = self.chosen(info)
+        if len(parts) == 2:
+            info = {
+                **info,
+                "requested_formats": parts,
+                "format_id": "+".join(f["format_id"] for f in parts),
+                "ext": "mp4",
+            }
         else:
-            parts = [formats["18"]]
-        final_ext = "mp3" if mp3 else ("mp4" if len(parts) == 2 else parts[0]["ext"])
-        final = self.name(info, final_ext)
+            info = {**info, **parts[0]}
+        for _, pp in sorted((p for p in self.pps if p[0] == self.WHEN.get("video")), key=lambda x: x[0]):
+            _, info = pp.run(info)  # yt-dlp's step after choosing the streams, before naming the file
+        final = self.name(info, "mp3" if mp3 else info["ext"])
         if os.path.exists(final):
             self.log(f"[download] {final} has already been downloaded")
             self.hook(
@@ -393,12 +508,17 @@ class YoutubeDL:
             files = [self.fetch(info, f, delay, parts) for f in parts]
             if len(files) == 2:
                 self.log(f'[Merger] Merging formats into "{final}"')
+                temp = os.path.splitext(final)[0] + ".temp.mp4"
                 time.sleep(delay)
-                with self.open(final, "wb") as out:
+                with self.open(temp, "wb") as out:
                     for f in files:
                         with open(f, "rb") as src:
                             out.write(src.read())
-                        os.remove(f)
+                        if info.get("_fail_merge"):
+                            self.fail("ERROR: Postprocessing: Conversion failed!")
+                os.replace(temp, final)
+                for f in files:
+                    os.remove(f)
             elif mp3:  # ffmpeg writes the .mp3 as it goes, so a cut leaves a short file that looks finished
                 self.log(f"[ExtractAudio] Destination: {final}")
                 with self.open(final, "wb") as out:
@@ -409,7 +529,7 @@ class YoutubeDL:
                 os.remove(files[0])
             else:
                 os.replace(files[0], final)
-        order = [pp for _, pp in sorted(self.pps, key=lambda x: x[0])]
+        order = [pp for when, pp in sorted(self.pps, key=lambda x: x[0]) if when != self.WHEN.get("video")]
         self.log("[fake] ran: " + ", ".join(getattr(pp, "key", type(pp).__name__) for pp in order))
         if self.params.get("updatetime", True) and info.get("timestamp"):
             os.utime(final, (info["timestamp"], info["timestamp"]))
@@ -419,9 +539,9 @@ class YoutubeDL:
     def fetch(self, info, f, delay, parts):
         split = len(parts) > 1
         name = self.name(info, f"f{f['format_id']}.{f['ext']}" if split else f["ext"])
-        about = {**info, **f, "requested_formats": parts} if split else {**info, **f}  # as yt-dlp's hooks carry
+        about = {k: v for k, v in {**info, **f}.items() if k != "requested_formats"}  # yt-dlp's hooks see one part
         part = name + ".part"
-        total = f["filesize"]
+        total = f.get("filesize") or 1_000_000  # a stream with only a bitrate: any size will do
         done = os.path.getsize(part) if os.path.exists(part) else 0
         if done:
             self.log(f"[download] Resuming download at byte {done}")
@@ -453,7 +573,13 @@ class YoutubeDL:
                 )
                 time.sleep(delay)
         os.replace(part, name)
-        self.hook(status="finished", downloaded_bytes=total, total_bytes=total, filename=name)
+        self.hook(
+            **({"info_dict": about} if self.HOOK_INFO else {}),
+            status="finished",
+            downloaded_bytes=total,
+            total_bytes=total,
+            filename=name,
+        )
         return name
 
     def hook(self, **d):

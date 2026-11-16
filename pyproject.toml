@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Save any video to your own disk. Paste a link, pick a quality, get the file."
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE", "NOTICE.md", "src/spool/static/vendor/LICENSE-*.txt", "src/spool/static/fonts/OFL.txt"]
 requires-python = ">=3.11"
 dependencies = []
 
@@ -24,7 +25,7 @@ module-name = "spool"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["network: talks to the real engines and the internet (deselected by default)"]
-addopts = "-m 'not network'"
+addopts = "-m 'not network' -W error::pytest.PytestUnhandledThreadExceptionWarning"
 
 [tool.ruff]
 line-length = 120

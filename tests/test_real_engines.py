@@ -10,7 +10,7 @@ import time
 import pytest
 
 from spool.engines import Engines
-from spool.jobs import Jobs
+from spool.jobs import WORKER, Jobs
 from spool.worker import format_params
 
 pytestmark = pytest.mark.network
@@ -126,6 +126,7 @@ NO_WIDTHS = [fmt("v720", 720), fmt("v1080", 1080), fmt("v1440", 1440, **VP9), AU
 FOUR_THREE = [fmt("v240", 240, 320), fmt("v360", 360, 480), fmt("v480", 480, 640), AUDIO, OPUS]
 VP9_TOP = [fmt("v720", 720, 1280), fmt("v1080", 1080, 1920, **VP9), AUDIO, OPUS]  # 1080 exists only in VP9
 TIE = [fmt("v1080vp9", 1080, 1920, **VP9), fmt("v1080", 1080, 1920), AUDIO, OPUS]  # H.264 breaks the tie
+WITH_SOUND = [fmt("v360", 360, 640, acodec="mp4a.40.2"), AUDIO]  # the top stream has its own sound
 
 
 def pick(jobs, engine, module, formats, preset):
@@ -155,6 +156,7 @@ def pick(jobs, engine, module, formats, preset):
         (VP9_TOP, "best", "v1080+a140"),
         (VP9_TOP, "1080", "v1080+a140"),
         (TIE, "best", "v1080+a140"),
+        (WITH_SOUND, "best", "v360"),  # no second sound, so the size estimate counts one stream
     ],
 )
 def test_yt_dlp_picks_the_class_by_its_short_side_with_h264_only_as_a_tie_break(jobs, formats, preset, chosen):
@@ -190,3 +192,31 @@ def test_spool_fetches_a_working_deno_from_its_official_release(tmp_path):
     assert (tools["js_runtime"], tools["js_setup"]) == ("deno", None), tools
     out = subprocess.run([tools["js_path"], "--version"], capture_output=True, text=True, check=True).stdout
     assert out.startswith("deno ")
+
+
+# The worker against the real engine
+
+
+def worker(jobs, dest, url, preset="best"):
+    spec = jobs._spec("yt-dlp", mode="download", url=url, dest=str(dest), preset=preset, item=None)
+    out = subprocess.run(
+        [sys.executable, "-I", str(WORKER)], input=json.dumps(spec), capture_output=True, text=True, timeout=300
+    ).stdout
+    return [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+
+
+def test_a_real_two_part_download_rises_across_both_parts(jobs, tmp_path):
+    events = worker(jobs, tmp_path, ZOO)
+    assert events[-1]["event"] == "done", events[-1]
+    progress = [(e["part"], e["progress"]) for e in events if e["event"] == "progress" and e["progress"] is not None]
+    values = [p for _, p in progress]
+    assert values == sorted(values)
+    if {part for part, _ in progress} == {1, 2}:  # with ffmpeg: video, then audio
+        assert max(p for part, p in progress if part == 1) < 0.99
+        assert any(e["path"].endswith(".temp.mp4") for e in events if e["event"] == "file")  # the merge's file
+
+
+def test_a_real_channel_link_fails_as_a_list_and_saves_nothing(jobs, tmp_path):
+    events = worker(jobs, tmp_path, "https://www.youtube.com/@jawed")
+    assert (events[-1]["event"], events[-1].get("kind")) == ("error", "playlist"), events[-1]
+    assert list(tmp_path.iterdir()) == []
