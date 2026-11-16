@@ -311,7 +311,7 @@ def download(engine, module, params, spec):
         return None
 
     # shortcut: youtube-dl has no step between choosing and naming, so its class is the preset's, even when a
-    # playlist entry has no such class; upgrade if youtube-dl gains one, or drop with youtube-dl
+    # playlist entry has no such class, and its merge's .temp file goes unreported; drop with youtube-dl
     cls = "" if module == "yt_dlp" else CLASS.get(spec["preset"], "")
     params.update(
         match_filter=wanted,
