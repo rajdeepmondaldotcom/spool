@@ -49,13 +49,16 @@ const FFMPEG = { darwin: "brew install ffmpeg", linux: "sudo apt install ffmpeg"
 export const ffmpegCommand = (platform) => FFMPEG[platform] || FFMPEG.linux;
 
 // The quality to select for a video: the remembered one, else the nearest lower class (Best counts as its own
-// class, which the server leaves out of the list), else Best.
+// class, which the server leaves out of the list), else Best. A video with no Best (no helper, and no stream with
+// both picture and sound) gets the first quality it does offer.
 export function pick(presets, remembered) {
-  if (presets.some((p) => p.id === remembered)) return remembered;
-  if (!/^\d+$/.test(remembered)) return "best";
+  const offered = (id) => presets.some((p) => p.id === id);
+  if (offered(remembered)) return remembered;
+  const fallback = offered("best") ? "best" : presets[0]?.id;
+  if (!/^\d+$/.test(remembered)) return fallback;
   const height = (p) => parseInt(p.id === "best" ? p.detail : p.id, 10);
   const lower = presets.filter((p) => height(p) < +remembered).sort((a, b) => height(b) - height(a));
-  return lower[0]?.id || "best";
+  return lower[0]?.id || fallback;
 }
 
 // At most four tiles up front (Best, two classes below it, Audio); the rest go under "More qualities".

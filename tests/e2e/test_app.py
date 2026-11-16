@@ -631,7 +631,6 @@ def test_finished_shows_ten_then_show_all_and_clear_list_keeps_the_files(app, sp
     finished.get_by_role("button", name="Show all 12").click()
     expect(finished.get_by_role("listitem")).to_have_count(12)
 
-    clear_by_ids(app, spool)
     files = sorted(p.name for p in (tmp_path / "downloads").iterdir())
     finished.get_by_role("button", name="Clear list").click()
     expect(app.get_by_role("status").filter(has_text="Cleared 12.")).to_be_visible()
@@ -730,8 +729,8 @@ def test_a_drive_that_does_not_answer_blocks_download(app, monkeypatch):
     from spool import system
 
     release = threading.Event()
-    real = system.probe_dest
-    monkeypatch.setattr(system, "probe_dest", lambda path: (release.wait(), real(path))[1])  # asleep until released
+    real = system.probe
+    monkeypatch.setattr(system, "probe", lambda path, write: (release.wait(), real(path, write))[1])  # asleep till then
     try:
         problem = app.get_by_role("alert").filter(
             has_text="isn't answering. If macOS is asking whether Spool may use it"
@@ -877,19 +876,10 @@ def test_a_tab_reconnects_after_spool_restarts(page, tmp_path):
 # Review round: each test below went red on the page as it was at 93de052
 
 
-def clear_by_ids(page, spool):
-    """POST /api/jobs/clear {"ids"} as agreed with the server: only the rows the tab took off are cleared.
-    shortcut: emulated here until the server takes ids; drop this once it does."""
+def clear_requests(page):
+    """The ids each Clear sent to the server, as they go out."""
     sent = []
-
-    def handle(route):
-        ids = route.request.post_data_json["ids"]
-        sent.append(ids)
-        for i in ids:
-            spool[1].remove(i)
-        route.fulfill(status=204)
-
-    page.route("**/api/jobs/clear", handle)
+    page.on("request", lambda r: sent.append(r.post_data_json["ids"]) if r.url.endswith("/api/jobs/clear") else None)
     return sent
 
 
@@ -960,7 +950,7 @@ def test_a_refused_token_never_replaces_the_kept_one(page, spool):
 
 
 def test_clear_sends_only_the_rows_it_took_off(app, spool):
-    sent = clear_by_ids(app, spool)
+    sent = clear_requests(app)
     add(spool, [("https://fake.test/video/1", "Fake video 1")])
     finished = group(app, "Finished")
     expect(finished.get_by_role("listitem")).to_have_count(1, timeout=15000)

@@ -256,7 +256,7 @@ def test_a_release_tag_that_is_not_a_version_is_refused(tmp_path, tag):
     engines = Engines(tmp_path, fetch=github.fetch, resolve=github.resolve)
     engines.update("yt-dlp")
     status = settle(engines)["yt-dlp"]
-    assert (status["installed"], status["error"]) == (False, "Spool couldn't update its engine.")
+    assert (status["installed"], status["error"]) == (False, "Spool couldn't set up its engine.")
     assert sorted(p.name for p in tmp_path.iterdir()) == ["update.log"]  # nothing installed, the cause kept
 
 

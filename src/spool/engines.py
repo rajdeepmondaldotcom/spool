@@ -122,12 +122,13 @@ class Engines:
                 self._install(name, tag)
         except Exception as exc:
             log(self.root, f"update {name}", exc)
+            did = "update" if self.version(name) else "set up"  # the first fetch is a setup: there is nothing to update
             error = (
-                "The engine Spool downloaded didn't match its published checksum, so Spool kept the one it had."
+                "The engine Spool downloaded didn't match its published checksum, so Spool didn't use it."
                 if isinstance(exc, ChecksumMismatch)
-                else "Spool couldn't update its engine. Check your internet connection."
+                else f"Spool couldn't {did} its engine. Check your internet connection."
                 if isinstance(exc, OSError)
-                else "Spool couldn't update its engine."
+                else f"Spool couldn't {did} its engine."
             )
         with self.lock:
             self.busy[name] = None

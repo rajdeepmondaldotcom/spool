@@ -80,7 +80,9 @@ export const refresh = () => reopen();
 
 export function listen({ snapshot, job, removed, connected }) {
   const handlers = { snapshot, job, job_removed: (d) => removed(d.id) };
-  const channel = new BroadcastChannel(`spool-${token}`);
+  // shortcut: a browser without Web Locks reads its own stream in every tab, so a seventh tab stalls there
+  const shared = !!(navigator.locks && window.BroadcastChannel);
+  const channel = shared ? new BroadcastChannel(`spool-${token}`) : { postMessage() {} };
   const deliver = ({ event, data }) => {
     if (event === "connected") return connected(data);
     if (event === "unauthorized") return unauthorized();
@@ -130,10 +132,12 @@ export function listen({ snapshot, job, removed, connected }) {
     emit({ event: "connected", data: false });
     setTimeout(open, 2000);
   };
-  navigator.locks.request(`spool-events-${token}`, () => {
+  const lead = () => {
     leading = true;
     reopen = () => { again = true; stream?.abort(); };
     open();
     return new Promise(() => {}); // held until this tab closes
-  });
+  };
+  if (shared) navigator.locks.request(`spool-events-${token}`, lead);
+  else lead();
 }

@@ -28,6 +28,8 @@ CASES = [
     ("pick", [[{"id": "best"}, {"id": "720"}, {"id": "480"}, {"id": "audio"}], "1080"], "720"),
     ("pick", [[{"id": "best"}, {"id": "720"}, {"id": "audio"}], "360"], "best"),
     ("pick", [[{"id": "best"}, {"id": "audio"}], "mp3"], "best"),
+    ("pick", [[{"id": "audio"}], "best"], "audio"),
+    ("pick", [[{"id": "audio"}], "720"], "audio"),
     ("pick", [[{"id": "best", "detail": "480p"}, {"id": "360"}, {"id": "audio"}], "720"], "best"),
     ("pick", [[{"id": "best", "detail": "1080p"}, {"id": "720"}, {"id": "360"}], "480"], "360"),
     (
