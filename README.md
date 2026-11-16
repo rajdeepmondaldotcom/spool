@@ -7,7 +7,7 @@ Save videos from YouTube and over a thousand other sites to your own disk. Paste
   <img alt="Spool showing a video's details, its quality choices with file sizes, and a download in progress" src="docs/spool-light.png">
 </picture>
 
-- Any quality the site offers, up to 4K, with the file size shown before you download.
+- Any quality the site offers, up to 4K, with the file size and file type shown before you download.
 - Whole playlists or only the videos you pick, or audio only as MP3.
 - Files go to a folder you choose. Spool runs on your computer, needs no account, and nothing you save leaves your machine.
 
@@ -51,7 +51,7 @@ Type `spool` and press Enter. A browser tab opens.
 
 The file lands in your Downloads folder. To save somewhere else, including an external drive, press Change next to the folder name.
 
-Keep the Terminal window open while Spool works. Press Ctrl+C in it to stop Spool. The next time you start it, press Resume on a download that was running and it continues from where it stopped.
+Keep the Terminal window open while Spool works. Press Ctrl+C in it to stop Spool, or choose Quit Spool in Settings. The next time you start it, press Resume on a download that was running and it continues from where it stopped.
 
 ## Faster ways in
 
@@ -59,6 +59,7 @@ Keep the Terminal window open while Spool works. Press Ctrl+C in it to stop Spoo
 |---|---|
 | Paste a link, then press Enter | Downloads it at the quality you used last |
 | Paste several links at once | Queues them all |
+| Paste a channel's link | Lists its newest 100 videos to pick from |
 | Press Cmd+Enter in the link field (Ctrl+Enter on Windows and Linux) | Downloads without showing the choices |
 | Run `spool https://…` | Opens with that link ready |
 | Drag "Save with Spool" from Settings to your bookmarks bar, then click it on a video's page | Opens with that page's link ready |
@@ -70,6 +71,8 @@ Keep the Terminal window open while Spool works. Press Ctrl+C in it to stop Spoo
 - Files are named `Title [id].ext`. A fixed quality adds itself, as in `Title [id] 720p.mp4`, so two qualities of one video can sit side by side.
 - Spool warns you before a download when the file won't fit, and says so when a drive is unplugged or full.
 - Cancel and resume. A download you cancelled, or one cut short by closing Spool, continues from where it stopped when you press Resume.
+- A dropped connection doesn't end a download. Spool waits, tries again by itself and carries on from where it was.
+- Open a finished file from its row, or show it in its folder.
 - When a site changes how it serves video, Spool updates its engine the next time it starts.
 
 ## Update and uninstall
@@ -77,6 +80,8 @@ Keep the Terminal window open while Spool works. Press Ctrl+C in it to stop Spoo
 ```
 uv tool upgrade spool-dl
 ```
+
+Settings tells you when a newer Spool is ready.
 
 ```
 uv tool uninstall spool-dl
@@ -101,6 +106,7 @@ Your downloaded files are not in that folder, and Spool does not delete them.
 | "This quality needs a free helper…" | Run the command from step 3 of Install, then press Try again. |
 | "… isn't connected." | Plug the drive in, or press Change and pick another folder. |
 | "This tab lost its link to Spool." | Run `spool` again. It opens a working tab. |
+| "The site is limiting this connection for now." | Wait an hour or so, then press Try again. A site slows a connection that asks for a lot in a short time. |
 | "Joining video and audio" takes a long time | The drive is slow, and the row shows its speed and the time left. A drive plugged straight into the computer with a fast cable finishes this in minutes. |
 | macOS asks whether Spool may use a removable volume | Choose Allow. It asks the first time you save to an external drive. |
 
