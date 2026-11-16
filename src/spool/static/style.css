@@ -32,6 +32,7 @@
   --text: "Barlow", system-ui, sans-serif;
   --condensed: "Barlow Condensed", "Barlow", system-ui, sans-serif;
   --target: 32px;
+  --tile: calc(2 * var(--s2) + 4px + 22px + 14px * 1.45); /* a tile: two lines, the gap, padding and border */
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -207,7 +208,7 @@ input[type="radio"], input[type="checkbox"] { width: 18px; height: 18px; margin:
 .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr)); gap: var(--s2); }
 /* An option tile: the radio covers the whole tile, so a click anywhere picks it. */
 .tile {
-  position: relative; display: grid; align-content: center; gap: 2px; min-height: 56px; padding: var(--s2) var(--s3);
+  position: relative; display: grid; align-content: center; gap: 2px; min-height: var(--tile); padding: var(--s2) var(--s3);
   border: 1px solid var(--field-border); border-radius: var(--r-control); background: var(--surface);
   transition: border-color var(--fast), background-color var(--fast);
 }
@@ -233,8 +234,8 @@ input[type="radio"], input[type="checkbox"] { width: 18px; height: 18px; margin:
 .skeleton .lines div, .skeleton .tiles div, .skeleton .bar { border-radius: var(--r-thumb); background: var(--rule); }
 .skeleton .lines div { height: 22px; width: 80%; }
 .skeleton .lines div + div { height: 15px; width: 40%; }
-.skeleton .tiles { margin-top: calc(var(--s4) + 31px); }
-.skeleton .tiles div { height: 56px; border-radius: var(--r-control); }
+.skeleton .tiles { margin-top: calc(var(--s4) + var(--s2) + 17px * 1.45); }
+.skeleton .tiles div { height: var(--tile); border-radius: var(--r-control); }
 .skeleton .bar { margin-top: calc(var(--s5) + 44px); height: 44px; width: 9em; border-radius: var(--r-control); }
 
 /* Strips under the deck */
@@ -255,8 +256,7 @@ code { padding: 2px var(--s2); border-radius: var(--r-thumb); background: var(--
 .group ul { list-style: none; margin: 0; padding: 0; }
 .row {
   display: grid; grid-template-columns: 64px minmax(0, 1fr) auto; gap: var(--s2) var(--s4);
-  align-items: center; padding: var(--s3) var(--s2); margin-inline: calc(-1 * var(--s2));
-  border-bottom: 1px solid var(--rule); border-radius: var(--r-thumb);
+  align-items: center; padding-block: var(--s3); border-bottom: 1px solid var(--rule);
 }
 /* The row that just finished, or that was already in the list: tinted, then it settles. No movement. */
 .row.flash { background: var(--flash); animation: settle 2s ease-in forwards; }
@@ -337,6 +337,7 @@ progress:not([value])::-webkit-progress-bar { background: repeating-linear-gradi
 @media (max-width: 600px) {
   .link-row { flex-direction: column; }
   .thumb { width: 112px; }
+  .thumb.small { width: 48px; }
   .tray { padding: var(--s4); }
   .tray-head { flex-direction: column; }
   .tray-head .thumb { width: 100%; max-width: 240px; }

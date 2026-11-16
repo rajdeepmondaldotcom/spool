@@ -197,6 +197,18 @@ def test_pasting_several_links_queues_them_all(app):
     expect(app.get_by_text("Added 3 downloads.")).to_be_hidden(timeout=7000)  # gone after 5 seconds
 
 
+@pytest.mark.parametrize("width", [1440, 375])
+def test_the_skeleton_is_as_tall_as_the_tray_it_stands_in_for(app, width):
+    app.set_viewport_size({"width": width, "height": 900})
+    held = []
+    app.route("**/api/probe", lambda route: held.append(route))
+    look_up(app, VIDEO)
+    waiting = app.locator(".tray.skeleton").bounding_box()["height"]
+    held[0].continue_()
+    expect(tray(app, "Fake video 1")).to_be_visible()
+    assert abs(tray(app, "Fake video 1").bounding_box()["height"] - waiting) < 2
+
+
 def test_one_yellow_button_at_a_time(app):
     look_up(app, VIDEO)
     expect(tray(app, "Fake video 1")).to_be_visible()
@@ -821,6 +833,7 @@ def test_a_first_run_that_cannot_fetch_the_engine_says_so(page, tmp_path):
         strip = page.get_by_role("complementary", name="Engine")
         expect(strip).to_contain_text("Spool couldn't set up its engine.", timeout=15000)
         expect(strip.get_by_role("button", name="Try again")).to_be_visible()
+        expect(page.get_by_text("Setting up Spool.")).to_have_count(0)
         assert_no_program_names(page, "engine strip")
     finally:
         httpd.shutdown()

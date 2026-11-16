@@ -185,14 +185,14 @@ function App() {
     },
     turnOff() { local.set("spool-notify", "off"); setNotifyPref("off"); },
   };
-  const ready = !!snap.engines[snap.settings.engine]?.installed;
+  const engine = snap.engines[snap.settings.engine], ready = !!engine?.installed;
   return html`
     <main>
       <${Deck} ...${ctx} turning=${running.length > 0} added=${added} notify=${notify} ready=${ready} />
       <${EngineStrip} snap=${snap} />
       ${!snap.tools.ffmpeg && html`<${FfmpegStrip} snap=${snap} />`}
       <div class="queue" onfocusin=${trackRow}>
-        <${Queue} ...${ctx} jobs=${shown} flash=${flash} ready=${ready} />
+        <${Queue} ...${ctx} jobs=${shown} flash=${flash} ready=${ready} failed=${!!engine?.error && !engine.busy} />
       </div>
     </main>
     ${undo && html`
@@ -547,9 +547,9 @@ const canResume = (j) => j.state === "cancelled" || (j.state === "failed" && j.e
 // Running, then waiting in the order they will start; the server lists newest first.
 const downloading = (jobs) => [...jobs.filter((j) => j.state === "running"), ...jobs.filter((j) => j.state === "queued").reverse()];
 
-function Queue({ jobs, flash, ready, ...ctx }) {
+function Queue({ jobs, flash, ready, failed, ...ctx }) {
   const [all, setAll] = useState(false);
-  if (!jobs.length) return ready
+  if (!jobs.length) return ready || failed
     ? html`<div class="empty"><p>Downloads show up here. Paste a link above to start.</p>
         <p class="dim">Works with YouTube, Vimeo and over a thousand other sites.</p></div>`
     : html`<p class="empty" role="status">Setting up Spool. This takes a few seconds.</p>`;
