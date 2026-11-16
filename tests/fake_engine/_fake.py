@@ -223,9 +223,11 @@ def scenario(url):
     delay = parse_qs(parts.query).get("delay")
     delay = float(delay[0]) if delay else None
     if name == "video":
-        fail = parse_qs(parts.query).get("fail")  # merge: the join breaks half way; tags: a part can't be tagged
+        fail = parse_qs(parts.query).get("fail")  # merge: the join breaks half way; tags: a part can't be tagged;
+        # join-args: the join breaks only when told to take chapters and details from a part
         join = float(parse_qs(parts.query).get("join", ["0"])[0])  # seconds per tenth of the join
         extra = {"_fail_merge": fail == ["merge"], "_fail_tags": fail == ["tags"], "_join": join}
+        extra["_fail_join_args"] = fail == ["join-args"]
         return {**video(url, n), **extra}, delay if delay is not None else 0.02
     if name == "audio":
         return {
@@ -572,6 +574,8 @@ class YoutubeDL:
         temp = os.path.splitext(final)[0] + ".temp.mp4"
         time.sleep(delay)
         with self.open(temp, "wb") as out:
+            if info.get("_fail_join_args") and args:
+                self.fail("ERROR: Postprocessing: Conversion failed!")  # before deleting the parts, as yt-dlp does
             for f in files:
                 with open(f, "rb") as src:
                     data = src.read()
@@ -596,6 +600,16 @@ class YoutubeDL:
         split = len(parts) > 1
         name = self.name(info, f"f{f['format_id']}.{f['ext']}" if split else f["ext"])
         about = {k: v for k, v in {**info, **f}.items() if k != "requested_formats"}  # yt-dlp's hooks see one part
+        if split and os.path.exists(name):  # a part a failed join left: yt-dlp keeps it
+            self.log(f"[download] {name} has already been downloaded")
+            self.hook(
+                **({"info_dict": about} if self.HOOK_INFO else {}),
+                status="finished",
+                total_bytes=os.path.getsize(name),
+                filename=name,
+            )
+            return name
+        self.log(f"[download] Destination: {name}")
         part = name + ".part"
         total = f.get("filesize") or 1_000_000  # a stream with only a bitrate: any size will do
         done = os.path.getsize(part) if os.path.exists(part) else 0

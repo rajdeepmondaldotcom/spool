@@ -346,6 +346,8 @@ def download(engine, module, params, spec):
             return [], information
 
     joined = []  # the join takes chapters and details from the audio part: no second pass over the joined file
+    plain = []  # that join failed: the second try joins the plain way and Details writes the tags after
+    merging = []  # the join started and has not finished
 
     def tag_audio(d):
         """Tag the small audio part and have the join copy its tags, instead of rewriting the joined file after.
@@ -353,7 +355,7 @@ def download(engine, module, params, spec):
         Any failure leaves today's two passes: the Details step then writes them into the joined file."""
         info = d["info_dict"]
         i = next((k for k, f in enumerate(plan) if f.get("format_id") == info.get("format_id")), None)
-        if i is None or len(plan) < 2 or has(info, "vcodec") or not has(info, "acodec"):
+        if plain or i is None or len(plan) < 2 or has(info, "vcodec") or not has(info, "acodec"):
             return
         try:
             wrote("{}.temp{}".format(*os.path.splitext(d["filename"])))
@@ -382,6 +384,8 @@ def download(engine, module, params, spec):
         """yt-dlp's postprocessor_hooks: one step runs at a time, from its started hook to its finished one."""
         stepping[0].set()
         what = STEPS.get(d.get("postprocessor"))
+        if what == "join":
+            merging[:] = [True] if d.get("status") == "started" else []
         if d.get("status") == "started" and what:
             try:
                 out, total = output(what, d["info_dict"])
@@ -460,7 +464,17 @@ def download(engine, module, params, spec):
             ydl.add_post_processor(Capture(), when="after_move")
         else:
             ydl.add_post_processor(Capture())
-        ydl.download([spec["url"]])
+        try:
+            ydl.download([spec["url"]])
+        except Exception as exc:
+            if not (joined and merging):
+                raise
+            # the parts stay on disk, so the engine finds them and only joins again
+            emit(event="log", line=f"[spool] the join with the details failed, so Spool joined the plain way: {exc}")
+            ydl.params["postprocessor_args"].pop("merger+ffmpeg_o")
+            joined.clear()
+            plain.append(True)
+            ydl.download([spec["url"]])
     if refused:
         raise refused[0]
     path = final.get("path")
