@@ -7,7 +7,6 @@ const Icon = ({ d, cls = "" }) => html`
   <svg class="icon ${cls}" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d=${d} /></svg>`;
 const ICONS = {
   alert: "M12 4 2.5 20h19L12 4Zm0 6v4.5m0 3v.01",
-  check: "m5 12.5 4.5 4.5L19 7.5",
   stop: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm-6.4 2.6 12.8 12.8",
   wait: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm0 4.5V12l3 2",
   more: "M5.5 12h.01M12 12h.01M18.5 12h.01",
@@ -19,8 +18,17 @@ const Reel = ({ turning }) => html`
   <svg class="reel ${turning ? "turning" : ""}" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path d=${REEL} /></svg>`;
 
 const isEditable = (el) => el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
-const newerEngine = (snap, name) => { const e = snap.engines[name]; return !!(e?.latest && e.latest !== e.version); };
 const revealWord = (platform) => (platform === "darwin" ? "Show in Finder" : "Show in folder");
+const modKey = (platform) => (platform === "darwin" ? "Cmd" : "Ctrl");
+const local = {
+  get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch { /* private window: forgotten on close */ } },
+};
+const canNotify = () => "Notification" in window;
+const notifying = () => canNotify() && Notification.permission === "granted" && local.get("spool-notify") === "on";
+const UNDO_MS = 5000, FLASH_MS = 2000, SHOWN = 10;
+
+window.name = "spool"; // the bookmark button opens its link in the window of this name, so it lands in this tab
 
 function App() {
   const [snap, setSnap] = useState(null);
@@ -28,13 +36,27 @@ function App() {
   const [connected, setConnected] = useState(true);
   const [said, setSaid] = useState("");
   const [signedOut, setSignedOut] = useState(false);
+  const [away, setAway] = useState(new Set()); // rows taken off the screen; the server call waits for Undo's time
+  const [undo, setUndo] = useState(null);
+  const [flash, setFlash] = useState(new Set());
+  const [unseen, setUnseen] = useState(false); // a download finished while the tab was hidden
+  const [ask, setAsk] = useState(false); // asked once, after the first download this page added
+  const [, setNotifyPref] = useState(local.get("spool-notify"));
   const seen = useRef({});
   const pending = useRef(null);
   const lastRow = useRef(null);
+  const jobsNow = useRef(jobs);
+  jobsNow.current = jobs;
   const field = useRef(null);
   const settings = useRef(null);
+  const undoButton = useRef(null);
+  const waiting = useRef(null);
 
   const say = (text) => { setSaid(""); setTimeout(() => setSaid(text), 50); };
+  const tint = (ids) => {
+    setFlash((s) => new Set([...s, ...ids]));
+    setTimeout(() => setFlash((s) => new Set([...s].filter((id) => !ids.includes(id)))), FLASH_MS);
+  };
 
   useEffect(() => api.onUnauthorized(() => setSignedOut(true)), []);
   useEffect(() => api.listen({
@@ -47,14 +69,26 @@ function App() {
     job: (j) => {
       const before = seen.current[j.id];
       seen.current[j.id] = j.state;
-      if (before && before !== j.state && j.state === "done") say(`Finished: ${j.title}`);
-      if (before && before !== j.state && j.state === "failed") say(`Failed: ${j.title}`);
+      if (before && before !== j.state && j.state === "done") {
+        say(`Finished: ${j.title}`);
+        tint([j.id]);
+        if (document.hidden) {
+          setUnseen(true);
+          if (notifying()) new Notification("Finished", { body: j.title || j.url });
+        }
+      }
+      if (before && before !== j.state && j.state === "failed") say(`Stopped: ${j.title}`);
       setJobs((js) => (js.some((x) => x.id === j.id) ? js.map((x) => (x.id === j.id ? j : x)) : [j, ...js]));
     },
     removed: (id) => setJobs((js) => js.filter((x) => x.id !== id)),
   }), []);
+  useEffect(() => {
+    const visible = () => { if (!document.hidden) { setUnseen(false); api.refresh(); } };
+    document.addEventListener("visibilitychange", visible);
+    return () => document.removeEventListener("visibilitychange", visible);
+  }, []);
 
-  // "Update engine and retry": run the follow-up once the engine has been busy and is idle again.
+  // "Update and try again": run the follow-up once the engine has been busy and is idle again.
   useEffect(() => {
     const p = pending.current, e = snap?.engines[p?.name];
     if (!e) return;
@@ -62,54 +96,115 @@ function App() {
     else if (p.saw) { pending.current = null; if (!e.error) p.then(); }
   }, [snap]);
   const whenUpdated = async (name, then) => {
-    const e = snap.engines[name];
-    if (e.installed && e.latest && e.latest === e.version) return then();
     pending.current = { name, then, saw: false };
     try { await api.updateEngine(name); } catch (err) { if (err.status !== 409) { pending.current = null; say(err.message); } }
   };
 
+  // Remove and Clear: off the screen at once, sent when Undo's time has passed (or the tab closes).
+  const send = () => {
+    const w = waiting.current;
+    if (!w) return;
+    clearTimeout(w.timer);
+    waiting.current = null;
+    w.send().catch((e) => { setAway((s) => new Set([...s].filter((id) => !w.ids.includes(id)))); say(e.message); });
+  };
+  useEffect(() => { window.addEventListener("pagehide", send); return () => window.removeEventListener("pagehide", send); }, []);
+  const takeAway = (ids, words, call) => {
+    send();
+    const timer = setTimeout(() => {
+      const focused = document.activeElement === undoButton.current;
+      send();
+      setUndo(null);
+      if (focused) field.current?.focus();
+    }, UNDO_MS);
+    waiting.current = { ids, send: call, timer };
+    setAway((s) => new Set([...s, ...ids]));
+    setUndo({ words, ids });
+  };
+  const putBack = () => {
+    const w = waiting.current;
+    if (!w) return;
+    clearTimeout(w.timer);
+    waiting.current = null;
+    setAway((s) => new Set([...s].filter((id) => !w.ids.includes(id))));
+    setUndo(null);
+    lastRow.current = { id: w.ids[0], index: 0, back: true };
+  };
+  useEffect(() => { if (undo) undoButton.current?.focus(); }, [undo]);
+
   // Keep keyboard focus when the focused row changes state, moves list or goes away.
   useLayoutEffect(() => {
     const last = lastRow.current, active = document.activeElement;
-    if (!last || (active && active !== document.body)) return;
+    if (!last || (!last.back && active && active !== document.body)) return;
+    if (last.back) lastRow.current = { ...last, back: false };
     const rows = [...document.querySelectorAll("[data-job]")];
     const row = rows.find((r) => r.dataset.job === last.id) || rows[Math.min(last.index, rows.length - 1)];
     (row?.querySelector("button") || field.current)?.focus();
-  }, [jobs]);
+  }, [jobs, away]);
   const trackRow = (e) => {
     const li = e.target.closest("[data-job]");
     lastRow.current = li ? { id: li.dataset.job, index: [...document.querySelectorAll("[data-job]")].indexOf(li) } : null;
   };
 
-  const running = jobs.filter((j) => j.state === "running");
+  const shown = jobs.filter((j) => !away.has(j.id));
+  const running = shown.filter((j) => j.state === "running");
   useEffect(() => {
-    document.title = running.length > 1 ? `${running.length} downloading, Spool`
-      : running.length ? `${f.percent(running[0]) ?? 0}% Spool` : "Spool";
+    const pct = running.length === 1 ? f.percent(running[0]) : null;
+    document.title = running.length > 1 || (running.length && pct == null) ? `${running.length} downloading - Spool`
+      : running.length ? `${pct}% - Spool` : unseen ? "Finished - Spool" : "Spool";
   });
 
   // A tab whose token Spool does not know (another machine's link, or a token that changed) can do nothing.
   if (signedOut) return html`
     <main class="signed-out measure">
-      <h1>Spool</h1>
-      <p>This tab isn't signed in to Spool. Run <code>spool</code> in your terminal and it opens the right link.</p>
+      <h1 class="wordmark"><${Reel} />Spool</h1>
+      <p>This tab lost its link to Spool. Run <code>spool</code> in your terminal to open a new one.</p>
     </main>`;
   if (!snap) return html`<p class="connecting">Connecting to Spool…</p>`;
 
-  const ctx = { snap, say, whenUpdated, field, openSettings: (focusFolder) => settings.current.open(focusFolder) };
+  // After an add: rows that were already in the list are scrolled to and tinted; the first add asks about notifications.
+  const added = (res) => {
+    if (canNotify() && !local.get("spool-notify")) setAsk(true);
+    const before = new Set(jobsNow.current.map((j) => j.id));
+    const old = res.jobs.filter((j) => before.has(j.id)).map((j) => j.id);
+    if (old.length) {
+      tint(old);
+      requestAnimationFrame(() => document.querySelector(`[data-job="${old[0]}"]`)?.scrollIntoView({ block: "nearest" }));
+    }
+  };
+  const ctx = {
+    snap, say, whenUpdated, field, connected, takeAway,
+    openSettings: (focusFolder) => settings.current.open(focusFolder),
+  };
+  const notify = {
+    asking: ask && !local.get("spool-notify"),
+    async turnOn() {
+      const answer = await Notification.requestPermission();
+      local.set("spool-notify", answer === "granted" ? "on" : "off");
+      setNotifyPref(local.get("spool-notify"));
+    },
+    turnOff() { local.set("spool-notify", "off"); setNotifyPref("off"); },
+  };
+  const ready = !!snap.engines[snap.settings.engine]?.installed;
   return html`
     <main>
-      <${Deck} ...${ctx} turning=${running.length > 0} />
-      ${!snap.tools.ffmpeg && html`<${FfmpegStrip} ...${ctx} />`}
+      <${Deck} ...${ctx} turning=${running.length > 0} added=${added} notify=${notify} ready=${ready} />
+      <${EngineStrip} snap=${snap} />
+      ${!snap.tools.ffmpeg && html`<${FfmpegStrip} snap=${snap} />`}
       <div class="queue" onfocusin=${trackRow}>
-        <${Queue} ...${ctx} jobs=${jobs} />
+        <${Queue} ...${ctx} jobs=${shown} flash=${flash} ready=${ready} />
       </div>
     </main>
-    <${StatusBar} ...${ctx} connected=${connected} />
-    <${SettingsDialog} snap=${snap} handle=${settings} />
+    ${undo && html`
+      <div class="undo" role="status">
+        <span>${undo.words}</span>
+        <button class="link-button" ref=${undoButton} onClick=${putBack}>Undo</button>
+      </div>`}
+    <${SettingsDialog} snap=${snap} handle=${settings} notify=${notify} />
     <div class="visually-hidden" role="status" aria-live="polite">${said}</div>`;
 }
 
-function Deck({ snap, say, whenUpdated, field, openSettings, turning }) {
+function Deck({ snap, say, whenUpdated, field, openSettings, turning, added, notify, ready }) {
   const [url, setUrl] = useState("");
   const [look, setLook] = useState({ status: "idle" });
   const [preset, setPreset] = useState(snap.settings.preset);
@@ -118,90 +213,114 @@ function Deck({ snap, say, whenUpdated, field, openSettings, turning }) {
   const [trayError, setTrayError] = useState("");
   const [busy, setBusy] = useState(false);
   const handlers = useRef();
+  const lookup = useRef(0); // the newest lookup; an answer to an older one is ignored
+  const chosen = useRef(null); // the quality the preview opened with
+  const held = useRef(null); // text given while Spool is still setting up
+  const noticeTimer = useRef();
+  const tray = useRef();
 
-  const engineName = snap.settings.engine, engine = snap.engines[engineName];
-  const ready = engine.installed;
-  const dest = snap.dest;
+  const tell = (text) => {
+    clearTimeout(noticeTimer.current);
+    setNotice(text);
+    if (text) noticeTimer.current = setTimeout(() => setNotice(""), UNDO_MS);
+  };
 
-  useEffect(() => { if (ready) field.current.focus(); }, [ready]);
-
-  const lookUp = async (link, useEngine) => {
-    setNotice(""); setTrayError("");
-    if (!link.trim()) return setLook({ status: "error", error: { kind: "empty_field" } });
-    setLook({ status: "looking" });
+  const queue = async (entries, usePreset, engine) => {
+    setBusy(true);
     try {
-      const data = await api.probe(link.trim(), useEngine);
-      const ids = data.entries[0].presets.map((p) => p.id);
-      setPreset(ids.includes(snap.settings.preset) ? snap.settings.preset : "best");
+      const res = await api.addJobs(entries, usePreset, engine);
+      const existing = res.existing || 0, fresh = res.jobs.length - existing;
+      setLook({ status: "idle" }); setUrl(""); setTrayError("");
+      field.current.focus();
+      added(res);
+      if (entries.length === 1) tell(existing ? "This one is already in the list." : "");
+      else tell([fresh || !existing ? `Added ${fresh} download${fresh === 1 ? "" : "s"}.` : "",
+        existing ? `${existing} ${existing === 1 ? "was" : "were"} already in the list.` : ""].filter(Boolean).join(" "));
+      return true;
+    } catch (e) {
+      look.status === "preview" ? setTrayError(e.message) : tell(e.message);
+    } finally { setBusy(false); }
+  };
+
+  // Any text: several links are queued at the remembered quality, one is looked up, none goes to the server,
+  // whose answer says why it isn't a link.
+  const lookUp = async (text, quick = false) => {
+    if (!ready) { held.current = { text, quick }; return; }
+    const ls = f.links(text);
+    tell("");
+    if (ls.length > 1) { setUrl(""); return queue(ls.map((u) => ({ url: u })), snap.settings.preset); }
+    const link = ls[0] ?? text.trim();
+    if (ls.length) setUrl(link);
+    const n = ++lookup.current;
+    setLook({ status: "looking" }); setTrayError("");
+    try {
+      const data = await api.probe(link);
+      if (n !== lookup.current) return;
+      const remembered = f.pick(data.entries[0].presets, snap.settings.preset);
+      if (quick && !data.entries.some((e) => e.live)) {
+        setLook({ status: "idle" });
+        return queue(data.entries, remembered, data.engine);
+      }
+      chosen.current = remembered;
+      setPreset(remembered);
       setPicked(new Set(data.entries.map((e, i) => i)));
       setLook({ status: "preview", data });
       say(`Details ready: ${data.title}`);
     } catch (error) {
-      setLook({ status: "error", error, engine: useEngine || engineName, url: link.trim() });
+      if (n === lookup.current) setLook({ status: "error", error, url: link });
     }
   };
+  useEffect(() => {
+    if (ready && held.current) { const h = held.current; held.current = null; lookUp(h.text, h.quick); }
+  }, [ready]);
 
-  const done = (n) => {
-    setLook({ status: "idle" }); setUrl(""); setTrayError("");
-    if (n > 1) setNotice(`Added ${n} downloads.`);
-    field.current.focus();
-  };
-
-  const queue = async (entries, usePreset, useEngine) => {
-    setBusy(true);
-    try {
-      const res = await api.addJobs(entries, usePreset, useEngine);
-      done(res.jobs.length);
-    } catch (e) {
-      look.status === "preview" ? setTrayError(e.message) : setNotice(e.message);
-    } finally { setBusy(false); }
-  };
-
-  const download = () => {
+  const download = async () => {
+    if (look.status !== "preview" || busy) return;
     const { data } = look;
     const entries = data.kind === "playlist" ? data.entries.filter((e, i) => picked.has(i)) : data.entries;
-    queue(entries, preset, data.engine);
+    if (!entries.length || data.entries.some((e) => e.live) || !snap.dest.ok) return;
+    const choice = preset;
+    // Only a quality the person picked becomes the remembered one, not the nearest one Spool fell back to.
+    if (await queue(entries, choice, data.engine) && choice !== chosen.current) api.saveSettings({ preset: choice }).catch(() => {});
   };
+  const close = () => { lookup.current++; setLook({ status: "idle" }); setTrayError(""); field.current.focus(); };
+  const take = (text) => { setUrl(f.links(text)[0] ?? text); lookUp(text); };
+  handlers.current = { take, close, download, lookUp, look };
 
-  // Cmd+Enter (Ctrl+Enter elsewhere): skip the preview and download at the default quality.
-  const quick = () => {
-    if (look.status === "preview") return queue(look.data.entries.filter((e, i) => picked.has(i) || look.data.kind === "video"), snap.settings.preset, look.data.engine);
-    const ls = f.links(url);
-    if (!ls.length) return setLook({ status: "error", error: { kind: url.trim() ? "invalid_link" : "empty_field" } });
-    if (ls.length > 1) return queue(ls.map((u) => ({ url: u })), snap.settings.preset);
-    // One link: read its details first so the row has a title and a live stream is caught, but show no preview.
-    setLook({ status: "looking" });
-    api.probe(ls[0]).then(
-      (data) => { setLook({ status: "idle" }); if (!data.entries.some((e) => e.live)) return queue(data.entries, snap.settings.preset, data.engine); setLook({ status: "preview", data }); },
-      (error) => setLook({ status: "error", error, engine: engineName, url: ls[0] }),
-    );
-  };
-
-  const handleText = (text) => {
-    const ls = f.links(text);
-    if (ls.length > 1) { setUrl(""); queue(ls.map((u) => ({ url: u })), snap.settings.preset); }
-    else if (ls.length === 1) { setUrl(ls[0]); lookUp(ls[0]); }
-    return ls.length > 0;
-  };
-  const close = () => { setLook({ status: "idle" }); setTrayError(""); field.current.focus(); };
-  handlers.current = { handleText, close, open: look.status !== "idle" };
-
-  // Paste or drop a link anywhere on the page.
+  // The preview opens with focus on Download (Enter downloads), scrolled into view on small or zoomed screens.
   useEffect(() => {
+    if (look.status !== "preview") return;
+    const t = tray.current, submit = t.querySelector("button[type=submit]");
+    (submit.disabled ? t.querySelector("input:checked") || t.querySelector("button[type=button]") : submit)?.focus({ preventScroll: true });
+    submit.scrollIntoView({ block: "nearest" });
+  }, [look]);
+
+  useEffect(() => field.current.focus(), []);
+  useEffect(() => api.onLink((text) => { setUrl(f.links(text).join(" ") || text); field.current.focus(); }), []);
+
+  // Paste or drop a link anywhere on the page. Escape cancels a lookup or closes the preview;
+  // Cmd+Enter (Ctrl+Enter elsewhere) downloads the quality selected in the preview.
+  useEffect(() => {
+    const blocked = () => document.querySelector("dialog[open]");
     const onPaste = (e) => {
-      if (isEditable(e.target) && e.target !== field.current) return;
-      if (field.current.disabled) return;
-      if (handlers.current.handleText(e.clipboardData.getData("text"))) e.preventDefault();
+      if (blocked() || (isEditable(e.target) && e.target !== field.current)) return;
+      if (e.target === field.current) return setTimeout(() => handlers.current.lookUp(field.current.value));
+      e.preventDefault();
+      handlers.current.take(e.clipboardData.getData("text"));
     };
     const onDragOver = (e) => e.preventDefault();
     const onDrop = (e) => {
       e.preventDefault();
-      if (!field.current.disabled) handlers.current.handleText(e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text"));
+      if (!blocked()) handlers.current.take(e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text"));
     };
     const onKey = (e) => {
-      if (e.key !== "Escape" || !handlers.current.open) return;
-      if (document.querySelector("dialog[open], :popover-open")) return;
-      handlers.current.close();
+      const { look } = handlers.current;
+      if (blocked() || document.querySelector(":popover-open")) return;
+      if (e.key === "Escape" && look.status !== "idle") return handlers.current.close();
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && look.status === "preview") {
+        e.preventDefault();
+        handlers.current.download();
+      }
     };
     document.addEventListener("paste", onPaste);
     window.addEventListener("dragover", onDragOver);
@@ -218,165 +337,202 @@ function Deck({ snap, say, whenUpdated, field, openSettings, turning }) {
   const onKeyDown = (e) => {
     if (e.key !== "Enter") return;
     if (e.isComposing || e.keyCode === 229) return e.preventDefault(); // Enter that confirms an IME composition
-    if (e.metaKey || e.ctrlKey) { e.preventDefault(); quick(); }
+    if ((e.metaKey || e.ctrlKey) && look.status !== "preview") { e.preventDefault(); lookUp(url, true); }
   };
-  const onSubmit = (e) => {
-    e.preventDefault();
-    const ls = f.links(url);
-    ls.length > 1 ? handleText(url) : lookUp(url);
-  };
+  const onSubmit = (e) => { e.preventDefault(); lookUp(url); };
 
   const changeFolder = async () => {
     if (!snap.tools.can_choose_folder) return openSettings(true);
     try {
       const res = await api.chooseFolder();
       if (res?.path) await api.saveSettings({ dest: res.path });
-    } catch (e) { setNotice(e.message); }
+    } catch (e) { tell(e.message); }
   };
-  const recheck = () => api.saveSettings({ dest: snap.settings.dest }).catch((e) => setNotice(e.message));
+  const recheck = () => api.saveSettings({ dest: snap.settings.dest }).catch((e) => tell(e.message));
+  const showFolder = () => api.revealFolder().catch((e) => tell(e.message));
 
   const err = look.status === "error" ? look.error : null;
   const looking = look.status === "looking";
+  const open = look.status === "preview";
+  const retry = () => lookUp(look.url);
 
   return html`
     <div class="deck">
       <div class="measure">
-        <h1 class="wordmark"><${Reel} turning=${turning} />Spool</h1>
+        <div class="deck-top">
+          <h1 class="wordmark"><${Reel} turning=${turning} />Spool</h1>
+          <button class="quiet on-deck" onClick=${() => openSettings(false)}>Settings</button>
+        </div>
         <form class="link" onSubmit=${onSubmit} novalidate>
           <label for="link">Link to download</label>
           <div class="link-row">
             <input id="link" ref=${field} type="text" inputmode="url" autocomplete="off" spellcheck="false"
-              placeholder="https://" value=${url} disabled=${!ready}
+              placeholder="https://" value=${url}
               aria-invalid=${err ? "true" : undefined} aria-describedby=${err ? "link-error" : "link-help"}
-              onInput=${(e) => setUrl(e.target.value)} onKeyDown=${onKeyDown} />
-            <button class="primary" type="submit" disabled=${!ready || looking}>${looking ? "Looking…" : "Get details"}</button>
+              onInput=${(e) => { setUrl(e.target.value); tell(""); }} onKeyDown=${onKeyDown} />
+            <button class=${open ? "secondary on-deck" : "primary"} type="submit" disabled=${looking}>
+              ${looking ? "Getting details…" : "Get details"}</button>
           </div>
         </form>
-        ${!ready ? html`<${EngineInstall} engine=${engine} name=${engineName} />`
-          : err ? html`<${ProbeError} error=${err} look=${look} snap=${snap} whenUpdated=${whenUpdated} lookUp=${lookUp} />`
-          : html`<p id="link-help" class="help">Enter looks it up. ${snap.tools.platform === "darwin" ? "Cmd" : "Ctrl"}+Enter downloads at ${f.presetName(snap.settings.preset)}.</p>`}
+        ${err ? html`
+          <div class="deck-message" role="alert">
+            <p id="link-error"><${Icon} d=${ICONS.alert} />${err.message}</p>
+            <${Fix} hint=${err.hint} snap=${snap} engine=${snap.settings.engine} retry=${retry} whenUpdated=${whenUpdated}
+              changeFolder=${changeFolder} cls="secondary on-deck" />
+          </div>`
+          : html`<p id="link-help" class="help">Enter gets the details. ${modKey(snap.tools.platform)}+Enter downloads at ${f.presetName(snap.settings.preset)}.</p>`}
         <p class="notice" role="status">${notice}</p>
-        <${Destination} dest=${dest} change=${changeFolder} recheck=${recheck} />
-        ${looking && html`<div class="tray skeleton" aria-hidden="true"><div class="thumb" /><div class="lines"><div /><div /><div /></div></div>`}
-        ${look.status === "preview" && html`<${Tray} data=${look.data} preset=${preset} setPreset=${setPreset}
-          picked=${picked} setPicked=${setPicked} dest=${dest} busy=${busy} error=${trayError}
+        ${notify.asking && html`
+          <div class="ask">
+            <p>Get a notification when downloads finish.</p>
+            <button class="secondary on-deck" onClick=${notify.turnOn}>Turn on</button>
+            <button class="quiet on-deck" onClick=${notify.turnOff}>No thanks</button>
+          </div>`}
+        <${Destination} dest=${snap.dest} change=${changeFolder} recheck=${recheck} show=${showFolder} />
+        ${looking && html`<div class="tray skeleton" aria-hidden="true">
+          <div class="tray-head"><div class="thumb" /><div class="lines"><div /><div /></div></div>
+          <div class="tiles"><div /><div /><div /><div /></div><div class="bar" /></div>`}
+        ${open && html`<${Tray} data=${look.data} preset=${preset} setPreset=${setPreset} trayRef=${tray}
+          picked=${picked} setPicked=${setPicked} dest=${snap.dest} busy=${busy} error=${trayError}
           download=${download} close=${close} />`}
       </div>
     </div>`;
 }
 
-function EngineInstall({ engine, name }) {
-  if (engine.error && !engine.busy) return html`
-    <div id="link-help" class="deck-message" role="alert">
-      <p><${Icon} d=${ICONS.alert} />${f.plain(engine.error)}</p>
-      <button class="secondary on-deck" onClick=${() => api.updateEngine(name).catch(() => {})}>Try again</button>
-    </div>`;
-  return html`<p id="link-help" class="help" role="status">Setting up Spool. This takes a few seconds.</p>`;
+// The fix button chosen by the server's hint. A null or unknown hint has none.
+function Fix({ hint, snap, engine, retry, whenUpdated, changeFolder, cls }) {
+  const busy = snap.engines[engine]?.busy;
+  if (hint === "retry") return html`<button class=${cls} onClick=${retry}>Try again</button>`;
+  if (hint === "resume") return html`<button class=${cls} onClick=${retry}>Resume</button>`;
+  if (hint === "update_engine") return html`<button class=${cls} disabled=${!!busy} onClick=${() => whenUpdated(engine, retry)}>
+    ${busy ? "Updating…" : "Update and try again"}</button>`;
+  if (hint === "check_dest") return html`<button class=${cls} onClick=${changeFolder}>Change folder</button>`;
+  if (hint === "install_ffmpeg") return html`<${CopyCommand} command=${f.ffmpegCommand(snap.tools.platform)} cls=${cls} />`;
+  return null;
 }
 
-function ProbeError({ error, look, snap, whenUpdated, lookUp }) {
-  if (error.kind === "empty_field") return html`<p id="link-error" class="deck-message" role="alert"><${Icon} d=${ICONS.alert} />Paste a link first.</p>`;
-  const [message, fix, other] = f.failure(error, { engine: look.engine, dest: snap.settings.dest, newer: newerEngine(snap, look.engine), probe: true });
-  const busy = snap.engines[look.engine]?.busy;
-  const button = {
-    update_engine: [busy ? "Updating…" : "Update and retry", () => whenUpdated(look.engine, () => lookUp(look.url, look.engine))],
-    try_other_engine: [f.tryOther(other), () => lookUp(look.url, other)],
-    retry: ["Retry", () => lookUp(look.url, look.engine)],
-  }[fix];
-  return html`
-    <div id="link-error" class="deck-message" role="alert">
-      <p><${Icon} d=${ICONS.alert} />${message}</p>
-      ${button && html`<button class="secondary on-deck" disabled=${!!busy} onClick=${button[1]}>${button[0]}</button>`}
-      ${fix === "install_js_runtime" && html`<${CopyCommand} command=${f.installCommand("deno", snap.tools.platform)} label="Copy install command" cls="secondary on-deck" />`}
-    </div>`;
-}
-
-function Destination({ dest, change, recheck }) {
+function Destination({ dest, change, recheck, show }) {
   if (!dest.ok) return html`
-    <div class="dest problem" id="dest-problem" role="alert">
-      <p><${Icon} d=${ICONS.alert} />${f.destProblem(dest)}</p>
+    <div class="dest problem" role="alert">
+      <p id="dest-problem"><${Icon} d=${ICONS.alert} />${dest.message}</p>
       <span class="dest-actions">
         <button class="secondary on-deck" onClick=${recheck}>Try again</button>
         <button class="secondary on-deck" onClick=${change}>Change folder</button>
       </span>
     </div>`;
   return html`
-    <div class="dest">
-      <p><span><span class="dim">Saving to</span> <span class="dest-name" title=${dest.path}>${dest.display}</span></span>
-        ${dest.free_bytes != null && html`<span class="dim free num">${f.bytes(dest.free_bytes)} free</span>`}</p>
-      <button class="link-button" onClick=${change}>Change folder</button>
-    </div>`;
+    <p class="dest">
+      <span class="dim">Saving to</span>
+      <button class="dest-name" title=${dest.path} onClick=${show}><${Icon} d=${ICONS.folder} />${dest.display}</button>
+      ${dest.free_bytes != null && html`<span class="dim free num">${f.bytes(dest.free_bytes)} free</span>`}
+      <button class="link-button" onClick=${change}>Change</button>
+    </p>`;
 }
 
-function Tray({ data, preset, setPreset, picked, setPicked, dest, busy, error, download, close }) {
+function Tray({ data, preset, setPreset, picked, setPicked, dest, busy, error, download, close, trayRef }) {
   const playlist = data.kind === "playlist";
   const first = data.entries[0];
   const live = !playlist && first.live;
-  const n = playlist ? picked.size : 1;
+  const n = playlist ? picked.size : 1, total = data.entries.length;
+  const [shown, more] = f.split(first.presets);
+  const [opened, setOpened] = useState(more.some((p) => p.id === preset));
   const need = first.presets.find((p) => p.id === preset)?.size;
   const tight = !live && dest.ok && need != null && dest.free_bytes != null && need > dest.free_bytes;
   const why = live ? "live-note" : !dest.ok ? "dest-problem" : tight ? "space-note" : undefined;
+  const all = useRef();
+  useEffect(() => { if (all.current) all.current.indeterminate = n > 0 && n < total; });
   // Picked by position: the entries of one multi-file item can all share a URL.
   const toggle = (i) => { const s = new Set(picked); s.has(i) ? s.delete(i) : s.add(i); setPicked(s); };
+  const tile = (p) => html`
+    <label class="tile" key=${p.id}>
+      <input type="radio" name="quality" value=${p.id} checked=${preset === p.id} onChange=${() => setPreset(p.id)} />
+      <span class="tile-label">${p.label}${p.detail && html` <span class="detail">${p.detail}</span>`}</span>
+      ${!playlist && html`<span class="tile-size num">${p.size != null ? f.bytes(p.size) : "Size unknown"}</span>`}
+    </label>`;
 
   return html`
-    <section class="tray" aria-labelledby="tray-title">
-      <div class="tray-head">
-        ${!playlist && first.thumbnail && html`<img class="thumb" src=${first.thumbnail} alt="" width="160" height="90" />`}
-        <div class="tray-title">
-          <h2 id="tray-title" class="clamp" title=${data.title}>${data.title}</h2>
-          <p class="dim">
-            ${playlist ? html`<span>${n} of ${data.entries.length} selected</span>`
-              : html`${first.uploader && html`<span>${first.uploader}</span>`} <span class="num">${f.duration(first.duration)}</span>`}
-          </p>
-        </div>
-      </div>
-      ${playlist && html`
-        <div class="picks">
-          <div class="pick-actions">
-            <button class="secondary" onClick=${() => setPicked(new Set(data.entries.map((e, i) => i)))}>Select all</button>
-            <button class="secondary" onClick=${() => setPicked(new Set())}>Select none</button>
+    <section class="tray" aria-labelledby="tray-title" ref=${trayRef}>
+      <form onSubmit=${(e) => { e.preventDefault(); download(); }} novalidate>
+        <div class="tray-head">
+          ${!playlist && first.thumbnail && html`<img class="thumb" src=${first.thumbnail} alt="" width="160" height="90" />`}
+          <div class="tray-title">
+            <h2 id="tray-title" class="clamp" dir="auto" title=${data.title}>${data.title}</h2>
+            <p class="dim">
+              ${playlist ? html`<span class="num">${total} videos</span>`
+                : html`${first.uploader && html`<span dir="auto">${first.uploader}</span>`} <span class="num">${f.duration(first.duration)}</span>`}
+            </p>
           </div>
-          <ul class="checklist" aria-label="Videos in ${data.title}">
-            ${data.entries.map((e, i) => html`
-              <li key=${i}><label>
-                <input type="checkbox" checked=${picked.has(i)} onChange=${() => toggle(i)} />
-                <span class="clamp" title=${e.title}>${e.title}</span>
-                <span class="dim num">${f.duration(e.duration)}</span>
-              </label></li>`)}
-          </ul>
-        </div>`}
-      ${live ? html`<p id="live-note" class="note"><${Icon} d=${ICONS.wait} />This is live now. Download it after it ends.</p>`
-        : html`
-        <fieldset class="quality">
-          <legend>Quality</legend>
-          ${first.presets.map((p) => html`
-            <label key=${p.id}>
-              <input type="radio" name="quality" value=${p.id} checked=${preset === p.id} onChange=${() => setPreset(p.id)} />
-              ${p.label}${p.size != null && html` <span class="dim num">${f.bytes(p.size)}</span>`}
-            </label>`)}
-        </fieldset>`}
-      ${tight && html`<p id="space-note" class="note" role="status"><${Icon} d=${ICONS.alert} />This needs about ${f.bytes(need)}. ${dest.display} has ${f.bytes(dest.free_bytes)} free.</p>`}
-      ${error && html`<p class="tray-error" role="alert"><${Icon} d=${ICONS.alert} />${error}</p>`}
-      <div class="tray-actions">
-        <button class="primary" onClick=${download} disabled=${live || !dest.ok || busy || n === 0}
-          aria-describedby=${why}>${playlist ? `Download ${n}` : "Download"}</button>
-        <button class="secondary" onClick=${close}>Close</button>
-      </div>
+        </div>
+        ${playlist && html`
+          <div class="picks">
+            <label class="select-all">
+              <input type="checkbox" ref=${all} checked=${n === total}
+                onChange=${() => setPicked(n === total ? new Set() : new Set(data.entries.map((e, i) => i)))} />
+              Select all <span class="dim num">${n} of ${total}</span>
+            </label>
+            <ul class="checklist" aria-label="Videos in ${data.title}">
+              ${data.entries.map((e, i) => html`
+                <li key=${i}><label>
+                  <input type="checkbox" checked=${picked.has(i)} onChange=${() => toggle(i)} />
+                  <span class="clamp" dir="auto" title=${e.title}>${e.title}</span>
+                  <span class="dim num">${f.duration(e.duration)}</span>
+                </label></li>`)}
+            </ul>
+          </div>`}
+        ${live ? html`<p id="live-note" class="note"><${Icon} d=${ICONS.wait} />This is live now. Download it after it ends.</p>`
+          : html`
+          <fieldset class="quality">
+            <legend>Quality</legend>
+            <div class="tiles">
+              ${shown.map(tile)}
+              ${opened && more.map(tile)}
+            </div>
+            ${more.length > 0 && !opened && html`
+              <button type="button" class="quiet more" aria-expanded="false" onClick=${() => setOpened(true)}>More qualities</button>`}
+          </fieldset>`}
+        ${tight && html`<p id="space-note" class="note" role="status"><${Icon} d=${ICONS.alert} />This needs about ${f.bytes(need)}. ${dest.display} has ${f.bytes(dest.free_bytes)} free.</p>`}
+        ${error && html`<p class="tray-error" role="alert"><${Icon} d=${ICONS.alert} />${error}</p>`}
+        <div class="tray-actions">
+          <button class="primary" type="submit" disabled=${live || !dest.ok || busy || n === 0}
+            aria-describedby=${why}>${playlist ? `Download ${n}` : "Download"}</button>
+          <button class="secondary" type="button" onClick=${close}>Close</button>
+        </div>
+      </form>
     </section>`;
 }
 
-function FfmpegStrip({ snap }) {
-  return html`
-    <aside class="strip" aria-label="Missing tool">
+function EngineStrip({ snap }) {
+  const broken = Object.entries(snap.engines).filter(([, e]) => e.error && !e.busy);
+  const js = snap.tools.js_setup; // Spool fetching YouTube's free helper itself: null, "installing" or "failed"
+  if (!broken.length && js) return html`
+    <aside class="strip" aria-label="Engine">
       <div class="measure">
-        <p><${Icon} d=${ICONS.alert} />Higher qualities need one more tool, ffmpeg.</p>
-        <${CopyCommand} command=${f.installCommand("ffmpeg", snap.tools.platform)} />
+        ${js === "failed" ? html`<p role="alert"><${Icon} d=${ICONS.alert} />Spool couldn't set up what it needs for YouTube. Check your internet connection.</p>`
+          : html`<p role="status">Spool is setting up what it needs for YouTube.</p>`}
+      </div>
+    </aside>`;
+  if (!broken.length) return null;
+  const setUp = broken.some(([, e]) => !e.installed);
+  return html`
+    <aside class="strip" aria-label="Engine">
+      <div class="measure">
+        <p role="alert"><${Icon} d=${ICONS.alert} />${setUp ? "Spool couldn't set up its engine." : "Spool couldn't update its engine."}</p>
+        <button class="secondary" onClick=${() => broken.forEach(([name]) => api.updateEngine(name).catch(() => {}))}>Try again</button>
       </div>
     </aside>`;
 }
 
-function CopyCommand({ command, label = "Copy", cls = "secondary" }) {
+function FfmpegStrip({ snap }) {
+  return html`
+    <aside class="strip" aria-label="Free helper">
+      <div class="measure">
+        <p>The top qualities and MP3 need a free helper. Run this in your terminal:</p>
+        <${CopyCommand} command=${f.ffmpegCommand(snap.tools.platform)} />
+      </div>
+    </aside>`;
+}
+
+function CopyCommand({ command, cls = "secondary" }) {
   const [copied, setCopied] = useState(false);
   const copy = async () => {
     await navigator.clipboard.writeText(command);
@@ -384,49 +540,74 @@ function CopyCommand({ command, label = "Copy", cls = "secondary" }) {
     setTimeout(() => setCopied(false), 2000);
   };
   return html`<span class="command"><code>${command}</code>
-    <button class=${cls} onClick=${copy}>${copied ? "Copied" : label}</button></span>`;
+    <button class=${cls} onClick=${copy}>${copied ? "Copied" : "Copy command"}</button></span>`;
 }
 
-const GROUPS = [
-  ["Downloading", (j) => j.state === "running" || j.state === "queued"],
-  ["Stopped", (j) => j.state === "failed" || j.state === "cancelled"],
-  ["Finished", (j) => j.state === "done"],
-];
+const canResume = (j) => j.state === "cancelled" || (j.state === "failed" && j.error?.hint === "resume");
+// Running, then waiting in the order they will start; the server lists newest first.
+const downloading = (jobs) => [...jobs.filter((j) => j.state === "running"), ...jobs.filter((j) => j.state === "queued").reverse()];
 
-function Queue({ jobs, ...ctx }) {
-  if (!jobs.length) return html`<p class="empty">Nothing here yet. Paste a link above.</p>`;
-  return GROUPS.map(([name, test]) => {
-    const list = jobs.filter(test);
-    return list.length > 0 && html`
-      <section class="group" aria-labelledby="group-${name}" key=${name}>
-        <h2 id="group-${name}">${name}</h2>
-        <ul>${list.map((j) => html`<${Row} key=${j.id} job=${j} ...${ctx} />`)}</ul>
-      </section>`;
-  });
+function Queue({ jobs, flash, ready, ...ctx }) {
+  const [all, setAll] = useState(false);
+  if (!jobs.length) return ready
+    ? html`<div class="empty"><p>Downloads show up here. Paste a link above to start.</p>
+        <p class="dim">Works with YouTube, Vimeo and over a thousand other sites.</p></div>`
+    : html`<p class="empty" role="status">Setting up Spool. This takes a few seconds.</p>`;
+  const row = (j) => html`<${Row} key=${j.id} job=${j} flash=${flash.has(j.id)} ...${ctx} />`;
+  const stopped = jobs.filter((j) => j.state === "failed" || j.state === "cancelled");
+  const finished = jobs.filter((j) => j.state === "done");
+  const resumable = stopped.filter(canResume);
+  // A finished row that was tinted (already in the list) must be on screen.
+  const many = all || finished.slice(SHOWN).some((j) => flash.has(j.id));
+  const active = downloading(jobs);
+  return html`
+    ${active.length > 0 && html`
+      <section class="group" aria-labelledby="group-downloading">
+        <div class="group-head"><h2 id="group-downloading">Downloading</h2></div>
+        <ul>${active.map(row)}</ul>
+      </section>`}
+    ${stopped.length > 0 && html`
+      <section class="group" aria-labelledby="group-stopped">
+        <div class="group-head"><h2 id="group-stopped">Stopped</h2>
+          ${resumable.length > 1 && html`<button class="quiet" onClick=${() => resumable.forEach((j) => api.retry(j.id).catch((e) => ctx.say(e.message)))}>Resume all</button>`}
+        </div>
+        <ul>${stopped.map(row)}</ul>
+      </section>`}
+    ${finished.length > 0 && html`
+      <section class="group" aria-labelledby="group-finished">
+        <div class="group-head"><h2 id="group-finished">Finished</h2>
+          <button class="quiet" onClick=${() => ctx.takeAway(finished.map((j) => j.id), `Cleared ${finished.length}.`, api.clearFinished)}>Clear list</button>
+        </div>
+        <ul>${(many ? finished : finished.slice(0, SHOWN)).map(row)}</ul>
+        ${!many && finished.length > SHOWN && html`<button class="quiet show-all" onClick=${() => setAll(true)}>Show all ${finished.length}</button>`}
+      </section>`}`;
 }
 
-function Row({ job, snap, say, whenUpdated, openSettings }) {
+function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, takeAway }) {
   const [logText, setLogText] = useState(null);
-  const [gone, setGone] = useState(false);
+  const [gone, setGone] = useState(null);
   const act = (fn) => fn().catch((e) => say(e.message));
   const tid = `title-${job.id}`; // each row button is described by its row's title, so "Cancel" says which one
-  const title = html`<h3 class="title clamp" id=${tid} title=${job.title || job.url}>${job.title || job.url}</h3>`;
-  const remove = html`<button class="quiet" aria-describedby=${tid} onClick=${() => act(() => api.remove(job.id))}>Remove</button>`;
+  const title = html`<h3 class="title clamp" id=${tid} dir="auto" title=${job.title || job.url}>${job.title || job.url}</h3>`;
+  const removeIt = () => takeAway([job.id], "Removed.", () => api.remove(job.id));
+  const remove = html`<button class="quiet" aria-describedby=${tid} onClick=${removeIt}>Remove from list</button>`;
+  const cls = `row ${flash ? "flash" : ""}`;
 
   if (job.state === "running" || job.state === "queued") {
     const pct = f.percent(job);
     const running = job.state === "running";
     return html`
-      <li class="row active" data-job=${job.id}>
-        <div class="counter num" aria-hidden="true">${running ? pct ?? 0 : ""}<span>${running ? "%" : ""}</span></div>
+      <li class="${cls} active" data-job=${job.id}>
+        <div class="counter num" aria-hidden="true">${running && pct != null ? html`${pct}<span>%</span>` : ""}</div>
         <div class="body">
           ${title}
-          ${running && (pct == null || job.stage === "processing"
+          ${running && (pct == null
             ? html`<progress key="busy" aria-label="Progress of ${job.title}" />`
             : html`<progress key="pct" value=${pct} max="100" aria-label="Progress of ${job.title}" />`)}
           <p class="meta dim">
             ${running ? html`<span>${f.stageWords(job)}</span>
-              ${job.stage === "downloading" && html`<span class="num">${f.speed(job.speed)}</span><span class="num">${f.timeLeft(job.eta)}</span>`}`
+              ${!connected ? html`<span class="reconnecting">Reconnecting…</span>`
+                : job.stage === "downloading" && html`<span class="num">${f.speed(job.speed)}</span><span class="num">${f.timeLeft(job.eta)}</span>`}`
               : html`<span><${Icon} d=${ICONS.wait} />Waiting</span>`}
           </p>
         </div>
@@ -436,7 +617,7 @@ function Row({ job, snap, say, whenUpdated, openSettings }) {
 
   if (job.state === "done") {
     const show = async () => {
-      try { await api.reveal(job.id); } catch (e) { e.status === 410 ? setGone(true) : say(e.message); }
+      try { await api.reveal(job.id); } catch (e) { e.status === 410 ? setGone(e.message) : say(e.message); }
     };
     const menuId = `menu-${job.id}`;
     const place = (e) => {
@@ -446,64 +627,57 @@ function Row({ job, snap, say, whenUpdated, openSettings }) {
       e.target.style.left = `${Math.max(8, r.right - e.target.offsetWidth)}px`;
     };
     return html`
-      <li class="row done" data-job=${job.id}>
+      <li class="${cls} done" data-job=${job.id}>
         ${job.thumbnail ? html`<img class="thumb small" src=${job.thumbnail} alt="" width="64" height="36" loading="lazy" />` : html`<div class="thumb small" />`}
         <div class="body">
           ${title}
-          <p class="meta dim"><span><${Icon} d=${ICONS.check} />Done</span><span class="num">${f.bytes(job.size)}</span>
+          <p class="meta dim"><span>${f.presetName(job.preset)}</span><span class="num">${f.bytes(job.size)}</span>
             ${job.dest && job.dest !== snap.settings.dest && html`<span class="folder" title=${job.dest}><${Icon} d=${ICONS.folder} /><span class="visually-hidden">In </span>${f.folderName(job.dest)}</span>`}</p>
+          ${gone && html`<p class="dim moved">${gone}</p>`}
         </div>
         <div class="actions">
           ${job.file_exists && !gone ? html`<button class="secondary" aria-describedby=${tid} onClick=${show}>${revealWord(snap.tools.platform)}</button>`
-            : html`<span class="dim moved">File moved or deleted</span>`}
+            : !gone && html`<span class="dim moved">File moved or deleted</span>`}
           <button class="icon-button" popovertarget=${menuId} aria-label="More actions for ${job.title}" title="More actions">
             <${Icon} d=${ICONS.more} cls="bold" /></button>
           <div class="menu" id=${menuId} popover="auto" onToggle=${place}>
             <button onClick=${() => act(() => api.retry(job.id))}>Download again</button>
-            <button onClick=${() => act(() => api.remove(job.id))}>Remove from list</button>
+            <button onClick=${removeIt}>Remove from list</button>
           </div>
         </div>
       </li>`;
   }
 
   if (job.state === "cancelled") return html`
-    <li class="row stopped" data-job=${job.id}>
+    <li class="${cls} stopped" data-job=${job.id}>
       <div class="state-icon"><${Icon} d=${ICONS.stop} /></div>
-      <div class="body">${title}<p class="meta dim"><span>Cancelled</span></p></div>
-      <div class="actions">
-        <button class="secondary" aria-describedby=${tid} onClick=${() => act(() => api.retry(job.id))}>Resume</button>${remove}
+      <div class="body">${title}<p class="meta dim"><span>Cancelled</span></p>
+        <div class="row-actions">
+          <button class="fill" aria-describedby=${tid} onClick=${() => act(() => api.retry(job.id))}>Resume</button>${remove}
+        </div>
       </div>
     </li>`;
 
-  // Failed.
-  const error = job.error || { kind: "engine" };
-  const newer = newerEngine(snap, job.engine);
-  const [message, kindFix, other] = f.failure(error, { engine: job.engine, dest: job.dest, newer });
-  // The server's hint wins, except that updating is only offered when a newer engine exists.
-  const fix = error.hint === "update_engine" && !newer ? kindFix : error.hint || kindFix;
-  const live = error.kind === "live";
+  // Failed: the server's sentence, and the button its hint names.
+  const error = job.error || {};
   const showLog = async () => {
     if (logText != null) return setLogText(null);
     try { setLogText(await api.log(job.id)); } catch (e) { say(e.message); }
   };
-  const fixButton = {
-    update_engine: ["Update and retry", () => whenUpdated(job.engine, () => act(() => api.retry(job.id)))],
-    try_other_engine: [f.tryOther(other), () => act(() => api.retry(job.id, other))],
-    check_dest: ["Change folder", () => openSettings(true)],
-  }[fix];
-  const copyFix = { install_ffmpeg: "ffmpeg", install_js_runtime: "deno" }[fix];
+  const retry = () => act(() => api.retry(job.id));
   return html`
-    <li class="row stopped failed" data-job=${job.id}>
+    <li class="${cls} stopped failed" data-job=${job.id}>
       <div class="state-icon danger"><${Icon} d=${ICONS.alert} /></div>
       <div class="body">
         ${title}
-        <p class="failure"><span class="visually-hidden">Failed: </span>${message}</p>
+        <p class="failure"><span class="visually-hidden">Stopped: </span>${error.message}</p>
         <div class="row-actions">
-          ${fixButton && html`<button class="fill" aria-describedby=${tid} onClick=${fixButton[1]}>${fixButton[0]}</button>`}
-          ${copyFix && html`<${CopyCommand} command=${f.installCommand(copyFix, snap.tools.platform)} label="Copy install command" cls="fill" />`}
-          ${!live && html`<button class=${fixButton || copyFix ? "secondary" : "fill"} aria-describedby=${tid} onClick=${() => act(() => api.retry(job.id))}>${error.kind === "interrupted" ? "Resume" : "Retry"}</button>
-          <button class="quiet" aria-describedby=${tid} aria-expanded=${logText != null ? "true" : "false"} aria-controls="log-${job.id}" onClick=${showLog}>
-            ${logText != null ? "Hide log" : "Show log"}</button>`}
+          ${error.hint === "show_log" ? html`
+            <button class="fill" aria-describedby=${tid} onClick=${retry}>Try again</button>
+            <button class="secondary" aria-describedby=${tid} aria-expanded=${logText != null ? "true" : "false"} aria-controls="log-${job.id}" onClick=${showLog}>
+              ${logText != null ? "Hide log" : "Show log"}</button>`
+            : html`<${Fix} hint=${error.hint} snap=${snap} engine=${job.engine} retry=${retry} whenUpdated=${whenUpdated}
+                changeFolder=${() => openSettings(true)} cls="fill" />`}
           ${remove}
         </div>
         ${logText != null && html`<pre class="log" id="log-${job.id}" tabindex="0" role="region" aria-label="Download log">${logText || "The log is empty."}</pre>`}
@@ -511,37 +685,12 @@ function Row({ job, snap, say, whenUpdated, openSettings }) {
     </li>`;
 }
 
-function StatusBar({ snap, connected, openSettings }) {
-  const name = snap.settings.engine;
-  return html`
-    <footer class="status">
-      <div class="status-inner">
-        <span><${EngineUpdate} name=${name} engine=${snap.engines[name]} bar=${true} /></span>
-        ${!connected && html`<span class="reconnecting" role="status">Reconnecting…</span>`}
-        <button class="link-button settings-button" onClick=${() => openSettings(false)}>Settings</button>
-      </div>
-    </footer>`;
-}
-
-// The update control for one engine: in the status bar for the engine in use, and in Settings for each.
-function EngineUpdate({ name, engine, bar = false }) {
-  const update = () => api.updateEngine(name).catch(() => {});
-  const which = html`<span class="visually-hidden"> ${f.engineName(name)} engine</span>`;
-  if (engine.busy === "updating") return html`<span>Updating…</span>`;
-  if (engine.busy === "installing" || (!engine.installed && !engine.error)) return html`<span>Setting up…</span>`;
-  if (engine.error) return html`<span class="danger-text">${engine.installed ? "Update failed" : "Setup failed"}</span>
-    <button class="link-button" onClick=${update}>Try again${!bar && which}</button>`;
-  if (engine.latest && engine.latest !== engine.version) return html`<button class="link-button" onClick=${update}>${bar ? "Update available" : html`Update${which}`}</button>`;
-  return html`<span>${engine.latest ? "Up to date" : ""}</span>`;
-}
-
-const PRESETS = ["best", "2160", "1440", "1080", "720", "480", "360", "240", "audio", "mp3"];
-
 // handle.current.open(focusFolder) lets "Change folder" land on the folder field.
-function SettingsDialog({ snap, handle }) {
+function SettingsDialog({ snap, handle, notify }) {
   const dialog = useRef(), folder = useRef();
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
+  const [checking, setChecking] = useState(false);
   handle.current = {
     open(focusFolder) {
       setDraft(snap.settings.dest); setError("");
@@ -550,46 +699,52 @@ function SettingsDialog({ snap, handle }) {
     },
   };
   const save = (changes) => api.saveSettings(changes).then(() => setError("")).catch((e) => setError(e.message));
+  // The folder saves when the field loses focus, on Enter and on Done; unchanged text is not sent again.
+  const saveFolder = () => { const d = draft.trim(); if (d && d !== snap.settings.dest) save({ dest: d }); };
   const choose = async () => {
     try { const res = await api.chooseFolder(); if (res?.path) { setDraft(res.path); save({ dest: res.path }); } }
     catch (e) { setError(e.message); }
   };
-  const onSubmit = (e) => { e.preventDefault(); save({ dest: draft.trim() }); };
-  const presets = PRESETS.filter((p) => p !== "mp3" || snap.tools.ffmpeg);
-  const missing = [!snap.tools.ffmpeg && "ffmpeg", !snap.tools.js_runtime && "deno"].filter(Boolean);
+  const busy = Object.values(snap.engines).some((e) => e.busy);
+  const check = () => {
+    setChecking(true);
+    Object.entries(snap.engines).forEach(([name, e]) => e.installed && api.updateEngine(name).catch(() => {}));
+  };
+  const engineError = Object.values(snap.engines).some((e) => e.error);
+  const bookmark = `javascript:void(window.open(${JSON.stringify(`${location.origin}/#url=`)}+encodeURIComponent(location.href),"spool"))`;
+  const on = notifying();
 
   return html`
-    <dialog class="settings" ref=${dialog} aria-labelledby="settings-title">
+    <dialog class="settings" ref=${dialog} aria-labelledby="settings-title" onClose=${saveFolder}>
       <h2 id="settings-title">Settings</h2>
-      <fieldset>
-        <legend>Engine</legend>
-        ${Object.entries(snap.engines).map(([name, e]) => html`
-          <div class="engine-choice" key=${name}>
-            <label><input type="radio" name="engine" value=${name} checked=${snap.settings.engine === name}
-              disabled=${!e.installed} onChange=${() => save({ engine: name })} />
-              <strong>${f.engineName(name)}</strong> <span class="dim num">${e.version || ""}</span></label>
-            <span class="dim"><${EngineUpdate} name=${name} engine=${e} /></span>
-          </div>`)}
-        <p class="dim helper">If a link fails on one, the other may work.</p>
-      </fieldset>
-      <label class="stack">Default quality
-        <select value=${snap.settings.preset} onChange=${(e) => save({ preset: e.target.value })}>
-          ${presets.map((p) => html`<option value=${p}>${f.presetName(p)}</option>`)}
-        </select>
-      </label>
-      <form class="stack" onSubmit=${onSubmit} novalidate>
+      <form class="stack" onSubmit=${(e) => { e.preventDefault(); saveFolder(); }} novalidate>
         <label for="folder">Folder</label>
         <div class="folder-row">
           <input id="folder" ref=${folder} type="text" spellcheck="false" autocomplete="off" value=${draft}
-            aria-describedby="folder-state" onInput=${(e) => setDraft(e.target.value)} />
+            aria-describedby="folder-state" onInput=${(e) => setDraft(e.target.value)} onBlur=${saveFolder} />
           ${snap.tools.can_choose_folder && html`<button type="button" class="secondary" onClick=${choose}>Choose…</button>`}
-          <button type="submit" class="secondary">Save folder</button>
         </div>
         <p id="folder-state" class=${snap.dest.ok && !error ? "dim" : "danger-text"} role="status" title=${snap.dest.path}>
-          ${error || (snap.dest.ok ? `${snap.dest.display}, ${f.bytes(snap.dest.free_bytes)} free` : f.destProblem(snap.dest))}</p>
+          ${error || (snap.dest.ok ? `${snap.dest.display}, ${f.bytes(snap.dest.free_bytes)} free` : snap.dest.message)}</p>
+        ${!error && snap.dest.problem === "missing" && html`
+          <button type="button" class="secondary create" onClick=${() => save({ dest: snap.settings.dest, create: true })}>Create this folder</button>`}
       </form>
-      ${missing.length > 0 && html`<p class="tools dim">Missing tools: ${missing.join(", ")}.</p>`}
-      <div class="dialog-actions"><button class="primary" onClick=${() => dialog.current.close()}>Done</button></div>
+      ${canNotify() && html`
+        <label class="switch">
+          <input type="checkbox" checked=${on} onChange=${() => (on ? notify.turnOff() : notify.turnOn())} />
+          Get a notification when downloads finish
+        </label>`}
+      <div class="stack bookmark">
+        <p>Save from any page. Drag this to your bookmarks bar:</p>
+        <p><a class="bookmarklet" href=${bookmark} onClick=${(e) => e.preventDefault()}>Save with Spool</a></p>
+      </div>
+      <p class="version dim">
+        <span>Spool ${snap.version || ""}</span>
+        ${busy ? html`<span role="status">Checking…</span>`
+          : checking && !engineError ? html`<span role="status">Up to date</span>`
+          : html`<button class="link-button" onClick=${check}>Check for updates</button>`}
+      </p>
+      <div class="dialog-actions"><button class="secondary" onClick=${() => dialog.current.close()}>Done</button></div>
     </dialog>`;
 }
 

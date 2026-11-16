@@ -35,73 +35,55 @@ export function presetName(id) {
 const AUDIO = new Set(["audio", "mp3"]);
 
 export function stageWords(job) {
-  if (job.stage === "starting" || !job.stage) return "Starting";
-  if (job.stage === "processing") return job.preset === "mp3" ? "Converting to MP3" : "Joining video and sound";
-  return AUDIO.has(job.preset) || job.part > 1 ? "Downloading sound" : "Downloading video";
+  if (job.stage === "processing") return job.preset === "mp3" ? "Converting to MP3" : job.part > 1 ? "Joining video and audio" : "Finishing";
+  if (job.stage === "downloading") return job.what === "audio" || AUDIO.has(job.preset) ? "Downloading audio" : "Downloading video";
+  return "Starting";
 }
 
-export function percent(job) {
-  return job.total ? Math.min(100, Math.floor((100 * (job.downloaded || 0)) / job.total)) : null;
-}
-
-export const otherEngine = (name) => (name === "yt-dlp" ? "youtube-dl" : "yt-dlp");
-
-// The engine ids stay in the API; people see only these names, and only where they choose between them.
-export const ENGINE_NAMES = { "yt-dlp": "Main", "youtube-dl": "Backup" };
-export const engineName = (id) => ENGINE_NAMES[id] || "Main";
-export const tryOther = (other) => (other === "youtube-dl" ? "Try the backup engine" : "Try the main engine");
-// Server and engine messages can name the program underneath; the page never does.
-export const plain = (text = "") => text.replace(/\b(yt[-_]dlp|youtube[-_]dl)\b/gi, "the engine");
-
-// Failure wording by error kind (design brief, "Words"). Returns the message and the fix button, if any.
-// `newer`: a newer engine exists, so updating is worth offering. `probe`: a probe has no log to point at.
-export function failure(error, { engine, dest, newer = false, probe = false }) {
-  const other = otherEngine(engine);
-  if (error.hint === "install_js_runtime") return ["YouTube needs one more tool, deno.", "install_js_runtime"];
-  switch (error.kind) {
-    case "blocked": return ["The site refused this download. It often works on a second try.", newer ? "update_engine" : "retry"];
-    case "live": return ["This is live now. Download it after it ends.", null];
-    case "unavailable": return ["This video is private, removed, or needs a sign-in. Spool can't download it.", null];
-    case "unsupported": return ["Spool can't read this link.", "try_other_engine", other];
-    case "empty": return ["Nothing was found at this link.", "try_other_engine", other];
-    case "network": return ["Couldn't reach the site. Check your connection.", "retry"];
-    case "dest_unplugged": return [`${drive(dest)} isn't connected. Plug it in, or choose another folder.`, "check_dest"];
-    case "dest_missing": return [`${folderName(dest)} doesn't exist. Choose another folder.`, "check_dest"];
-    case "dest_not_folder": return [`${dest} is a file, not a folder.`, "check_dest"];
-    case "dest_full": return [`${drive(dest)} is full. Free some space, or choose another folder.`, "check_dest"];
-    case "dest_denied": return [`Spool isn't allowed to write to ${folderName(dest)}.`, "check_dest"];
-    case "no_ffmpeg": return ["This quality needs ffmpeg to join picture and sound.", "install_ffmpeg"];
-    case "interrupted": return ["Spool was closed before this finished.", "resume"];
-    case "invalid_link": return ["That isn't a link Spool can use. Paste a link that starts with http or https.", null];
-    case "engine_not_ready": return ["Spool is still setting up. Try again in a few seconds.", null];
-    case "engine": return probe ? [plain(error.message) || "Spool couldn't read this link.", "retry"] : ["The download stopped with an error. The log has the details.", "show_log"];
-    default: return [plain(error.message) || "Something went wrong.", "retry"];
-  }
-}
+// The server's one percentage for the whole job (0 to 1), as a whole number; null when it knows nothing yet.
+export const percent = (job) => (job.progress == null ? null : Math.min(100, Math.max(0, Math.floor(job.progress * 100))));
 
 export const folderName = (path = "") => path.split(/[\\/]/).filter(Boolean).pop() || path;
-// The drive's name for a folder under /Volumes, otherwise the folder's own name.
-const drive = (path = "") => /^\/Volumes\/([^/]+)/.exec(path)?.[1] || folderName(path);
 
-export function destProblem(dest) {
-  const name = dest.display || folderName(dest.path);
-  switch (dest.problem) {
-    case "unplugged": return `${drive(dest.path)} isn't connected. Plug it in, or choose another folder.`;
-    case "missing": return `${folderName(dest.path)} doesn't exist. Choose another folder.`;
-    case "not_a_folder": return `${name} is a file, not a folder.`;
-    case "not_writable": return `Spool isn't allowed to write to ${name}. Choose another folder.`;
-    case "not_responding": return `${drive(dest.path)} isn't answering. If macOS is asking whether Spool may use it, choose Allow.`;
-    default: return dest.problem ? `${name} can't be used right now. Choose another folder.` : "";
-  }
+const FFMPEG = { darwin: "brew install ffmpeg", linux: "sudo apt install ffmpeg", win32: "winget install ffmpeg" };
+export const ffmpegCommand = (platform) => FFMPEG[platform] || FFMPEG.linux;
+
+// The quality to select for a video: the remembered one, else the nearest lower class (Best counts as its own
+// class, which the server leaves out of the list), else Best.
+export function pick(presets, remembered) {
+  if (presets.some((p) => p.id === remembered)) return remembered;
+  if (!/^\d+$/.test(remembered)) return "best";
+  const height = (p) => parseInt(p.id === "best" ? p.detail : p.id, 10);
+  const lower = presets.filter((p) => height(p) < +remembered).sort((a, b) => height(b) - height(a));
+  return lower[0]?.id || "best";
 }
 
-export const INSTALL = {
-  ffmpeg: { darwin: "brew install ffmpeg", linux: "sudo apt install ffmpeg", win32: "winget install ffmpeg" },
-  deno: { darwin: "brew install deno", linux: "curl -fsSL https://deno.land/install.sh | sh", win32: "winget install DenoLand.Deno" },
-};
-export const installCommand = (tool, platform) => INSTALL[tool][platform] || INSTALL[tool].linux;
+// At most four tiles up front (Best, two classes below it, Audio); the rest go under "More qualities".
+export function split(presets) {
+  const classes = presets.filter((p) => /^\d+$/.test(p.id));
+  const usual = (p) => p.id === "1080" || p.id === "720";
+  const two = [...classes.filter(usual), ...classes.filter((p) => !usual(p))].slice(0, 2);
+  const shown = presets.filter((p) => p.id === "best" || p.id === "audio" || two.includes(p));
+  return [shown, presets.filter((p) => !shown.includes(p))];
+}
 
-// Splits pasted text into http(s) links; anything else is ignored.
-export function links(text) {
-  return text.split(/\s+/).filter((t) => /^https?:\/\/[^\s/]+/i.test(t));
+// Every link in any text: Markdown links, wrappers and trailing punctuation are taken off, and a bare host
+// ("youtu.be/x") gets https://. Paste, drop, Enter and the address bar all read links through this.
+const BARE = /^(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:[/?#]|$)/i;
+export function links(text = "") {
+  return text
+    .replace(/\[[^\]]*\]\(([^)\s]+)\)/g, " $1 ")
+    .split(/[\s,]+/)
+    .map(clean)
+    .map((t) => (BARE.test(t) ? `https://${t}` : t))
+    .filter((t) => /^https?:\/\/[^\s/?#]+\.[^\s/?#]/i.test(t) || /^https?:\/\/(localhost|\[[\d:]+\]|[\d.]+)(?=[:/?#]|$)/i.test(t));
+}
+function clean(t) {
+  for (let before; before !== t;) {
+    before = t;
+    t = t.replace(/^[<(["']+/, "").replace(/[>\]"'.,;:!?]+$/, "");
+    // A closing bracket belongs to the link only when the link opened it (Foo_(bar)).
+    if (t.endsWith(")") && (t.match(/\(/g) || []).length < (t.match(/\)/g) || []).length) t = t.slice(0, -1);
+  }
+  return t;
 }
