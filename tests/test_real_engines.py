@@ -54,9 +54,12 @@ def test_yt_dlp_probe_reads_real_heights_and_sizes(jobs):
     probe = jobs.probe(ZOO, "yt-dlp")
     [entry] = probe["entries"]
     assert (entry["id"], entry["title"], entry["duration"]) == ("jNQXAC9IVRw", "Me at the zoo", 19)
-    ids = [p["id"] for p in entry["presets"]]
-    assert ids[0] == "best" and "240" in ids and ids[-2:] == ["audio", "mp3"]
-    assert next(p for p in entry["presets"] if p["id"] == "best")["size"]
+    assert [(p["id"], p["detail"]) for p in entry["presets"]] == [
+        ("best", "240p"),  # its top class, so 240 is not offered again
+        ("audio", None),
+        ("mp3", None),
+    ]
+    assert all(p["size"] for p in entry["presets"])
 
 
 @pytest.mark.parametrize("engine, preset", [("yt-dlp", "best"), ("yt-dlp", "audio"), ("youtube-dl", "best")])
