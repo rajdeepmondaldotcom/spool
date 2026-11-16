@@ -4,6 +4,7 @@ import socket
 import time
 from pathlib import Path
 
+import pytest
 from support import job_state
 
 from spool import server, system
@@ -292,3 +293,13 @@ def test_reveal_shows_the_finished_file_or_says_the_system_cannot(app, monkeypat
     for path in (f"/api/jobs/{job['id']}/reveal", "/api/dest/reveal"):
         status, body = app.json("POST", path)
         assert (status, body["error"]["kind"]) == (501, "not_supported"), path
+
+
+def test_starting_the_server_never_looks_up_this_machines_name(monkeypatch):
+    """On some networks that lookup takes many seconds, and Spool only ever serves 127.0.0.1."""
+    monkeypatch.setattr(socket, "getfqdn", lambda *a: pytest.fail("the server looked up the machine's name"))
+    httpd = server.make_server(None, None, "token")
+    try:
+        assert httpd.server_address[0] == "127.0.0.1"
+    finally:
+        httpd.server_close()

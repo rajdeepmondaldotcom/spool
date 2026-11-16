@@ -6,6 +6,7 @@ import json
 import mimetypes
 import queue
 import re
+import socketserver
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,9 +26,17 @@ mimetypes.add_type("font/woff2", ".woff2")  # not in every platform's table, and
 PING = 15
 
 
+class Server(ThreadingHTTPServer):
+    def server_bind(self):
+        """Bind without HTTPServer's lookup of this machine's name: on some networks it takes many seconds, and
+        nothing here uses the name."""
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def make_server(jobs, engines, token, port=0):
     """A server bound to 127.0.0.1. Call serve_forever() on it."""
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    httpd = Server(("127.0.0.1", port), Handler)
     httpd.daemon_threads = True
     httpd.jobs, httpd.engines, httpd.token = jobs, engines, token
     return httpd
