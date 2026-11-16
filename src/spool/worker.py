@@ -111,19 +111,39 @@ def size(duration, *formats):
     return int(sum(sizes)) if all(sizes) else None
 
 
-def ranking(n, duration):
+NEWER_CODECS = (("hev", "hvc", "h265"), ("vp09.02", "vp9.2"), ("vp9", "vp09"), ("av01", "av1"))
+
+
+def codec_rank(f):
+    """yt-dlp's vcodec:h264: H.264 first, then older codecs, then newer ones, the nearest first (H.265, VP9,
+    VP9 HDR, AV1)."""
+    codec = str(f.get("vcodec"))
+    if codec.startswith(("avc", "h264")):
+        return 0
+    newer = next((i for i, names in enumerate(NEWER_CODECS) if codec.startswith(names)), None)
+    return -1 if newer is None else -(2, 4, 3, 5)[newer]
+
+
+def ranking(n):
     """yt-dlp's order for format_sort [res:N, fps, vcodec:h264, acodec:aac]: the site's own preference first,
-    then the largest short side up to N (above N the smallest), then frame rate, H.264, AAC, size, bitrate."""
+    then the largest short side up to N (above N the smallest), frame rate, H.264, AAC, and then the engine's own
+    defaults: the original language, the site's quality mark, HDR, a known size (none loses), bitrate."""
+
+    def known(f, field):
+        return -1 if f.get(field) is None else f[field]
 
     def key(f):
         side = short(f)
         return (
-            -1 if f.get("preference") is None else f["preference"],
+            known(f, "preference"),
             side if n is None or side <= n else -side,
             f.get("fps") or 0,
-            str(f.get("vcodec")).startswith(("avc1", "h264")),
+            codec_rank(f),
             str(f.get("acodec")).startswith(("mp4a", "aac")),
-            bytes_of(f, duration),
+            known(f, "language_preference"),
+            known(f, "quality"),
+            f.get("dynamic_range") not in (None, "SDR"),
+            f.get("filesize") or f.get("filesize_approx") or -1,
             f.get("tbr") or 0,
         )
 
@@ -139,12 +159,12 @@ def estimate(formats, preset, ffmpeg, duration):
     if preset == "audio":
         m4a = [f for f in audio if f.get("ext") == "m4a"]
         return size(duration, max(m4a or audio or both, key=lambda f: f.get("abr") or f.get("tbr") or 0, default=None))
-    return size(duration, *chosen(formats, None if preset == "best" else int(preset), ffmpeg, duration))
+    return size(duration, *chosen(formats, None if preset == "best" else int(preset), ffmpeg))
 
 
-def chosen(formats, n, ffmpeg, duration):
+def chosen(formats, n, ffmpeg):
     """The streams yt-dlp's rule picks for class n (None for Best): bv*+ba with ffmpeg, else b. (None,) if none fit."""
-    key = ranking(n, duration)
+    key = ranking(n)
     audio = [f for f in formats if has(f, "acodec") and not has(f, "vcodec")]
     video = [f for f in formats if has(f, "vcodec")]
     if ffmpeg and video and audio:
@@ -162,7 +182,7 @@ def entry(info, ffmpeg):
         formats = info.get("formats") or [info]  # a site with one stream puts it on the info itself
         playable = formats if ffmpeg else [f for f in formats if has(f, "acodec")]  # no merging without ffmpeg
         classes = {klass(f) for f in playable if has(f, "vcodec")}
-        top = chosen(formats, None, ffmpeg, info.get("duration"))[0]
+        top = chosen(formats, None, ffmpeg)[0]
         best = klass(top) if top and has(top, "vcodec") else None  # Best's own class: offered once, as its detail
         heights = [str(h) for h in HEIGHTS if h in classes and h != best]
         ids = ["best"] * bool(top) + heights + ["audio"] + ["mp3"] * bool(ffmpeg)  # no Best when nothing fits

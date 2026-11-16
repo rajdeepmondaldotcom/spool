@@ -141,6 +141,40 @@ def pick(jobs, engine, module, formats, preset):
     return json.loads(out.splitlines()[-1])
 
 
+# Streams shaped like the ones that fooled the size estimate on a real video.
+A140 = {"vcodec": "none", "acodec": "mp4a.40.2", "ext": "m4a", "abr": 129}
+NO_SIZE = [  # a stream with no size loses to one with a size, whatever its bitrate; then the site's quality decides
+    fmt("hls720", 720, 1280, tbr=1564, protocol="m3u8_native"),
+    fmt("v720", 720, 1280, tbr=618, filesize=11_586_906),
+    fmt("a140-drc", None, **A140, filesize=2_430_993, quality=2.5),
+    fmt("a140", None, **A140, filesize=2_430_774, quality=3),
+]
+NEWER = [  # with no H.264 at the top, the codec nearest above it wins: VP9, then VP9 HDR, then AV1
+    fmt("av1", 2160, 3840, vcodec="av01.0.12M.08", filesize=9_000_000),
+    fmt("vp9hdr", 2160, 3840, vcodec="vp09.02.51.10", ext="webm", filesize=8_000_000, dynamic_range="HDR10"),
+    fmt("vp9", 2160, 3840, **VP9, filesize=5_000_000),
+    fmt("v1080", 1080, 1920, filesize=1_000_000),
+    AUDIO,
+]
+OLD_AND_NEW = [fmt("vp8", 720, 1280, vcodec="vp8", ext="webm"), fmt("vp9", 720, 1280, **VP9, filesize=9_000_000), AUDIO]
+ORIGINAL = [  # the original language beats a dubbed track, before quality or size
+    fmt("v720", 720, 1280),
+    fmt("dub", None, **A140, filesize=3_000_000, language_preference=-1),
+    fmt("orig", None, **A140, filesize=2_000_000, language_preference=10),
+]
+
+
+@pytest.mark.parametrize(
+    "formats", [NO_SIZE, NEWER, OLD_AND_NEW, ORIGINAL, LANDSCAPE, VERTICAL, VP9_TOP, TIE, WITH_SOUND]
+)
+@pytest.mark.parametrize("preset", ["best", "1080", "720"])
+def test_the_size_estimate_counts_the_streams_the_engine_picks(jobs, formats, preset):
+    from spool.worker import chosen
+
+    ours = chosen(formats, None if preset == "best" else int(preset), True)
+    assert "+".join(f["format_id"] for f in ours) == pick(jobs, "yt-dlp", "yt_dlp", formats, preset)
+
+
 @pytest.mark.parametrize(
     "formats, preset, chosen",
     [
