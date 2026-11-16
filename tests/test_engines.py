@@ -308,3 +308,60 @@ def test_reading_the_current_version_takes_its_turn_with_a_replace(tmp_path):
         assert not read.wait(0.2)
     assert read.wait(2)
     assert engines.version("yt-dlp") == INSTALLED
+
+
+# A newer Spool
+
+
+class Releases:
+    def __init__(self, tag="v0.2.1", fail=False):
+        self.tag, self.fail, self.asked = tag, fail, []
+
+    def __call__(self, url):
+        self.asked.append(url)
+        if self.fail:
+            raise OSError("offline")
+        return f"https://github.com/rajdeepmondaldotcom/spool/releases/tag/{self.tag}"
+
+
+@pytest.mark.parametrize(
+    "tag, running, newer",
+    [
+        ("v0.2.1", "0.2.0", "0.2.1"),
+        ("0.10.0", "0.9.3", "0.10.0"),
+        ("v0.2.0", "0.2.0", None),
+        ("v0.1.9", "0.2.0", None),
+        ("releases", "0.2.0", None),  # no release yet: the page redirects to the list
+        ("v0.3.0-rc1", "0.2.0", None),
+        ("v0.2.1", None, None),  # run from a source tree
+    ],
+)
+def test_a_newer_spool_is_a_release_tag_above_the_running_version(tmp_path, tag, running, newer):
+    from spool.engines import newer_spool
+
+    releases = Releases(tag)
+    assert newer_spool(tmp_path, running, resolve=releases) == newer
+    assert releases.asked == ["https://github.com/rajdeepmondaldotcom/spool/releases/latest"]  # never api.github.com
+
+
+def test_the_release_page_is_asked_at_most_once_a_day_even_across_restarts(tmp_path):
+    from spool.engines import newer_spool
+
+    releases, now = Releases(), 1_000_000.0
+    assert newer_spool(tmp_path, "0.2.0", resolve=releases, now=lambda: now) == "0.2.1"
+    releases.tag = "v0.2.2"
+    assert newer_spool(tmp_path, "0.2.0", resolve=releases, now=lambda: now + 86_000) == "0.2.1"
+    assert len(releases.asked) == 1
+    assert newer_spool(tmp_path, "0.2.0", resolve=releases, now=lambda: now + 86_500) == "0.2.2"
+    assert len(releases.asked) == 2
+
+
+def test_a_failed_look_says_nothing_and_asks_again_next_time(tmp_path):
+    from spool.engines import newer_spool
+
+    releases = Releases(fail=True)
+    assert newer_spool(tmp_path, "0.2.0", resolve=releases) is None
+    (tmp_path / "update.json").write_text("{broken")
+    releases.fail = False
+    assert newer_spool(tmp_path, "0.2.0", resolve=releases) == "0.2.1"
+    assert len(releases.asked) == 2

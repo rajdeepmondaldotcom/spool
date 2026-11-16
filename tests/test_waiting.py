@@ -1,0 +1,192 @@
+"""A download the connection or the site cut short tries again by itself (contract point 3)."""
+
+import json
+import time
+
+import pytest
+from serve_fake import start
+
+import spool.jobs
+
+
+@pytest.fixture
+def events(app):
+    events = app.events()
+    events.next()
+    yield events
+    events.close()
+
+
+def add(app, url, preset="best"):
+    status, body = app.json("POST", "/api/jobs", {"entries": [{"url": url}], "preset": preset})
+    assert status == 201, body
+    return body["jobs"][0]["id"]
+
+
+def wait_for(events, job_id, match, timeout=15):
+    return events.until(lambda e, d: e == "job" and d["id"] == job_id and match(d), timeout)
+
+
+def runs(app, job_id):
+    return app.request("GET", f"/api/jobs/{job_id}/log")[1].decode().count("--- ")
+
+
+def waiting(d):
+    return d["state"] == "running" and d["stage"] == "waiting"
+
+
+def test_the_waits_grow_and_end_after_five_minutes():
+    assert spool.jobs.WAITS == (10, 30, 60, 120, 300)
+
+
+def test_a_refusal_waits_then_tries_again_by_itself(app, events):
+    app.jobs.waits = (2.5,) * 5
+    job_id = add(app, "https://fake.test/403-once?delay=0")
+    seen = wait_for(events, job_id, lambda d: d["state"] in ("done", "failed"))
+    held = [d for e, d in seen if e == "job" and d["id"] == job_id and waiting(d)]
+    assert held, [d["stage"] for _, d in seen]
+    assert {(d["note"], d["attempt"], d["attempts"]) for d in held} == {("The site refused the download.", 2, 6)}
+    etas = [d["eta"] for d in held]
+    assert etas[0] == 3 and len(set(etas)) >= 2 and etas == sorted(etas, reverse=True)  # about once a second
+    assert seen[-1][1]["state"] == "done"
+    assert (seen[-1][1]["note"], seen[-1][1]["stage"]) == (None, None)
+    assert runs(app, job_id) == 2
+
+
+def test_a_refusal_that_persists_fails_as_today_after_the_last_wait(app, events):
+    app.jobs.waits = (0.05,) * 5
+    job_id = add(app, "https://fake.test/403-start?delay=0")
+    failed = wait_for(events, job_id, lambda d: d["state"] == "failed")[-1][1]
+    assert failed["error"] == {"kind": "blocked", "message": "The site refused the download.", "hint": "retry"}
+    assert (failed["stage"], failed["note"], failed["eta"]) == (None, None, None)
+    assert runs(app, job_id) == 6
+
+
+def test_a_refusal_mid_download_continues_the_partial_file(app, events):
+    app.jobs.waits = (0.05,) * 5
+    job_id = add(app, "https://fake.test/403?delay=0")
+    seen = wait_for(events, job_id, lambda d: d["state"] == "failed")
+    progress = [d["progress"] for e, d in seen if e == "job" and d["id"] == job_id and d["progress"] is not None]
+    assert progress == sorted(progress) and progress[-1] > 0  # never backwards while it waits
+    assert runs(app, job_id) == 6  # each try after the first got no further
+    assert "Resuming download at byte" in app.request("GET", f"/api/jobs/{job_id}/log")[1].decode()
+
+
+STUB = """
+import json, pathlib, sys
+spec = json.loads(sys.stdin.read())
+count = pathlib.Path(sys.argv[0]).with_name("runs")
+n = int(count.read_text()) + 1 if count.exists() else 1
+count.write_text(str(n))
+def say(**event):
+    print(json.dumps(event), flush=True)
+say(event="progress", status="downloading", part=1, downloaded=n * FURTHER, total=1000, speed=None, eta=None,
+    progress=n / 100, what="video")
+if n < RUNS:
+    say(event="error", message=MESSAGE, **KIND)
+else:
+    path = pathlib.Path(spec["dest"]) / "Stub [s].mp4"
+    path.write_bytes(b"x")
+    say(event="done", path=str(path), size=1)
+"""
+
+
+def stub(monkeypatch, tmp_path, message, runs=99, further=100, kind=None):
+    worker = tmp_path / "stub" / "worker.py"
+    worker.parent.mkdir()
+    worker.write_text(
+        STUB.replace("FURTHER", str(further))
+        .replace("RUNS", str(runs))
+        .replace("MESSAGE", repr(message))
+        .replace("KIND", repr({"kind": kind} if kind else {}))
+    )
+    monkeypatch.setattr(spool.jobs, "WORKER", worker)
+    return worker.with_name("runs")
+
+
+def test_a_try_that_got_further_starts_the_count_again(app, events, monkeypatch, tmp_path):
+    """A line that drops every few minutes still finishes a large download."""
+    count = stub(monkeypatch, tmp_path, "ERROR: [Errno 54] Connection reset by peer", runs=9)
+    app.jobs.waits = (0.05, 0.05)  # two waits without getting further, then it fails
+    job_id = add(app, "https://fake.test/big")
+    seen = wait_for(events, job_id, lambda d: d["state"] in ("done", "failed"))
+    assert seen[-1][1]["state"] == "done", seen[-1][1]["error"]
+    assert count.read_text() == "9"
+    notes = {d["note"] for e, d in seen if e == "job" and d["id"] == job_id and waiting(d)}
+    assert notes == {"The connection dropped."}
+    assert {d["attempt"] for e, d in seen if e == "job" and d["id"] == job_id and waiting(d)} == {2}
+
+
+def test_a_try_that_got_no_further_counts(app, events, monkeypatch, tmp_path):
+    count = stub(monkeypatch, tmp_path, "ERROR: Unable to download webpage: The read operation timed out", further=0)
+    app.jobs.waits = (0.05, 0.05)
+    job_id = add(app, "https://fake.test/big")
+    failed = wait_for(events, job_id, lambda d: d["state"] in ("done", "failed"))[-1][1]
+    assert failed["error"]["kind"] == "network"
+    assert count.read_text() == "3"
+
+
+@pytest.mark.parametrize(
+    "message, kind",
+    [
+        ("ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader", None),
+        ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access to this video", None),
+        ("This is live now.", "live"),
+        ("ERROR: unable to write data: [Errno 28] No space left on device", None),
+        ("ERROR: unable to open for writing: [Errno 13] Permission denied: '/x/T [a].mp4.part'", None),
+        ("ERROR: destination folder is missing", None),
+        ("ERROR: Postprocessing: ffprobe and ffmpeg not found.", None),
+        ("a list", "playlist"),
+        ("ERROR: [youtube] abc: Some new breakage", None),
+    ],
+)
+def test_what_another_try_cannot_fix_is_not_tried_again(app, events, monkeypatch, tmp_path, message, kind):
+    count = stub(monkeypatch, tmp_path, message, kind=kind)
+    app.jobs.waits = (0.05,) * 5
+    job_id = add(app, "https://fake.test/big")
+    failed = wait_for(events, job_id, lambda d: d["state"] in ("done", "failed"))
+    assert not [d for e, d in failed if e == "job" and d["id"] == job_id and waiting(d)]
+    assert count.read_text() == "1"
+
+
+def test_a_waiting_job_holds_its_slot_and_cancel_works_at_once(app, events):
+    app.jobs.waits = (30,) * 5
+    first, second = (add(app, f"https://fake.test/403-start/{n}?delay=0") for n in (1, 2))
+    wait_for(events, first, waiting)
+    third = add(app, "https://fake.test/video?delay=0")
+    assert app.jobs.snapshot()["jobs"][0]["state"] == "queued"  # both slots are held by jobs that wait
+    status, job = app.json("POST", f"/api/jobs/{first}/cancel")
+    assert (status, job["state"], job["stage"], job["note"]) == (200, "cancelled", None, None)
+    assert wait_for(events, third, lambda d: d["state"] == "done", timeout=5)[-1][1]["state"] == "done"
+    assert runs(app, first) == 1
+
+
+def test_cancel_then_retry_while_waiting_runs_once(app, events):
+    app.jobs.waits = (30,) * 5
+    job_id = add(app, "https://fake.test/403-once?delay=0")
+    wait_for(events, job_id, waiting)
+    app.json("POST", f"/api/jobs/{job_id}/cancel")
+    assert app.json("POST", f"/api/jobs/{job_id}/retry")[0] == 200
+    assert wait_for(events, job_id, lambda d: d["state"] == "done", timeout=5)[-1][1]["state"] == "done"
+    assert runs(app, job_id) == 2
+
+
+def test_quitting_while_waiting_leaves_the_job_interrupted(tmp_path):
+    httpd, _, jobs, _ = start(tmp_path)
+    jobs.waits = (30,) * 5
+    job = jobs.add([{"url": "https://fake.test/403-start?delay=0"}], "best")[0][0]
+    end = time.time() + 10
+    while jobs.snapshot()["jobs"][0]["stage"] != "waiting":
+        assert time.time() < end
+        time.sleep(0.05)
+    httpd.shutdown()
+    jobs.close()
+    assert json.loads((tmp_path / "state.json").read_text())["jobs"][0]["stage"] == "waiting"
+    httpd, _, jobs, _ = start(tmp_path)
+    try:
+        [again] = jobs.snapshot()["jobs"]
+        assert (again["id"], again["state"], again["error"]["kind"]) == (job["id"], "failed", "interrupted")
+        assert (again["stage"], again["note"], again["eta"]) == (None, None, None)
+    finally:
+        httpd.shutdown()
+        jobs.close()

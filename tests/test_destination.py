@@ -429,3 +429,31 @@ def test_kill_survives_a_group_it_may_not_signal(monkeypatch):
     finally:
         proc.kill()
         proc.wait()
+
+
+@pytest.mark.parametrize(
+    "platform, call", [("darwin", ["open", "/v/a [x].mp4"]), ("linux", ["xdg-open", "/v/a [x].mp4"])]
+)
+def test_open_file_uses_the_systems_default_program(monkeypatch, platform, call):
+    monkeypatch.setattr(system.sys, "platform", platform)
+    ran = Ran(monkeypatch)
+    system.open_file("/v/a [x].mp4")
+    assert ran.calls == [call]
+    Ran(monkeypatch, missing=True)
+    with pytest.raises(NotImplementedError):
+        system.open_file("/v/a [x].mp4")
+
+
+def test_open_file_on_windows_asks_windows(monkeypatch):
+    monkeypatch.setattr(system.sys, "platform", "win32")
+    started = []
+    monkeypatch.setattr(system.os, "startfile", started.append, raising=False)
+    system.open_file(r"C:\v\a.mp4")
+    assert started == [r"C:\v\a.mp4"]
+
+    def no_program(path):
+        raise OSError("No application is associated with the specified file")
+
+    monkeypatch.setattr(system.os, "startfile", no_program, raising=False)
+    with pytest.raises(NotImplementedError):
+        system.open_file(r"C:\v\a.mp4")

@@ -290,3 +290,44 @@ def test_links_on_the_command_line_ride_in_the_fragment():
     assert carrying(["https://youtu.be/x?t=1", "https://v.test/a b"]) == (
         "&url=https%3A%2F%2Fyoutu.be%2Fx%3Ft%3D1%20https%3A%2F%2Fv.test%2Fa%20b"
     )
+
+
+def test_quit_from_the_page_shuts_down_as_ctrl_c_does(data):
+    proc, workers = downloading(data)
+    lock = json.loads((data / "spool.lock").read_text())
+    client = Client(f"http://127.0.0.1:{lock['port']}", lock["token"])
+    assert client.request("POST", "/api/quit")[0] == 204
+    stopped_cleanly(proc, data, workers)
+    saved = json.loads((data / "state.json").read_text())["jobs"]
+    assert [j["state"] for j in saved] == ["running"]  # read as interrupted at the next launch
+
+
+def test_a_launch_with_no_network_says_nothing_about_a_newer_spool(data):
+    proc, line = launch(data)
+    url = url_in(line)
+    client = Client(url.split("/#")[0], url.split("#t=")[1])
+    events = client.events()
+    try:
+        assert events.until(lambda e, d: e == "snapshot")[-1][1]["update"] is None
+    finally:
+        events.close()
+
+
+def test_a_newer_spool_found_at_launch_reaches_the_page(tmp_path, monkeypatch):
+    import spool.__main__ as launcher
+    from spool.engines import Engines
+    from spool.jobs import Jobs
+
+    monkeypatch.setattr(launcher, "VERSION", "0.2.0")
+    monkeypatch.setattr(
+        launcher, "newer_spool", lambda data, running: running == "0.2.0" and data == tmp_path and "0.2.1"
+    )
+    jobs = Jobs(tmp_path, Engines(tmp_path / "engines"))
+    q = jobs.subscribe()
+    q.get(timeout=5)
+    try:
+        threading.Thread(target=launcher.releases, args=(jobs, tmp_path), daemon=True).start()
+        event, snap = q.get(timeout=5)
+        assert (event, snap["update"]) == ("snapshot", {"version": "0.2.1"})
+    finally:
+        jobs.close()

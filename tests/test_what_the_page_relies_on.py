@@ -114,10 +114,7 @@ def github():  # a newer engine is published but fails its checksum, so it is ne
     return FakeGitHub(corrupt=True)
 
 
-def test_a_refusal_offers_the_update_when_a_newer_engine_exists(app, events, monkeypatch):
-    import spool.jobs
-
-    monkeypatch.setattr(spool.jobs, "RETRY_AFTER", 0)
+def test_a_refusal_offers_the_update_when_a_newer_engine_exists(app, events):
     end = time.time() + 10
     while app.engines.status()["yt-dlp"]["busy"]:
         assert time.time() < end
@@ -219,3 +216,30 @@ def test_the_interrupted_job_can_resume(tmp_path):
 def test_a_finished_job_reports_done_with_full_progress(app, events):
     done = events.until(job_state("done")) if add(app, "https://fake.test/audio?delay=0", "audio") else None
     assert done[-1][1]["progress"] == 1.0
+
+
+# What the worker adds rides through unchanged
+
+
+def test_a_presets_file_type_and_a_lists_truncated_reach_the_page(app, monkeypatch, tmp_path):
+    import json
+
+    import spool.jobs
+
+    preset = {"id": "best", "label": "Best", "detail": "1080p", "size": 3_400_000, "ext": "mkv"}
+    entry = {"url": "https://fake.test/v/1", "id": "v1", "title": "One", "presets": [preset]}
+    info = {"event": "info", "kind": "playlist", "title": "A channel", "entries": [entry], "truncated": True}
+    worker = tmp_path / "worker.py"
+    worker.write_text(f"import sys\nsys.stdin.read()\nprint({json.dumps(json.dumps(info))})\n")
+    monkeypatch.setattr(spool.jobs, "WORKER", worker)
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/channel"})
+    assert status == 200
+    assert (body["kind"], body["title"], body["truncated"]) == ("playlist", "A channel", True)
+    assert body["entries"] == [entry]
+    info["truncated"] = False
+    worker.write_text(f"import sys\nsys.stdin.read()\nprint({json.dumps(json.dumps(info))})\n")
+    assert app.json("POST", "/api/probe", {"url": "https://fake.test/channel"})[1]["truncated"] is False
+
+
+def test_a_probe_from_a_worker_that_says_nothing_of_truncation_is_not_truncated(app):
+    assert app.json("POST", "/api/probe", {"url": "https://fake.test/video"})[1]["truncated"] is False

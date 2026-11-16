@@ -304,3 +304,63 @@ def test_starting_the_server_never_looks_up_this_machines_name(monkeypatch):
         assert httpd.server_address[0] == "127.0.0.1"
     finally:
         httpd.server_close()
+
+
+# Open and quit
+
+
+def test_open_plays_the_finished_file_or_says_why_not(app, monkeypatch, tmp_path):
+    opened = []
+    monkeypatch.setattr(system, "open_file", opened.append)  # never a real player
+    events = app.events()
+    events.next()
+    entry = {"url": "https://fake.test/video?delay=0", "id": "vid-1", "title": "Fake video 1"}
+    [job] = app.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})[1]["jobs"]
+    slow = app.json("POST", "/api/jobs", {"entries": [{"url": "https://fake.test/slow"}], "preset": "best"})[1]
+    done = events.until(lambda e, d: e == "job" and d["id"] == job["id"] and d["state"] == "done")[-1][1]
+    events.close()
+    elsewhere = tmp_path / "not-the-job.mp4"
+    elsewhere.write_bytes(b"x")
+    assert app.request("POST", f"/api/jobs/{job['id']}/open", {"path": str(elsewhere)})[0] == 204
+    assert opened == [done["path"]]  # the job's file, whatever the request says
+    status, body = app.json("POST", f"/api/jobs/{slow['jobs'][0]['id']}/open")
+    assert (status, body["error"]["message"]) == (409, "Only a finished download can be opened.")
+    assert app.json("POST", "/api/jobs/nope/open")[0] == 404
+
+    def none(path):
+        raise NotImplementedError
+
+    monkeypatch.setattr(system, "open_file", none)
+    status, body = app.json("POST", f"/api/jobs/{job['id']}/open")
+    assert (status, body["error"]) == (
+        501,
+        {"kind": "not_supported", "message": "Spool can't open files on this system.", "hint": None},
+    )
+    Path(done["path"]).unlink()
+    status, body = app.json("POST", f"/api/jobs/{job['id']}/open")
+    assert (status, body["error"]["kind"]) == (410, "gone")
+    assert opened == [done["path"]]
+    assert raw(app, "POST", f"/api/jobs/{job['id']}/open", {"Host": host(app), **TOKEN})[0] == 403  # no Origin
+
+
+def test_quit_answers_then_stops_the_server_and_passes_the_access_checks(app):
+    assert raw(app, "POST", "/api/quit", {"Host": host(app), "Origin": f"http://{host(app)}"})[0] == 401
+    assert raw(app, "POST", "/api/quit", {"Host": host(app), "Origin": "http://evil.test", **TOKEN})[0] == 403
+    assert raw(app, "GET", "/api/quit", {"Host": host(app), **TOKEN})[0] == 405
+    assert app.request("GET", "/api/jobs/x/log")[0] == 404  # still serving
+    status, data, _ = app.request("POST", "/api/quit")
+    assert (status, data) == (204, b"")
+    end = time.time() + 5
+    while True:
+        try:
+            app.request("GET", "/api/jobs/x/log")
+        except OSError:
+            break
+        assert time.time() < end, "the server is still answering"
+        time.sleep(0.1)
+
+
+def test_the_snapshot_says_when_a_newer_spool_exists(app):
+    assert app.jobs.snapshot()["update"] is None
+    app.jobs.newer = "0.2.1"
+    assert app.jobs.snapshot()["update"] == {"version": "0.2.1"}
