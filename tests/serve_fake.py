@@ -76,8 +76,11 @@ class FakeGitHub:
         return self.asset + (b"corrupted" if self.corrupt else b"")
 
 
-def start(data_dir, port=0, fresh=False, github=None, ffmpeg=True, js_runtime="deno", js_setup=None):
+def start(data_dir, port=0, fresh=False, github=None, ffmpeg=True, js_runtime="deno", js_setup=None, waits=()):
     """Start Spool on the fake engine in data_dir. Returns (httpd, url, jobs, engines).
+
+    waits: the seconds before each automatic try again. None by default, so a refused link fails at once; pass
+    e.g. (30,) to see a job waiting.
 
     The tools are what the caller says, never what this machine's PATH has, so tests run the same everywhere."""
     from spool import server
@@ -99,6 +102,7 @@ def start(data_dir, port=0, fresh=False, github=None, ffmpeg=True, js_runtime="d
         "can_choose_folder": False,
     }
     jobs = Jobs(data, engines, tools=lambda: dict(tools))
+    jobs.waits = waits
     downloads = data / "downloads"
     if not (data / "state.json").exists() or not downloads.exists():
         downloads.mkdir(exist_ok=True)

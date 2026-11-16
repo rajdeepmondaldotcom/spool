@@ -1,6 +1,7 @@
 """The queue: jobs and their states, settings, the one state file, live events and plain-word errors."""
 
 import json
+import math
 import os
 import queue
 import re
@@ -25,7 +26,7 @@ try:
 except metadata.PackageNotFoundError:  # run from a source tree that was never installed
     VERSION = None
 LINK_LIMIT = 8192  # signed CDN links run to a few thousand characters
-RETRY_AFTER = 3  # seconds before the one automatic retry of a download refused before any bytes
+WAITS = (10, 30, 60, 120, 300)  # seconds before each try again of a download cut short; then it fails
 TICK = 0.25  # job progress goes out at most once a tick: four a second
 
 
@@ -53,6 +54,7 @@ class Jobs:
         self.settings.update({k: v for k, v in saved.get("settings", {}).items() if k in valid and valid[k](v)})
         # keys added after v0.1's first saves
         later = {"files": [], "item": None, "progress": None, "what": None, "started": None}
+        later |= {"note": None, "attempt": None, "attempts": None}
         keys = set(new_job({"url": "https://x.test"}, "best", "yt-dlp", "/")) - set(later)
         self.jobs = [  # newest first; a malformed record is dropped, not fatal
             {**later, **j} for j in saved.get("jobs", []) if isinstance(j, dict) and keys <= set(j)
@@ -62,9 +64,12 @@ class Jobs:
         self.dirty = set()
         self.subscribers = []
         self.closed = False
+        self.waits = WAITS
+        self.wake = threading.Condition(self.lock)  # a job waiting to try again wakes for a cancel or a quit
+        self.newer = None  # a newer Spool's version, once a look at the releases finds one
         for job in self.jobs:
             if job["state"] in ("queued", "running"):
-                job.update(state="failed", stage=None, error=error("interrupted"))
+                job.update(state="failed", stage=None, note=None, eta=None, error=error("interrupted"))
         self._save()
         engines.on_change = self._snapshot_changed  # the event stream lives here, so engines report to it
         threading.Thread(target=self._tick, daemon=True).start()
@@ -102,6 +107,7 @@ class Jobs:
                 "engines": self.engines.status(),
                 "tools": {k: v for k, v in self.tools().items() if k != "js_path"},
                 "version": VERSION,
+                "update": self.newer and {"version": self.newer},
                 "jobs": jobs,
             }
 
@@ -184,8 +190,9 @@ class Jobs:
             job = self._job(job_id)
             if job["state"] not in ("queued", "running"):
                 raise Problem(409, "conflict", "Only a waiting or running download can be cancelled.")
-            job.update(state="cancelled", stage=None, speed=None, eta=None, finished=time.time())
+            job.update(state="cancelled", stage=None, note=None, speed=None, eta=None, finished=time.time())
             self._changed(job)
+            self.wake.notify_all()
             proc = self.procs.get(job_id)
             self._pump()
         if proc:
@@ -297,6 +304,7 @@ class Jobs:
     def close(self):
         with self.lock:
             self.closed = True
+            self.wake.notify_all()
             procs = [p for p in self.procs.values() if p]
             for q in self.subscribers:
                 q.put((None, None))
@@ -383,8 +391,8 @@ class Jobs:
     def _run(self, job):
         """Run a job in the slot _pump reserved for it; the slot is freed only when its worker is gone."""
         try:
-            failure = None
-            for attempt in (1, 2):
+            failure, switched, waited, furthest = None, False, 0, None
+            while True:
                 dest_problem(self._check(job["dest"], but=job))
                 result = self._attempt(job)
                 if result is None or result["event"] == "done":
@@ -395,15 +403,17 @@ class Jobs:
                 except Problem as p:
                     kind = p.kind
                 failure = self._error(kind, job["engine"], job["dest"])
-                if attempt == 2:
-                    break
-                if kind in ("unsupported", "empty") and self.engines.path(other(job["engine"])):
+                if kind in ("unsupported", "empty") and not switched and self.engines.path(other(job["engine"])):
                     with self.lock:  # the other engine may read what this one can't
-                        job["engine"] = other(job["engine"])
-                elif kind == "blocked" and not job["downloaded"]:
-                    time.sleep(RETRY_AFTER)  # a refusal before any bytes usually passes
-                else:
+                        job["engine"], switched = other(job["engine"]), True
+                    continue
+                reached = (job["part"], job["downloaded"] or 0)
+                if furthest is not None and reached > furthest:
+                    waited = 0  # this try got further: a line that drops now and then still finishes
+                furthest = max(furthest or reached, reached)
+                if kind not in NOTES or waited == len(self.waits) or not self._wait(job, kind, waited):
                     break
+                waited += 1
         except Problem as p:
             result, failure = {"event": "error"}, {"kind": p.kind, "message": p.message, "hint": p.hint}
         except Exception:  # a spawn or write that fails must not leave the job "starting" and its slot taken
@@ -426,9 +436,29 @@ class Jobs:
                         j["files"] = [f for f in j["files"] if result["path"] not in (f, mp3_of(j, f))]
                 else:
                     job.update(state="failed", error=failure)
-                job.update(stage=None, speed=None, eta=None, finished=time.time())
+                job.update(stage=None, note=None, speed=None, eta=None, finished=time.time())
                 self._changed(job)
             self._pump()
+
+    def _wait(self, job, kind, waited):
+        """Hold the job's slot until its next try. False when it was cancelled or Spool quit meanwhile."""
+        end = time.monotonic() + self.waits[waited]
+        with self.lock:
+            if self.closed or job["state"] != "running":
+                return False
+            note = NOTES[kind]
+            job.update(stage="waiting", note=note, attempt=waited + 2, attempts=len(self.waits) + 1, speed=None)
+            job["eta"] = math.ceil(self.waits[waited])
+            self._changed(job)
+            while (left := end - time.monotonic()) > 0:
+                self.wake.wait(min(1.0, left))
+                if self.closed or job["state"] != "running":
+                    return False
+                job["eta"] = max(0, math.ceil(end - time.monotonic()))
+                self.dirty.add(job["id"])
+            job.update(stage="starting", note=None, eta=None)
+            self._changed(job)
+        return True
 
     def _attempt(self, job):
         """One worker run: its last event, or None if the job was cancelled before it could start."""
@@ -582,6 +612,10 @@ MESSAGES = {  # kind -> (the sentence people read, hint). Every sentence the ser
     "not_found": ("Spool can't find that download.", None),
     "gone": ("Spool can't find the file. It was moved or deleted.", None),
 }
+NOTES = {  # kind -> what a job waiting to try again says happened. Only these kinds are tried again.
+    "network": "The connection dropped.",
+    "blocked": "The site refused the download.",
+}
 KINDS = ("live", "no_js", "playlist")  # the worker names these itself; its message is then not read
 DEST_KINDS = {
     "unplugged": "dest_unplugged",
@@ -681,6 +715,9 @@ RUN = {  # a job's fields for one run, as it is before the run starts; Retry set
     "file_exists": False,
     "error": None,
     "finished": None,
+    "note": None,  # waiting: what happened, in NOTES's words
+    "attempt": None,  # waiting: the number of the try that comes next, out of attempts
+    "attempts": None,
 }
 
 

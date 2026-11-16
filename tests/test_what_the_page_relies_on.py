@@ -114,10 +114,7 @@ def github():  # a newer engine is published but fails its checksum, so it is ne
     return FakeGitHub(corrupt=True)
 
 
-def test_a_refusal_offers_the_update_when_a_newer_engine_exists(app, events, monkeypatch):
-    import spool.jobs
-
-    monkeypatch.setattr(spool.jobs, "RETRY_AFTER", 0)
+def test_a_refusal_offers_the_update_when_a_newer_engine_exists(app, events):
     end = time.time() + 10
     while app.engines.status()["yt-dlp"]["busy"]:
         assert time.time() < end

@@ -475,28 +475,7 @@ def test_a_job_cancelled_as_it_starts_never_downloads_and_two_at_most_run(app, e
     assert [j["state"] for j in app.jobs.snapshot()["jobs"]] == ["cancelled"] * 25
 
 
-@pytest.fixture
-def quick_retry(monkeypatch):
-    import spool.jobs
-
-    monkeypatch.setattr(spool.jobs, "RETRY_AFTER", 0.3)
-
-
-def test_a_refusal_before_any_bytes_is_retried_once_by_itself(app, events, quick_retry):
-    done = wait_for(events, add(app, "https://fake.test/403-once?delay=0"), lambda d: d["state"] in ("done", "failed"))
-    assert done["state"] == "done"
-    assert app.request("GET", f"/api/jobs/{done['id']}/log")[1].decode().count("\n--- ") + 1 == 2
-
-
-def test_a_refusal_that_persists_fails_after_one_retry(app, events, quick_retry):
-    failed = wait_for(events, add(app, "https://fake.test/403-start?delay=0"), lambda d: d["state"] == "failed")
-    assert failed["error"]["kind"] == "blocked"
-    assert app.request("GET", f"/api/jobs/{failed['id']}/log")[1].decode().count("--- ") == 2
-
-
-def test_a_refusal_after_bytes_arrived_is_not_retried(app, events, quick_retry):
-    failed = wait_for(events, add(app, "https://fake.test/403?delay=0"), lambda d: d["state"] == "failed")
-    assert app.request("GET", f"/api/jobs/{failed['id']}/log")[1].decode().count("--- ") == 1
+# Trying again by itself: test_waiting.py
 
 
 # A damaged state file
