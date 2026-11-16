@@ -1184,17 +1184,36 @@ def test_a_copy_the_browser_refuses_selects_the_command(app):
     assert app.evaluate("getSelection().toString()") == strip.locator("code").inner_text()
 
 
-# Spool 0.2.0. The server half is built alongside: new values are put on the job, the snapshot or the probe answer here.
+# Spool 0.2.0
 
 
-def newer_server(page, spool, update=None):
-    """The page as a 0.2 server serves it: its snapshot carries `update` (null when Spool is up to date)."""
+def fresh_snapshot(page):
+    with page.expect_request("**/api/events"):
+        page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+
+
+def newer_spool(page, spool, version):
+    """Spool's look at the releases found a newer one."""
+    spool[1].newer = version
+    fresh_snapshot(page)
+
+
+def older_server(page, spool):
+    """The page as Spool 0.1 serves it: no `update` in the snapshot, no `ext` on a preset."""
     jobs = spool[1]
     plain = jobs.snapshot
-    jobs.snapshot = lambda *a, **k: {**plain(*a, **k), "update": update}
-    with page.expect_request("**/api/events"):
-        page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")  # a fresh snapshot
-    return jobs
+    jobs.snapshot = lambda *a, **k: {k: v for k, v in plain(*a, **k).items() if k != "update"}
+
+    def no_ext(route):
+        response = route.fetch()
+        body = response.json()
+        for e in body["entries"]:
+            for p in e.get("presets") or []:
+                p.pop("ext", None)
+        route.fulfill(response=response, json=body)
+
+    page.route("**/api/probe", no_ext)
+    fresh_snapshot(page)
 
 
 def with_ext(route):
@@ -1217,7 +1236,8 @@ def test_each_quality_says_the_type_of_file_it_saves(app):
     )
 
 
-def test_a_tile_from_an_older_server_shows_only_its_size(app):
+def test_a_tile_from_an_older_server_shows_only_its_size(app, spool):
+    older_server(app, spool)
     look_up(app, VIDEO)
     expect(tray(app, "Fake video 1")).to_be_visible()
     sizes = tray(app, "Fake video 1").locator(".tile-size").all_inner_texts()
@@ -1238,7 +1258,18 @@ def test_a_download_trying_again_by_itself_says_why_and_when(app, spool):
     expect(app).to_have_title(f"{pct}% - Spool")
 
 
+@pytest.mark.parametrize("spool", [{"waits": (30,)}], indirect=True)
+def test_a_refused_download_waits_to_try_again_and_can_be_cancelled(app, spool):
+    add(spool, [("https://fake.test/403", "Fake refused video")])
+    row = group(app, "Downloading").get_by_role("listitem")
+    expect(row.locator(".meta")).to_have_text(re.compile(r"^The site refused the download\.Trying again in \d+ s$"))
+    expect(row.get_by_role("alert")).to_have_count(0)
+    row.get_by_role("button", name="Cancel").click()
+    expect(group(app, "Stopped").get_by_text("Cancelled")).to_be_visible()
+
+
 def test_a_running_row_from_an_older_server_looks_as_before(app, spool):
+    older_server(app, spool)
     add(spool, [("https://fake.test/slow?delay=60", "Fake slow video")])
     processing(spool, "Fake slow video", stage="downloading", downloaded=4_000_000, speed=2_000_000, eta=12)
     expect(group(app, "Downloading").locator(".meta")).to_have_text("Downloading video2.0 MB/s12 s left")
@@ -1260,7 +1291,7 @@ def test_a_channel_with_more_videos_says_it_shows_the_newest(app):
 
 
 def test_settings_offers_a_newer_spool_with_its_command(app, spool):
-    newer_server(app, spool, {"version": "0.2.1"})
+    newer_spool(app, spool, "0.2.1")
     app.get_by_role("button", name="Settings", exact=True).click()
     dialog = app.get_by_role("dialog", name="Settings")
     expect(dialog.get_by_text("Spool 0.2.1 is ready.")).to_be_visible()
@@ -1269,7 +1300,8 @@ def test_settings_offers_a_newer_spool_with_its_command(app, spool):
     expect(dialog.get_by_text("When it finishes, quit Spool and start it again.")).to_be_visible()
 
 
-def test_settings_from_an_older_server_look_as_before(app):
+def test_settings_from_an_older_server_look_as_before(app, spool):
+    older_server(app, spool)
     app.get_by_role("button", name="Settings", exact=True).click()
     dialog = app.get_by_role("dialog", name="Settings")
     expect(dialog.get_by_role("button", name="Done")).to_be_visible()
@@ -1279,7 +1311,6 @@ def test_settings_from_an_older_server_look_as_before(app):
 
 
 def test_quit_with_nothing_running_quits_at_once(app, spool):
-    newer_server(app, spool)
     app.get_by_role("button", name="Settings", exact=True).click()
     dialog = app.get_by_role("dialog", name="Settings")
     expect(dialog.get_by_text(re.compile("is ready"))).to_have_count(0)
@@ -1290,7 +1321,6 @@ def test_quit_with_nothing_running_quits_at_once(app, spool):
 
 
 def test_quit_while_downloading_asks_first_in_the_page(app, spool):
-    newer_server(app, spool)
     add(spool, [("https://fake.test/slow?delay=60", "Fake slow video")])
     expect(group(app, "Downloading").get_by_role("progressbar")).to_be_visible(timeout=10000)
     app.on("dialog", lambda d: pytest.fail(f"a browser dialog: {d.message}"))
@@ -1310,7 +1340,6 @@ def test_quit_while_downloading_asks_first_in_the_page(app, spool):
 
 
 def test_open_a_finished_file_from_its_menu(app, spool):
-    newer_server(app, spool)
     download(app, VIDEO, "Fake video 1")
     finished = group(app, "Finished")
     finished.get_by_role("button", name="More actions for Fake video 1").click(timeout=15000)
@@ -1323,7 +1352,6 @@ def test_open_a_finished_file_from_its_menu(app, spool):
 
 
 def test_a_file_that_will_not_open_says_why_on_the_row(app, spool):
-    newer_server(app, spool)
     app.route(
         "**/api/jobs/*/open",
         lambda route: route.fulfill(
@@ -1337,7 +1365,8 @@ def test_a_file_that_will_not_open_says_why_on_the_row(app, spool):
     expect(finished.get_by_role("listitem").get_by_role("alert")).to_have_text("The server's words.")
 
 
-def test_a_finished_row_from_an_older_server_has_no_open(app):
+def test_a_finished_row_from_an_older_server_has_no_open(app, spool):
+    older_server(app, spool)
     download(app, VIDEO, "Fake video 1")
     finished = group(app, "Finished")
     finished.get_by_role("button", name="More actions for Fake video 1").click(timeout=15000)
@@ -1345,7 +1374,6 @@ def test_a_finished_row_from_an_older_server_has_no_open(app):
 
 
 def test_after_quit_the_tab_says_spool_stopped_and_how_to_start_it(app, spool):
-    newer_server(app, spool)
     add(spool, [("https://fake.test/slow?delay=60", "Fake slow video")])
     expect(group(app, "Downloading").get_by_role("progressbar")).to_be_visible(timeout=10000)
     app.get_by_role("button", name="Settings", exact=True).click()
