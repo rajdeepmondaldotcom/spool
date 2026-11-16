@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: ${{ matrix.os }}, Python ${{ matrix.python }}
@@ -15,8 +19,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ["3.11", "3.13"]
+        # While the repo is private the free minutes are few and macOS costs ten times as much,
+        # so only these run. Restore macos-latest and Python 3.11 when the repo goes public.
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.13"]
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.3
