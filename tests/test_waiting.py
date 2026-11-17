@@ -47,11 +47,18 @@ def test_a_refusal_waits_then_tries_again_by_itself(app, events):
     held = [d for e, d in seen if e == "job" and d["id"] == job_id and waiting(d)]
     assert held, [d["stage"] for _, d in seen]
     assert {(d["note"], d["attempt"], d["attempts"]) for d in held} == {("The site refused the download.", 2, 6)}
-    etas = [d["eta"] for d in held]
-    assert etas[0] == 3 and len(set(etas)) >= 2 and etas == sorted(etas, reverse=True)  # about once a second
     assert seen[-1][1]["state"] == "done"
     assert (seen[-1][1]["note"], seen[-1][1]["stage"]) == (None, None)
     assert runs(app, job_id) == 2
+
+
+def test_a_waiting_job_counts_down_to_its_next_try(app, events):
+    app.jobs.waits = (30,) * 5  # long enough that the count is there to see; Cancel ends it
+    job_id = add(app, "https://fake.test/403-start?delay=0")
+    seen = wait_for(events, job_id, lambda d: waiting(d) and d["eta"] < 30, timeout=25)
+    etas = [d["eta"] for e, d in seen if e == "job" and d["id"] == job_id and waiting(d)]
+    assert etas[0] == 30 and etas == sorted(etas, reverse=True)
+    app.json("POST", f"/api/jobs/{job_id}/cancel")
 
 
 def test_a_refusal_that_persists_fails_as_today_after_the_last_wait(app, events):
@@ -253,7 +260,6 @@ def test_with_many_waiting_the_next_starts_a_few_seconds_after_one_finishes(app,
 
 def test_a_handful_of_downloads_is_not_slowed(app, events):
     app.jobs.pace = 30
-    began = time.monotonic()
     ids = [add(app, f"https://fake.test/video/{n}?delay=0", id=f"vid-{n}") for n in range(4)]
     ended = set()
     events.until(
@@ -262,7 +268,7 @@ def test_a_handful_of_downloads_is_not_slowed(app, events):
         ),
         timeout=30,
     )
-    assert time.monotonic() - began < 15
+    assert app.jobs.rest_until == 0.0  # the queue never rested
 
 
 def test_the_pace_is_kept_in_one_place():

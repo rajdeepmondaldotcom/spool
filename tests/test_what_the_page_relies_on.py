@@ -5,7 +5,7 @@ import time
 
 import pytest
 from serve_fake import FakeGitHub
-from support import job_state
+from support import Held, job_state, until
 
 from spool import system
 
@@ -74,11 +74,14 @@ def test_youtube_dl_progress_rises_too(app, events):
     assert progress == sorted(progress) and progress[-1] == 1.0
 
 
-def test_the_join_says_how_far_it_is(app, events):
-    job = add(app, "https://fake.test/video?delay=0.02&join=0.15")["jobs"][0]
+def test_the_join_says_how_far_it_is(app, events, monkeypatch):
+    every = every_progress(app, monkeypatch)
+    job = add(app, "https://fake.test/video?delay=0&join=0.15")["jobs"][
+        0
+    ]  # the join takes 1.5 s at least: the worker reports it once a second
     seen = finished(events, job["id"])
     assert seen[-1][1]["state"] == "done"
-    mine = [d for e, d in seen if e == "job" and d["id"] == job["id"]]
+    mine = [d for d in every if d["id"] == job["id"]] + [seen[-1][1]]
     join = [d for d in mine if d["stage"] == "processing" and d["what"] == "join"]
     assert len(join) >= 2, [(d["stage"], d["what"]) for d in mine]
     assert {d["total"] for d in join} == {3_400_000}
@@ -200,15 +203,13 @@ def test_a_folder_problem_carries_its_sentence(app, tmp_path):
     assert snap["dest"]["message"] == body["dest"]["message"]
 
 
-def test_the_interrupted_job_can_resume(tmp_path):
+def test_the_interrupted_job_can_resume(tmp_path, monkeypatch):
     from serve_fake import start
 
+    worker = Held(monkeypatch, tmp_path)
     httpd, _, jobs, _ = start(tmp_path)
-    job = jobs.add([{"url": "https://fake.test/slow?delay=0.1"}], "best")[0][0]
-    end = time.time() + 10
-    while not jobs.snapshot()["jobs"][0]["downloaded"]:
-        assert time.time() < end
-        time.sleep(0.05)
+    job = jobs.add([{"url": "https://fake.test/hold", "id": "v"}], "best")[0][0]
+    worker.held()  # caught mid-download by the quit
     httpd.shutdown()
     jobs.close()
     httpd, _, jobs, _ = start(tmp_path)
@@ -218,12 +219,10 @@ def test_the_interrupted_job_can_resume(tmp_path):
             "message": "Spool was closed before this download finished.",
             "hint": "resume",
         }
+        worker.go()
         jobs.retry(job["id"])
-        end = time.time() + 15
-        while jobs.snapshot()["jobs"][0]["state"] != "done":
-            assert time.time() < end
-            time.sleep(0.05)
-        assert "Resuming download at byte" in jobs.log(job["id"])
+        until(lambda: jobs.snapshot()["jobs"][0]["state"] == "done")
+        assert "Resuming download at byte 100" in jobs.log(job["id"])
     finally:
         httpd.shutdown()
         jobs.close()

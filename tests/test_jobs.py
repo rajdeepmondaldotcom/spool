@@ -6,6 +6,7 @@ import time
 
 import pytest
 from serve_fake import start
+from support import Held, until
 
 from spool.jobs import classify, error
 
@@ -56,14 +57,21 @@ def events(app):
 # Cancel
 
 
-def test_cancel_stops_the_whole_process_group_and_keeps_the_partial_file(app, events):
-    job_id = add(app, "https://fake.test/slow?delay=0.3")
-    wait_for(events, job_id, downloading)
+def post(app, url, id="v", preset="best"):
+    status, body = app.json("POST", "/api/jobs", {"entries": [{"url": url, "id": id}], "preset": preset})
+    assert status == 201, body
+    return body["jobs"][0]["id"]
+
+
+def test_cancel_stops_the_whole_process_group_and_keeps_the_partial_file(app, monkeypatch, tmp_path):
+    worker = Held(monkeypatch, tmp_path)
+    job_id = post(app, "https://fake.test/hold/child")
+    worker.held()  # it started a helper of its own and is mid-file
     proc = app.jobs.procs[job_id]
     status, job = app.json("POST", f"/api/jobs/{job_id}/cancel")
     assert (status, job["state"], job["stage"]) == (200, "cancelled", None)
     assert gone(proc)  # the worker and the helper it started
-    assert [p.name for p in app.dest.iterdir()] == ["Fake slow video [slow-1].mp4.part"]
+    assert [p.name for p in app.dest.iterdir()] == ["Same video [v].mp4.part"]
 
 
 def test_cancel_a_queued_job(app, events):
@@ -82,18 +90,20 @@ def test_cancel_only_what_is_waiting_or_running(app, events):
 # Retry
 
 
-def test_retry_resumes_the_partial_file(app, events):
-    job_id = add(app, "https://fake.test/slow?delay=0.1")
-    wait_for(events, job_id, downloading)
+def test_retry_resumes_the_partial_file(app, events, monkeypatch, tmp_path):
+    worker = Held(monkeypatch, tmp_path)
+    job_id = post(app, "https://fake.test/hold")
+    worker.held()
     proc = app.jobs.procs[job_id]
     app.json("POST", f"/api/jobs/{job_id}/cancel")
     assert gone(proc)  # the retry resumes what the first run left, not a file still being written
+    worker.go()
     status, job = app.json("POST", f"/api/jobs/{job_id}/retry")
     assert (status, job["state"], job["error"]) == (200, "queued", None)
     done = wait_for(events, job_id, lambda d: d["state"] == "done")
-    assert done["size"] == 4_000_000
+    assert done["size"] == 100 + 300  # the first run's bytes, then the whole of the second
     log = app.request("GET", f"/api/jobs/{job_id}/log")[1].decode()
-    assert "Resuming download at byte" in log
+    assert "Resuming download at byte 100" in log
 
 
 def test_retry_can_switch_the_engine(app, events):
@@ -163,7 +173,6 @@ def test_jobs_survive_a_restart_and_a_job_caught_mid_download_becomes_interrupte
         assert time.time() < end
         time.sleep(0.05)
     cut = jobs.add([{"url": "https://fake.test/slow?delay=0.3", "id": "slow-1", "title": "Cut"}], "best")[0][0]
-    time.sleep(0.5)
     httpd.shutdown()
     jobs.close()
 
@@ -423,11 +432,11 @@ def test_remove_cleans_a_job_added_from_a_pasted_link(app, events):
     assert list(app.dest.iterdir()) == []
 
 
-def test_remove_cleans_a_half_written_mp3(app, events):
-    job_id = add(app, "https://fake.test/video?delay=0.1", "mp3")
-    wait_for(events, job_id, lambda d: d["stage"] == "processing")
-    time.sleep(0.2)  # the fake is writing the .mp3 now
-    assert "Fake video 1 [vid-1].mp3" in [p.name for p in app.dest.iterdir()]
+def test_remove_cleans_a_half_written_mp3(app, monkeypatch, tmp_path):
+    worker = Held(monkeypatch, tmp_path)
+    job_id = post(app, "https://fake.test/hold/mp3", preset="mp3")
+    worker.held()  # the .mp3 is half made
+    assert "Same video [v].mp3" in [p.name for p in app.dest.iterdir()]
     app.json("POST", f"/api/jobs/{job_id}/cancel")
     assert app.request("DELETE", f"/api/jobs/{job_id}")[0] == 204
     assert list(app.dest.iterdir()) == []
@@ -472,23 +481,27 @@ def workers():
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="ps")
-def test_a_job_cancelled_as_it_starts_never_downloads_and_two_at_most_run(app, events):
+def test_a_job_cancelled_as_it_starts_never_downloads_and_two_at_most_run(app, events, monkeypatch):
+    from spool import system
+
+    spawn, spawned, most = system.spawn, [], []
+
+    def counted(*args, **kwargs):  # every worker Spool starts, and how many of its workers are alive then
+        most.append(1 + sum(p.poll() is None for p in spawned))
+        spawned.append(spawn(*args, **kwargs))
+        return spawned[-1]
+
+    monkeypatch.setattr(system, "spawn", counted)
     entry = {"url": "https://fake.test/slow?delay=0.2", "id": "slow-1", "title": "Slow"}
-    most = 0
     for n in range(25):
         job = app.json(
             "POST",
             "/api/jobs",
-            {"entries": [dict(entry, url=f"https://fake.test/slow/{n}?delay=0.2")], "preset": "best"},
+            {"entries": [dict(entry, url=f"https://fake.test/slow/{n}?delay=0.2", id=f"slow-{n}")], "preset": "best"},
         )
         assert app.json("POST", f"/api/jobs/{job[1]['jobs'][0]['id']}/cancel")[1]["state"] == "cancelled"
-        most = max(most, len(workers()))
-    end = time.time() + 10
-    while workers() and time.time() < end:
-        most = max(most, len(workers()))
-        time.sleep(0.05)
-    assert workers() == []
-    assert most <= 2
+    until(lambda: not workers())
+    assert max(most, default=0) <= 2
     assert [j["state"] for j in app.jobs.snapshot()["jobs"]] == ["cancelled"] * 25
 
 
@@ -581,11 +594,12 @@ def test_a_byte_that_is_not_utf8_from_the_worker_is_only_logged(app, events, mon
 # Twins and the queue
 
 
-def test_retry_refuses_while_the_same_download_runs_in_another_row(app, events):
-    first = add(app, "https://fake.test/slow?delay=0.1")
-    wait_for(events, first, downloading)
+def test_retry_refuses_while_the_same_download_runs_in_another_row(app, events, monkeypatch, tmp_path):
+    worker = Held(monkeypatch, tmp_path)
+    first = post(app, "https://fake.test/hold")
+    worker.held()
     app.json("POST", f"/api/jobs/{first}/cancel")
-    second = add(app, "https://fake.test/slow?delay=0.1")
+    second = post(app, "https://fake.test/hold")  # the same download again, in a row of its own
     assert second != first
     status, body = app.json("POST", f"/api/jobs/{first}/retry")
     assert (status, body["error"]["kind"]) == (409, "conflict")
@@ -662,17 +676,28 @@ def test_a_snapshot_checks_files_outside_the_lock(tmp_path, monkeypatch):
 
 
 def test_with_no_page_open_nothing_checks_the_folder(tmp_path, monkeypatch):
+    import types
+
+    import spool.jobs
     from spool import system
     from spool.engines import Engines
     from spool.jobs import Jobs
 
+    watched = []  # each second the watcher has slept through
+    clock = types.SimpleNamespace(
+        time=time.time,
+        monotonic=time.monotonic,
+        strftime=time.strftime,
+        sleep=lambda s: time.sleep(s) or (s == 1 and watched.append(s)),
+    )
+    monkeypatch.setattr(spool.jobs, "time", clock)
     jobs = Jobs(tmp_path, Engines(tmp_path / "engines"))
     checks = []
     check = system.check_dest
     monkeypatch.setattr(system, "check_dest", lambda p, **k: checks.append(p) or check(p, **k))
     try:
         jobs._snapshot_changed()
-        time.sleep(1.3)
+        until(lambda: len(watched) >= 2)  # the watcher went round at least once, whole
         assert checks == []
         q = jobs.subscribe()
         jobs._snapshot_changed()

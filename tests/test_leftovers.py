@@ -6,6 +6,7 @@ import time
 
 import pytest
 from serve_fake import start
+from support import Held
 
 
 @pytest.fixture
@@ -44,16 +45,22 @@ def test_remove_after_a_failed_download_again_keeps_the_finished_file(app, event
     assert os.path.exists(done["path"])
 
 
-def test_removing_a_cancelled_twin_after_the_finished_one_keeps_the_file(app, events):
-    first = add(app, "https://fake.test/audio?delay=0.1", "audio")
-    wait_for(events, first, lambda d: d["stage"] == "downloading")
+def test_removing_a_cancelled_twin_after_the_finished_one_keeps_the_file(app, events, monkeypatch, tmp_path):
+    worker = Held(monkeypatch, tmp_path / "w")
+    first = add_entry(app, {"url": "https://fake.test/hold", "id": "v"})
+    worker.held()
     app.json("POST", f"/api/jobs/{first}/cancel")
-    second = add(app, "https://fake.test/audio?delay=0", "audio")
-    assert second != first
+    second = add_entry(app, {"url": "https://fake.test/plain", "id": "v"})  # the same video, another link
     done = wait_for(events, second, lambda d: d["state"] == "done")
     assert app.request("DELETE", f"/api/jobs/{second}")[0] == 204
     assert app.request("DELETE", f"/api/jobs/{first}")[0] == 204
     assert names(app.dest) == [os.path.basename(done["path"])]
+
+
+def add_entry(app, entry, preset="best"):
+    status, body = app.json("POST", "/api/jobs", {"entries": [entry], "preset": preset})
+    assert status == 201, body
+    return body["jobs"][0]["id"]
 
 
 HELD = """
@@ -136,14 +143,13 @@ def test_a_twin_waits_while_a_cancelled_jobs_worker_is_still_dying(app, monkeypa
     until(lambda: job(app, twin)["state"] == "done")
 
 
-def test_remove_cleans_the_partial_file_after_a_restart(tmp_path):
+def test_remove_cleans_the_partial_file_after_a_restart(tmp_path, monkeypatch):
+    worker = Held(monkeypatch, tmp_path)
     httpd, _, jobs, _ = start(tmp_path)
     try:
-        job = jobs.add([{"url": "https://fake.test/slow?delay=0.1"}], "best")[0][0]
-        end = time.time() + 10
-        while not jobs.snapshot()["jobs"][0]["files"]:
-            assert time.time() < end
-            time.sleep(0.05)
+        job = jobs.add([{"url": "https://fake.test/hold", "id": "v"}], "best")[0][0]
+        worker.held()
+        until(lambda: jobs.snapshot()["jobs"][0]["files"])  # saved, so a restart knows it
     finally:
         httpd.shutdown()
         jobs.close()
