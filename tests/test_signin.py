@@ -227,3 +227,27 @@ def test_a_probe_that_needs_an_account_says_why(app, worker, chosen, steps, mess
     app.json("PUT", "/api/settings", {"signin": chosen})
     status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/x"})
     assert (status, body["error"]["message"], body["error"]["hint"]) == (422, message, hint)
+
+
+# The second engine cannot sign in
+
+ELSEWHERE = {
+    "kind": "signin",
+    "message": "This video needs a signed-in account, and Spool can't sign in for this link.",
+    "hint": None,
+}
+
+
+def test_a_download_on_the_second_engine_is_not_tried_signed_in(app, events, worker):
+    specs = worker({"message": AGE})
+    app.json("PUT", "/api/settings", {"signin": "chrome", "engine": "youtube-dl"})
+    assert download(app, events)["error"] == ELSEWHERE
+    assert [(s["engine"], s.get("signin")) for s in specs()] == [("youtube-dl", None)]
+
+
+def test_a_probe_on_the_second_engine_is_not_tried_signed_in(app, worker):
+    specs = worker({"message": AGE})
+    app.json("PUT", "/api/settings", {"signin": "chrome"})
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/x", "engine": "youtube-dl"})
+    assert (status, body["error"]) == (422, ELSEWHERE)
+    assert [(s["engine"], s.get("signin")) for s in specs()] == [("youtube-dl", None)]

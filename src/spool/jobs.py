@@ -168,7 +168,7 @@ class Jobs:
                 looked = True
                 if self.engines.newer(engine):
                     continue
-            if kind == "signin" and not signin and self.settings["signin"]:
+            if kind == "signin" and not signin and self.settings["signin"] and engine == SIGNS_IN:
                 signin = self.settings["signin"]  # once more, signed in
                 continue
             break
@@ -392,6 +392,8 @@ class Jobs:
         if kind == "signin_unread" or (kind == "signin" and signin):
             words = "signin_denied" if kind == "signin" else kind
             return dict(error(words, BROWSERS.get(signin, "your browser")), kind=kind)
+        if kind == "signin" and self.settings["signin"] and engine != SIGNS_IN:  # a browser is chosen, to no avail
+            return dict(error("signin_elsewhere"), kind=kind)
         e = error(kind, dest and system.display(dest), probe)
         status = self.engines.status()[engine]
         if kind == "blocked" and status["latest"] and status["latest"] != status["version"]:
@@ -505,7 +507,7 @@ class Jobs:
                     looked = True
                     if self._newer(job):
                         continue  # not one of the waits: a newer engine is a new chance
-                if kind == "signin" and not signin and self.settings["signin"]:
+                if kind == "signin" and not signin and self.settings["signin"] and job["engine"] == SIGNS_IN:
                     signin = self.settings["signin"]  # once more at once, signed in
                     continue
                 failure = self._error(kind, job["engine"], job["dest"], signin=signin)
@@ -735,6 +737,7 @@ MESSAGES = {  # kind -> (the sentence people read, hint). Every sentence the ser
     "empty": ("Spool found no video at this link.", None),
     "unavailable": ("This video isn't available. It may be private or removed.", None),
     "signin": ("This video needs a signed-in account. Choose your browser in Settings.", "signin"),
+    "signin_elsewhere": ("This video needs a signed-in account, and Spool can't sign in for this link.", None),
     "signin_denied": ("The account in {name} can't open this video.", None),  # kind signin, on a try signed in
     "signin_unread": (
         "Spool couldn't read the sign-in from {name}. Choose another browser in Settings, or try again.",
@@ -772,6 +775,7 @@ NOTES = {  # kind -> what a job waiting to try again says happened. Only these k
 }
 NEWER = ("blocked", "engine")  # kinds a newer engine may fix: looked for once a run, and once a probe
 LOOKING = "Getting a newer engine."  # a job's note while it looks
+SIGNS_IN = "yt-dlp"  # shortcut: only the first engine reads a browser's sign-in, until the second can
 KINDS = ("live", "no_js", "playlist", "signin_unread")  # the worker names these itself; its message is then not read
 BROWSERS = {  # the signin setting -> the browser's proper name, for the sentences
     "brave": "Brave",
