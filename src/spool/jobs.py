@@ -50,11 +50,12 @@ class Jobs:
         self.state_file, self.logs = self.data / "state.json", self.data / "logs"
         self.logs.mkdir(exist_ok=True)
         saved = self._load()
-        self.settings = {"dest": str(system.default_dest()), "engine": "yt-dlp", "preset": "best"}
+        self.settings = {"dest": str(system.default_dest()), "engine": "yt-dlp", "preset": "best", "signin": None}
         valid = {
             "dest": lambda v: isinstance(v, str) and os.path.isabs(v),
             "engine": lambda v: isinstance(v, str) and v in RELEASES,
             "preset": lambda v: isinstance(v, str) and v in PRESETS,
+            "signin": browser,
         }
         self.settings.update({k: v for k, v in saved.get("settings", {}).items() if k in valid and valid[k](v)})
         # keys added after v0.1's first saves
@@ -150,9 +151,9 @@ class Jobs:
                     raise
 
     def _probe(self, url, engine):
-        looked = False
+        looked, signin = False, None
         while True:
-            events = self._call({"mode": "probe", "url": url, "engine": engine})
+            events = self._call({"mode": "probe", "url": url, "engine": engine, **signed(signin)})
             result = next((e for e in reversed(events) if e.get("event") in ("info", "error")), None)
             if result is None:
                 kind = "engine"
@@ -166,9 +167,12 @@ class Jobs:
                 looked = True
                 if self.engines.newer(engine):
                     continue
+            if kind == "signin" and not signin and self.settings["signin"]:
+                signin = self.settings["signin"]  # once more, signed in
+                continue
             break
         if kind:
-            e = self._error(kind, engine, probe=True)
+            e = self._error(kind, engine, probe=True, signin=signin)
             raise Problem(422, kind, e["message"], e["hint"])
         return {
             "engine": engine,
@@ -310,7 +314,7 @@ class Jobs:
         """Save settings. A destination with a problem is still saved: the drive may come back."""
         changes = dict(changes)
         create = changes.pop("create", False)
-        if changes.keys() - {"dest", "engine", "preset"}:
+        if changes.keys() - {"dest", "engine", "preset", "signin"}:
             raise Problem(422, "invalid_setting", "Spool has no setting by that name.")
         if not isinstance(create, bool):
             raise Problem(422, "invalid_setting", "Create is true or false.")
@@ -326,6 +330,8 @@ class Jobs:
             raise Problem(422, "invalid_engine", "Spool doesn't know that engine.")
         if "preset" in changes and not (isinstance(changes["preset"], str) and changes["preset"] in PRESETS):
             raise Problem(422, "invalid_preset", "Spool doesn't know that quality.")
+        if "signin" in changes and not browser(changes["signin"]):
+            raise Problem(422, "invalid_signin", "Spool can't sign in with that browser.")
         with self.lock:
             self.settings.update(changes)
             self._save()
@@ -379,8 +385,12 @@ class Jobs:
             raise problem(503, "engine_not_ready")
         return engine
 
-    def _error(self, kind, engine, dest=None, probe=False):
-        """The error for a kind, with the folder's name and, for a refusal, whether an engine update may help."""
+    def _error(self, kind, engine, dest=None, probe=False, signin=None):
+        """The error for a kind, with the folder's name and, for a refusal, whether an engine update may help.
+        signin: the browser the failed try signed in with."""
+        if kind == "signin_unread" or (kind == "signin" and signin):
+            words = "signin_denied" if kind == "signin" else kind
+            return dict(error(words, BROWSERS.get(signin, "your browser")), kind=kind)
         e = error(kind, dest and system.display(dest), probe)
         status = self.engines.status()[engine]
         if kind == "blocked" and status["latest"] and status["latest"] != status["version"]:
@@ -460,9 +470,10 @@ class Jobs:
         """Run a job in the slot _pump reserved for it; the slot is freed only when its worker is gone."""
         try:
             failure, switched, waited, furthest, looked = None, False, 0, None, False
+            signin = None  # the browser this run signs in with, once a try asked for an account
             while True:
                 dest_problem(self._check(job["dest"], but=job))
-                result = self._attempt(job)
+                result = self._attempt(job, signin)
                 if result is None or result["event"] == "done" or self.closed or job["state"] != "running":
                     break  # done, or cancelled or quit: nothing failed, so there is nothing to check
                 kind = result.get("kind") if result.get("kind") in KINDS else classify(result["message"])
@@ -474,7 +485,10 @@ class Jobs:
                     looked = True
                     if self._newer(job):
                         continue  # not one of the waits: a newer engine is a new chance
-                failure = self._error(kind, job["engine"], job["dest"])
+                if kind == "signin" and not signin and self.settings["signin"]:
+                    signin = self.settings["signin"]  # once more at once, signed in
+                    continue
+                failure = self._error(kind, job["engine"], job["dest"], signin=signin)
                 if kind in ("unsupported", "empty") and not switched and self.engines.path(other(job["engine"])):
                     with self.lock:  # the other engine may read what this one can't
                         job["engine"], switched = other(job["engine"]), True
@@ -550,10 +564,17 @@ class Jobs:
             self._changed(job)
         return True
 
-    def _attempt(self, job):
-        """One worker run: its last event, or None if the job was cancelled before it could start."""
+    def _attempt(self, job, signin=None):
+        """One worker run: its last event, or None if the job was cancelled before it could start. signin: the
+        browser to read the sign-in from, on a try that uses it."""
         spec = self._spec(
-            job["engine"], mode="download", url=job["url"], dest=job["dest"], preset=job["preset"], item=job["item"]
+            job["engine"],
+            mode="download",
+            url=job["url"],
+            dest=job["dest"],
+            preset=job["preset"],
+            item=job["item"],
+            **signed(signin),
         )
         result = {"event": "error", "message": ""}
         with open(self.logs / f"{job['id']}.log", "a", encoding="utf-8") as log:
@@ -676,7 +697,13 @@ MESSAGES = {  # kind -> (the sentence people read, hint). Every sentence the ser
     "too_long": ("That link is too long for Spool.", None),
     "unsupported": ("Spool can't read this link.", None),
     "empty": ("Spool found no video at this link.", None),
-    "unavailable": ("This video is private, removed, or needs a sign-in.", None),
+    "unavailable": ("This video isn't available. It may be private or removed.", None),
+    "signin": ("This video needs a signed-in account. Choose your browser in Settings.", "signin"),
+    "signin_denied": ("The account in {name} can't open this video.", None),  # kind signin, on a try signed in
+    "signin_unread": (
+        "Spool couldn't read the sign-in from {name}. Choose another browser in Settings, or try again.",
+        "signin",
+    ),
     "live": ("This is live now. Download it after it ends.", None),
     "playlist": ("This link is a list of videos. Paste it in the link field to choose from it.", None),
     "blocked": ("The site refused the download.", "retry"),  # update_engine when a newer engine exists
@@ -709,7 +736,18 @@ NOTES = {  # kind -> what a job waiting to try again says happened. Only these k
 }
 NEWER = ("blocked", "engine")  # kinds a newer engine may fix: looked for once a run, and once a probe
 LOOKING = "Getting a newer engine."  # a job's note while it looks
-KINDS = ("live", "no_js", "playlist")  # the worker names these itself; its message is then not read
+KINDS = ("live", "no_js", "playlist", "signin_unread")  # the worker names these itself; its message is then not read
+BROWSERS = {  # the signin setting -> the browser's proper name, for the sentences
+    "brave": "Brave",
+    "chrome": "Chrome",
+    "chromium": "Chromium",
+    "edge": "Edge",
+    "firefox": "Firefox",
+    "opera": "Opera",
+    "safari": "Safari",
+    "vivaldi": "Vivaldi",
+    "whale": "Whale",
+}
 DEST_KINDS = {
     "unplugged": "dest_unplugged",
     "missing": "dest_missing",
@@ -740,6 +778,16 @@ def dest_problem(check, status=None):
     """Raise the problem for a destination check, if it has one."""
     if check["problem"]:
         raise problem(status, DEST_KINDS[check["problem"]], check["display"])
+
+
+def browser(value):
+    """Whether value is a signin setting: None (off) or a browser Spool can read a sign-in from."""
+    return value is None or (isinstance(value, str) and value in BROWSERS)
+
+
+def signed(signin):
+    """The spec's signin, present only on a try that uses it."""
+    return {"signin": signin} if signin else {}
 
 
 def other(engine):
@@ -845,17 +893,13 @@ ERRORS = [  # (kind, lowercase pieces of engine messages); the first match wins.
     ("empty", ("found no video at this link",)),
     ("no_ffmpeg", ("ffmpeg not found", "ffprobe and ffmpeg not found", "ffmpeg is not installed", "ffprobe/avprobe")),
     ("engine", ("requested format is not available",)),  # the video is there; the log says what was asked
-    # before "unavailable": the robot check says "sign in" too. Never tried again by itself: more requests make it worse
+    # before "signin": the robot check says "sign in" too. Never tried again by itself: more requests make it worse
     ("limited", ("not a bot", "http error 429", "too many requests", "available, try again later")),
     ("blocked", ("http error 403",)),
-    (
-        "unavailable",
+    (  # before "unavailable": "Private video" and "login required" ride with words it has
+        "signin",
         (
-            "video unavailable",
-            "is unavailable",
             "private video",
-            "is not available",
-            "has been removed",
             "members-only",
             "registered users",
             "logged-in",
@@ -864,6 +908,15 @@ ERRORS = [  # (kind, lowercase pieces of engine messages); the first match wins.
             "login required",
             "confirm your age",
             "age-restricted",
+        ),
+    ),
+    (
+        "unavailable",
+        (
+            "video unavailable",
+            "is unavailable",
+            "is not available",
+            "has been removed",
             "in your country",
             "geo restrict",
             "http error 404",

@@ -231,15 +231,15 @@ def test_probe_errors_have_a_kind_and_plain_words(app):
         ("ERROR: [youtube] abc: This content isn\ufffdt available, try again later.", "limited"),  # a mark lost
         ("ERROR: [youtube] abc: Sign in to confirm you\ufffdre not a bot.", "limited"),
         ("ERROR: [youtube] abc: Sign in to confirm you`re not a bot.", "limited"),
-        ("ERROR: [youtube] abc: Sign in to confirm your age. This video may be inappropriate", "unavailable"),
-        ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access", "unavailable"),
-        ("ERROR: [youtube] abc: This video is available to this channel's members-only content", "unavailable"),
+        ("ERROR: [youtube] abc: Sign in to confirm your age. This video may be inappropriate", "signin"),
+        ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access", "signin"),
+        ("ERROR: [youtube] abc: This video is available to this channel's members-only content", "signin"),
         ("ERROR: unable to download video data: HTTP Error 403: Forbidden", "blocked"),
-        ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access to this video", "unavailable"),
+        ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access to this video", "signin"),
         ("ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader", "unavailable"),
         (
             "ERROR: [youtube] abc: Sign in to confirm your age. This video may be inappropriate for some users.",
-            "unavailable",
+            "signin",
         ),
         ("ERROR: Unsupported URL: https://example.com/", "unsupported"),
         (
@@ -261,17 +261,17 @@ def test_probe_errors_have_a_kind_and_plain_words(app):
         ("ERROR: [youtube] abc: Video unavailable", "unavailable"),
         (
             "ERROR: [vimeo] 123: This video is only available for registered users. Use --cookies, --cookies-from-browser, --username and --password, --netrc-cmd, or --netrc (vimeo) to provide account credentials",
-            "unavailable",
+            "signin",
         ),
         (
             "ERROR: [instagram] abc: Requested content is not available, rate-limit reached or login required",
-            "unavailable",
+            "signin",
         ),
-        ("ERROR: [twitter] 1: You need to log in to view this content", "unavailable"),
-        ("ERROR: [patreon] 1: You need to be logged-in to access this", "unavailable"),
+        ("ERROR: [twitter] 1: You need to log in to view this content", "signin"),
+        ("ERROR: [patreon] 1: You need to be logged-in to access this", "signin"),
         (
             "ERROR: [youtube] abc: Join this channel to get access to members-only content like this video, and other exclusive perks.",
-            "unavailable",
+            "signin",
         ),
         (
             "No supported JavaScript runtime could be found. ERROR: [youtube] KXItezz-BhA: Requested format is not available. Use --list-formats for a list of available formats",
@@ -331,7 +331,14 @@ def test_a_kind_the_worker_names_is_used_as_is(app, events, monkeypatch, tmp_pat
         ("too_long", None, "That link is too long for Spool.", None),
         ("unsupported", None, "Spool can't read this link.", None),
         ("empty", None, "Spool found no video at this link.", None),
-        ("unavailable", None, "This video is private, removed, or needs a sign-in.", None),
+        ("unavailable", None, "This video isn't available. It may be private or removed.", None),
+        ("signin", None, "This video needs a signed-in account. Choose your browser in Settings.", "signin"),
+        (
+            "signin_unread",
+            "Safari",
+            "Spool couldn't read the sign-in from Safari. Choose another browser in Settings, or try again.",
+            "signin",
+        ),
         ("live", None, "This is live now. Download it after it ends.", None),
         ("blocked", None, "The site refused the download.", "retry"),
         (

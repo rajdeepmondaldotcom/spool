@@ -275,3 +275,26 @@ def test_a_starting_job_may_carry_a_note_that_is_cleared_after(app, events, monk
     go.set()
     failed = finished(events, job["id"])[-1][1]
     assert (failed["state"], failed["note"]) == ("failed", None)
+
+
+# Signing in
+
+
+def test_the_snapshot_carries_the_signin_setting_and_a_failure_offers_settings(app, events, monkeypatch, tmp_path):
+    import spool.jobs
+
+    assert app.jobs.snapshot()["settings"]["signin"] is None
+    assert app.json("PUT", "/api/settings", {"signin": "firefox"})[1]["settings"]["signin"] == "firefox"
+    snap = events.until(lambda e, d: e == "snapshot" and d["settings"]["signin"] == "firefox")[-1][1]
+    assert snap["settings"]["signin"] == "firefox"
+    app.json("PUT", "/api/settings", {"signin": None})
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "import sys\nsys.stdin.readline()\n"
+        'print(\'{"event": "error", "message": "ERROR: Sign in to confirm your age"}\')\n'
+    )
+    monkeypatch.setattr(spool.jobs, "WORKER", worker)
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/x"})
+    assert (status, body["error"]["kind"], body["error"]["hint"]) == (422, "signin", "signin")
+    failed = finished(events, add(app, "https://fake.test/x")["jobs"][0]["id"])[-1][1]
+    assert (failed["error"]["kind"], failed["error"]["hint"]) == ("signin", "signin")

@@ -19,4 +19,5 @@ The words the code uses. Where the screen uses a plainer word, it is in brackets
 | **Note** | A running job's short line on what is happening: why it waits to try again, or that it is getting a newer engine. |
 | **Worker** | A child process that runs one engine call (a probe or a download) and reports as JSON lines. |
 | **Destination** (folder) | The folder finished files are saved to. |
+| **Sign-in** (sign in with) | The signed-in account a browser on this computer already has. The `signin` setting names the browser, or is off; Spool reads it only for a video that asks for an account, on one try again. |
 | **Snapshot** | The whole state the browser needs, sent when it connects: settings, destination, engines, tools and jobs. |
