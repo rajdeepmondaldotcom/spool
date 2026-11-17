@@ -212,7 +212,7 @@ wheels = [
 
 [[package]]
 name = "spool-dl"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "." }
 
 [package.dev-dependencies]

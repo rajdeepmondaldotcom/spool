@@ -1102,6 +1102,38 @@ def test_a_tab_from_an_earlier_launch_works_again_once_a_new_tab_is_let_in(page,
     expect(page.get_by_label("Link to download")).to_be_visible()
 
 
+def test_a_tab_that_lost_its_link_works_again_when_the_launch_link_is_put_in_its_address(page, spool):
+    origin = spool[0].split("#")[0]
+    page.goto(origin + "#t=stale")
+    expect(page.get_by_text("This tab lost its link to Spool.", exact=False)).to_be_visible()
+    page.goto(spool[0] + "&url=https%3A%2F%2Ffake.test%2Fvideo")  # only the fragment changes: no new load by itself
+    expect(page.get_by_label("Link to download")).to_have_value(VIDEO)  # the link given with it waits in the field
+    expect(page).to_have_url(re.compile(r"/$"))
+
+
+def test_a_stopped_tab_works_again_when_the_next_launch_link_is_put_in_its_address(page, tmp_path, monkeypatch):
+    from spool import server
+
+    httpd, url, jobs, _ = serve_fake.start(tmp_path)
+    port = httpd.server_address[1]
+    page.goto(url)
+    page.get_by_label("Link to download").wait_for()
+    jobs.close()
+    httpd.shutdown()
+    httpd.server_close()
+    expect(page.get_by_text(STOPPED)).to_be_visible()
+    real = server.make_server
+    monkeypatch.setattr(server, "make_server", lambda *a, **k: real(*a, **{**k, "token": "next-launch"}))
+    httpd, url, jobs, _ = serve_fake.start(tmp_path, port=port)  # each launch has a new token
+    try:
+        page.goto(url.replace("fake-token", "next-launch"))
+        expect(page.get_by_label("Link to download")).to_be_visible()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        jobs.close()
+
+
 # api.js: silence that means the stream is gone; how long a question waits for an answer
 STALL_MS, ASK_MS = 40_000, 2_000
 
@@ -1158,6 +1190,49 @@ def test_a_suspended_tab_that_wakes_up_hands_the_stream_over(page, spool):
     until(lambda: len(spool[1].subscribers) == 1)  # the woken tab's stream is gone once Spool next writes to it
     held, pending = locks(second)
     assert (len(held), len(pending)) == (1, 2)  # one tab reads; both wait in line for when it closes
+
+
+# The tab's first place in line for the stream is held back until its own take-over asks; then both go to the browser
+# back to back, so the tab is granted its lock and takes it from itself. window.order says what the browser did.
+OWN_LOCK_TAKEN = """
+const real = LockManager.prototype.request;
+let first = true, waiting = null;
+window.order = [];
+LockManager.prototype.request = function (name, options, callback) {
+  if (!name.startsWith('spool-events-')) return real.apply(this, arguments);
+  const tag = options.steal ? 'take-over' : first ? 'in line' : 'in line again';
+  const send = () => real.call(this, name, options, (lock) => { order.push(tag + ' granted'); return callback(lock); })
+    .catch((e) => { order.push(tag + ' ended: ' + e.name); throw e; });
+  if (!options.steal && first) { first = false; return new Promise((ok, no) => { waiting = () => send().then(ok, no); }); }
+  if (options.steal && waiting) { waiting(); waiting = null; }
+  return send();
+};
+"""
+
+
+def test_a_tab_granted_its_lock_as_it_takes_the_stream_over_keeps_one_stream(page, spool):
+    page.add_init_script(OWN_LOCK_TAKEN)
+    page.clock.install()  # nothing on a timer happens until the test moves the clock on
+    made = []
+    page.on("request", lambda r: "/api/events" in r.url and made.append(r))
+    page.goto(spool[0])
+    expect(page.get_by_text("Connecting to Spool…")).to_be_visible()  # its place in line is held back
+    page.clock.run_for(ASK_MS)  # its take-over fires
+    expect(page.get_by_label("Link to download")).to_be_visible()
+    page.wait_for_function("() => order.some((o) => o.startsWith('in line ended'))")
+    for _ in range(3):  # each round would be one more take-over from itself
+        page.clock.run_for(ASK_MS)
+        fence(page)
+    asked = len(made)
+    for _ in range(3):
+        page.clock.run_for(ASK_MS)
+        fence(page)
+    assert len(made) == asked  # no reconnecting over and over
+    add(spool, [("https://fake.test/video/5", "Fake video 5")])
+    expect(group(page, "Finished").get_by_text("Fake video 5")).to_be_visible(timeout=15000)
+    until(lambda: len(spool[1].subscribers) == 1)  # a stream the page left goes once Spool next writes to it
+    held, pending = locks(page)
+    assert (len(held), len(pending)) == (1, 1)  # it holds the stream, and stays in line for it
 
 
 def test_a_browser_that_refuses_the_lock_still_shows_the_page(page, spool):
