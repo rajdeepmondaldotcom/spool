@@ -6,7 +6,7 @@ import time
 
 import pytest
 from serve_fake import start
-from support import Held, until
+from support import Held, WriteTests, until
 
 from spool.jobs import classify, error
 
@@ -64,13 +64,15 @@ def post(app, url, id="v", preset="best"):
 
 
 def test_cancel_stops_the_whole_process_group_and_keeps_the_partial_file(app, monkeypatch, tmp_path):
-    worker = Held(monkeypatch, tmp_path)
+    worker, checks = Held(monkeypatch, tmp_path), WriteTests(monkeypatch)
     job_id = post(app, "https://fake.test/hold/child")
     worker.held()  # it started a helper of its own and is mid-file
     proc = app.jobs.procs[job_id]
+    checks.arm()  # from here, any write test Spool makes on the folder leaves its file there
     status, job = app.json("POST", f"/api/jobs/{job_id}/cancel")
     assert (status, job["state"], job["stage"]) == (200, "cancelled", None)
     assert gone(proc)  # the worker and the helper it started
+    until(lambda: job_id not in app.jobs.procs)  # Spool is done with the job: nothing of its is in flight
     assert [p.name for p in app.dest.iterdir()] == ["Same video [v].mp4.part"]
 
 
@@ -433,11 +435,13 @@ def test_remove_cleans_a_job_added_from_a_pasted_link(app, events):
 
 
 def test_remove_cleans_a_half_written_mp3(app, monkeypatch, tmp_path):
-    worker = Held(monkeypatch, tmp_path)
+    worker, checks = Held(monkeypatch, tmp_path), WriteTests(monkeypatch)
     job_id = post(app, "https://fake.test/hold/mp3", preset="mp3")
     worker.held()  # the .mp3 is half made
     assert "Same video [v].mp3" in [p.name for p in app.dest.iterdir()]
+    checks.arm()
     app.json("POST", f"/api/jobs/{job_id}/cancel")
+    until(lambda: job_id not in app.jobs.procs)
     assert app.request("DELETE", f"/api/jobs/{job_id}")[0] == 204
     assert list(app.dest.iterdir()) == []
 
@@ -887,3 +891,19 @@ def test_the_watcher_sends_a_snapshot_only_when_the_folder_or_tools_change(tmp_p
         assert (event, snap["tools"]["ffmpeg"]) == ("snapshot", False)
     finally:
         jobs.close()
+
+
+def test_a_cancel_never_tests_the_folder(app, monkeypatch, tmp_path):
+    """The write test after a run tells an unplugged drive from a plain failure; after Cancel nothing failed.
+    (A real failure still runs it: test_a_destination_that_vanishes_mid_download_is_named_as_missing.)"""
+    from spool import system
+
+    worker = Held(monkeypatch, tmp_path)
+    written, check = [], system.check_dest
+    monkeypatch.setattr(system, "check_dest", lambda p, write=True: written.append(write) or check(p, write=write))
+    job_id = post(app, "https://fake.test/hold")
+    worker.held()
+    before = written.count(True)  # the add and the start each test the folder
+    app.json("POST", f"/api/jobs/{job_id}/cancel")
+    until(lambda: job_id not in app.jobs.procs)  # the job's run is over
+    assert written.count(True) == before

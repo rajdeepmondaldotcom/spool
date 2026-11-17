@@ -2,6 +2,7 @@
 
 import http.client
 import json
+import os
 import queue
 import socket
 import threading
@@ -158,3 +159,25 @@ def until(test, timeout=20):
     while not test():
         assert time.time() < end, "it never happened"
         time.sleep(0.02)
+
+
+class WriteTests:
+    """Spool's folder write tests, made visible: once armed, each leaves its file in the folder (as macOS shows the
+    real one for an instant), so a test that lists a folder while Spool checks it sees the file every time."""
+
+    def __init__(self, monkeypatch):
+        from spool import system
+
+        self.armed, self.left, real = False, [], system.probe_dest
+
+        def probe_dest(path):
+            if self.armed:
+                left = os.path.join(path, f".spool-write-test-held-{len(self.left)}")
+                open(left, "w").close()
+                self.left.append(left)
+            return real(path)
+
+        monkeypatch.setattr(system, "probe_dest", probe_dest)
+
+    def arm(self):
+        self.armed = True

@@ -456,8 +456,8 @@ class Jobs:
             while True:
                 dest_problem(self._check(job["dest"], but=job))
                 result = self._attempt(job)
-                if result is None or result["event"] == "done":
-                    break
+                if result is None or result["event"] == "done" or self.closed or job["state"] != "running":
+                    break  # done, or cancelled or quit: nothing failed, so there is nothing to check
                 kind = result.get("kind") if result.get("kind") in KINDS else classify(result["message"])
                 try:
                     dest_problem(self._check(job["dest"], but=job))  # a drive unplugged mid-download says so
