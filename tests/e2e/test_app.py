@@ -1190,16 +1190,14 @@ def test_a_tab_keeps_hearing_progress_after_the_tab_holding_the_stream_goes_sile
     expect(second.get_by_label("Link to download")).to_be_visible()
     stop_clock(page)  # nothing on a timer happens until the test moves the clock on
     # The first tab still runs but no longer reaches the others. (The debugger cannot hold it here: moving the
-    # clock waits for every tab.)
-    page.evaluate("() => { BroadcastChannel.prototype.postMessage = () => {}; }")
-    add(spool, [("https://fake.test/video/5", "Fake video 5")])
-    second.evaluate(
-        """() => { const c = new BroadcastChannel('spool-fake-token');
-        c.onmessage = (e) => { if (e.data.event === 'refresh') window.asked = true; }; }"""
+    # clock waits for every tab.) It cannot ask for the lock either, so it never takes the stream back while nobody
+    # can hear it, just as a suspended tab asks for nothing.
+    page.evaluate(
+        """() => { BroadcastChannel.prototype.postMessage = () => {};
+        LockManager.prototype.request = () => new Promise(() => {}); }"""
     )
-    second.clock.run_for(STALL_MS)  # a long silence: the tab asks whether the one holding the stream is still there
-    second.wait_for_function("() => window.asked")
-    second.clock.run_for(ASK_MS)  # and nobody answers
+    add(spool, [("https://fake.test/video/5", "Fake video 5")])
+    second.clock.run_for(STALL_MS + ASK_MS)  # a long silence, then a question nobody answers
     expect(group(second, "Finished").get_by_text("Fake video 5")).to_be_visible(timeout=15000)
 
 
