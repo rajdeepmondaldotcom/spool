@@ -418,14 +418,60 @@ def test_one_source_offline_still_finds_the_other(tmp_path):
 
 
 def test_newer_waits_for_an_update_already_running(tmp_path):
-    github = FakeGitHub(delay=0.3)
+    import threading
+
+    github, gate = FakeGitHub(), threading.Event()
+    resolve = github.resolve
+    github.resolve = lambda url: gate.wait(20) and resolve(url)  # the update is held until newer() waits for it
     engines = installed(tmp_path, github)
+    waiting, wait = threading.Event(), engines.done.wait
+    engines.done.wait = lambda *a: waiting.set() or wait(*a)
     engines.update("yt-dlp")
-    assert engines.newer("yt-dlp") is True  # the running update installed LATEST
+    answer = []
+    looking = threading.Thread(target=lambda: answer.append(engines.newer("yt-dlp")))
+    looking.start()
+    assert waiting.wait(20)
+    gate.set()
+    looking.join(20)
+    assert answer == [True]  # the running update installed LATEST
     assert engines.status()["yt-dlp"]["version"] == LATEST
+    assert github.fetched.count(f"{RELEASES['yt-dlp']}/latest") == 1  # newer() did not look itself
     engines.update("youtube-dl")
     settle(engines)  # it has LATEST now: nothing is newer
     assert engines.newer("youtube-dl") is False
+
+
+def test_a_failed_look_leaves_no_error_on_the_page_and_keeps_the_cause(tmp_path):
+    engines = installed(tmp_path, FakeGitHub(offline=True))
+    assert engines.newer("yt-dlp") is False
+    assert engines.status()["yt-dlp"]["error"] is None
+    assert "update yt-dlp" in (tmp_path / "engines" / "update.log").read_text()
+    engines.error["yt-dlp"] = "an earlier update's words"
+    engines.asked.clear()
+    engines.newer("yt-dlp")
+    assert engines.status()["yt-dlp"]["error"] == "an earlier update's words"  # left as it was
+
+
+def test_a_daily_build_that_fails_to_install_never_offers_an_update_that_finds_nothing(tmp_path):
+    github = FakeGitHub(latest=INSTALLED, nightly=NIGHTLY, corrupt=True)
+    engines = installed(tmp_path, github)
+    assert engines.newer("yt-dlp") is False
+    assert engines.status()["yt-dlp"]["latest"] == INSTALLED  # what update() would install
+    github.corrupt = False
+    engines.asked.clear()
+    assert engines.newer("yt-dlp") is True
+    status = engines.status()["yt-dlp"]
+    assert (status["version"], status["latest"]) == (NIGHTLY, NIGHTLY)  # never older than the version
+
+
+def test_newer_never_raises(tmp_path, monkeypatch):
+    engines = installed(tmp_path, FakeGitHub())
+    monkeypatch.setattr(engines, "version", lambda name: (_ for _ in ()).throw(PermissionError(13, "denied")))
+    assert engines.newer("yt-dlp") is False
+    monkeypatch.undo()
+    engines.on_change = lambda: (_ for _ in ()).throw(RuntimeError("a listener broke"))
+    engines.newer("youtube-dl")  # answers, whatever it answers
+    assert engines.busy["youtube-dl"] is None  # and no update is left looking busy
 
 
 @pytest.mark.parametrize("launch", [True, False])

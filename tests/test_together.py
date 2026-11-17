@@ -1,6 +1,7 @@
 """Two pasted links download at once: a job added without its id learns it from its worker (contract section 1)."""
 
 import json
+import threading
 import time
 
 import pytest
@@ -223,8 +224,23 @@ def test_a_held_job_is_never_said_to_be_not_answering(app, events, worker, monke
     assert {d["state"] for d in last.values()} == {"done"}, last[second]["error"]
 
 
-def test_two_links_without_ids_download_at_once_with_the_real_worker(app, events):
-    ids = [add(app, f"https://fake.test/video/{n}?delay=0") for n in (1, 2)]
-    last = ended(events, *ids, timeout=30)
-    assert {d["state"] for d in last.values()} == {"done"}
-    assert all(job(app, i)["entry_id"] for i in ids)
+def test_two_links_without_ids_download_at_once_with_the_real_worker(app, events, monkeypatch):
+    """The first job's worker is kept waiting at its go while the second, another video, downloads whole."""
+    first_id, told, release, go = [], threading.Event(), threading.Event(), app.jobs._go
+
+    def held_go(job, proc, vid, hold):
+        if job["id"] in first_id:
+            told.set()
+            assert release.wait(20)
+        go(job, proc, vid, hold)
+
+    monkeypatch.setattr(app.jobs, "_go", held_go)
+    first_id.append(add(app, "https://fake.test/video/1?delay=0"))
+    assert told.wait(20)  # its worker named the video and waits
+    second = add(app, "https://fake.test/video/2?delay=0")
+    assert ended(events, second)[second]["state"] == "done"
+    assert job(app, first_id[0])["state"] == "running"
+    release.set()
+    assert ended(events, first_id[0])[first_id[0]]["state"] == "done"
+    assert job(app, first_id[0])["entry_id"] and job(app, second)["entry_id"]
+    assert job(app, first_id[0])["entry_id"] != job(app, second)["entry_id"]

@@ -153,33 +153,42 @@ class Engines:
 
     def newer(self, name):
         """Install the newest build of any source when it is newer than the installed one; True when one was.
-        Looks at most once an hour; while an update of name runs, waits for it. Never raises."""
-        before = self.version(name)
-        with self.lock:
-            if self.busy[name]:
-                while self.busy[name]:
-                    self.done.wait()
-                return self.version(name) != before
-            if time.monotonic() - self.asked.get(name, -HOUR) < HOUR:
-                return False
-            self.asked[name] = time.monotonic()
-            self.busy[name] = "updating" if before else "installing"
-            self.error[name] = None
-        self.on_change()
-        self._update(name, SOURCES[name])
-        return self.version(name) != before
+        Looks at most once an hour; while an update of name runs, waits for it. Never raises, and a failed look
+        is only logged: nobody asked for it, and the installed engine still works."""
+        try:
+            with self.lock:
+                before = self.version(name)  # under the lock: an update that ends now is seen by the wait below
+                if self.busy[name]:
+                    while self.busy[name]:
+                        self.done.wait()
+                    return self.version(name) != before
+                if time.monotonic() - self.asked.get(name, -HOUR) < HOUR:
+                    return False
+                self.asked[name] = time.monotonic()
+                self.busy[name] = "updating" if before else "installing"
+            try:
+                self.on_change()
+            finally:
+                self._update(name, SOURCES[name], look=True)
+            return self.version(name) != before
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                log(self.root, f"look for a newer {name}", exc)
+            return False
 
     def _latest(self, name, source):
         tag = self.resolve(f"{source}/latest").rstrip("/").rsplit("/", 1)[-1]
         if not TAG.fullmatch(tag):
             raise ValueError(f"unexpected release tag {tag!r}")
-        with self.lock:
-            self.latest[name] = max(self.latest[name], tag, key=order)
-        self.on_change()
+        if source == RELEASES[name]:  # latest is what update() would install; a daily build shows once installed
+            with self.lock:
+                self.latest[name] = max(self.latest[name], tag, key=order)
+            self.on_change()
         return tag
 
-    def _update(self, name, sources=None):
-        """Install the newest of sources' latest builds (the stable releases by default) if it is newer."""
+    def _update(self, name, sources=None, look=False):
+        """Install the newest of sources' latest builds (the stable releases by default) if it is newer.
+        look: newer() asked, so error stays as it was."""
         error = None
         try:
             found, failed = [], None
@@ -206,7 +215,8 @@ class Engines:
             )
         with self.lock:
             self.busy[name] = None
-            self.error[name] = error
+            if not look:
+                self.error[name] = error
             self.done.notify_all()
         self.on_change()
 
