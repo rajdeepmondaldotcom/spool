@@ -266,7 +266,11 @@ def total_of(d):
     return d.get("total_bytes") or (d.get("info_dict") or {}).get("filesize") or d.get("total_bytes_estimate")
 
 
-AT_ONCE = 4  # measured on a home line: 1 connection 7.5 MB/s, 2 10.2, 4 11.5, 8 8.8
+# shortcut: YouTube streams come whole, one connection, as in 0.1.2. In pieces (AT_ONCE > 1, 4 measured best on a
+# home line) a 239 MB film came at 9.7 MB/s against 7.9 whole in one run; but one run stalled six minutes on one piece
+# and one got a 403 on the data, while one connection fetched 35 GB and 3.4 GB without a failure. Raise it only after
+# many clean real-site runs in pieces, with no stall, no refusal, and a measured gain. Tests set it where they need it.
+AT_ONCE = 1
 THROTTLED = 20_000  # bytes a second: a piece slower for 3 seconds makes the engine read the video again and go on
 # with fresh links. Pieces join in order, so one throttled piece (seen: 1 KB/s for minutes) holds up the rest. Only on
 # the first read: the engine's re-reads have no limit, and on a slow line every piece is below it
@@ -428,7 +432,7 @@ def download(engine, module, params, spec):
             for e in {ext, ".mp3" if spec["preset"] == "mp3" else ext}:  # the merge and the metadata step write here
                 wrote(base + ".temp" + e)
             split = information.get("requested_formats")  # the engine's names for each stream's file
-            fast = pieces[0] and information.get("extractor_key") == "Youtube"
+            fast = AT_ONCE > 1 and pieces[0] and information.get("extractor_key") == "Youtube"
             reads[0] += fast
             used.clear()
             finished.clear()
@@ -632,7 +636,7 @@ def main():
         download(engine, module, params, spec)
 
 
-if __name__ == "__main__":
+def run():
     sys.stdout = sys.stderr  # an engine that prints must not corrupt the event stream
     try:
         main()
@@ -642,3 +646,7 @@ if __name__ == "__main__":
             message, kind = "No supported JavaScript runtime could be found.\n" + message, "no_js"
         emit(event="error", message=message, **({"kind": kind} if kind else {}))
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    run()
