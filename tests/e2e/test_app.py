@@ -9,7 +9,7 @@ import time
 import pytest
 import serve_fake  # on the path through conftest
 from playwright.sync_api import expect
-from support import Held, until
+from support import Client, Held, until
 
 VIDEO = "https://fake.test/video"
 
@@ -398,7 +398,7 @@ def test_the_page_never_names_the_programs_underneath(app, spool):
     assert_no_program_names(app, "youtube helper")
     app.get_by_role("button", name="Settings", exact=True).click()
     dialog = app.get_by_role("dialog", name="Settings")
-    expect(dialog.get_by_role("radio")).to_have_count(0)  # engines are not a choice
+    expect(dialog.locator("input[type=radio]:not([name=signin])")).to_have_count(0)  # engines are not a choice
     assert_no_program_names(app, "settings")
 
 
@@ -1274,10 +1274,15 @@ def newer_spool(page, spool, version):
 
 
 def older_server(page, spool):
-    """The page as Spool 0.1 serves it: no `update` in the snapshot, no `ext` on a preset."""
+    """The page as Spool 0.1 serves it: no `update` in the snapshot, no `ext` on a preset, no sign-in setting."""
     jobs = spool[1]
     plain = jobs.snapshot
-    jobs.snapshot = lambda *a, **k: {k: v for k, v in plain(*a, **k).items() if k != "update"}
+
+    def older(*a, **k):  # nor `signin` in its settings
+        snap = {k: v for k, v in plain(*a, **k).items() if k != "update"}
+        return {**snap, "settings": {k: v for k, v in snap["settings"].items() if k != "signin"}}
+
+    jobs.snapshot = older
 
     def no_ext(route):
         response = route.fetch()
@@ -1383,6 +1388,7 @@ def test_settings_from_an_older_server_look_as_before(app, spool):
     expect(dialog.get_by_text(re.compile("is ready"))).to_have_count(0)
     expect(dialog.get_by_role("button", name="Quit Spool")).to_have_count(0)
     expect(dialog.locator("code")).to_have_count(0)
+    expect(dialog.get_by_role("group", name="Sign in with")).to_have_count(0)
 
 
 def test_quit_with_nothing_running_quits_at_once(app, spool):
@@ -1580,3 +1586,147 @@ def test_two_videos_added_from_the_page_download_at_the_same_time(app, spool):
         assert time.time() < end, "the two never ran together"
         time.sleep(0.05)
     expect(group(app, "Downloading").get_by_role("progressbar")).to_have_count(2)
+
+
+# Spool 0.3.0
+
+
+TALL = "https://fake.test/h264-tall"  # Best is VP9 at 2160p; the largest H.264 with AAC is 1440p
+
+
+def save_settings(spool, changes):
+    """Through the settings route, as the page saves them, so the queue's own checks run."""
+    status, body = Client(spool[0].split("/#")[0]).json("PUT", "/api/settings", changes)
+    assert status == 200, body
+
+
+def test_plays_everywhere_is_a_quality_like_the_others(app):
+    look_up(app, TALL)
+    quality = tray(app, "Fake tall video").get_by_role("group", name="Quality")
+    radios = quality.get_by_role("radio")
+    expect(radios).to_have_count(4)  # Best, Plays everywhere, 1080p, Audio: it takes one class's place
+    expect(radios.nth(1)).to_have_accessible_name(re.compile(r"^Plays everywhere 1440p \d+(\.\d)? (KB|MB|GB) MP4$"))
+    radios.nth(1).check()
+    with app.expect_request("**/api/jobs") as sent:
+        app.keyboard.press("ControlOrMeta+Enter")
+    assert sent.value.post_data_json["preset"] == "compatible"
+
+
+@pytest.mark.parametrize("width", [375, 320])
+def test_the_plays_everywhere_tile_fits_a_phone(app, width):
+    app.set_viewport_size({"width": width, "height": 800})
+    look_up(app, TALL)
+    tile = tray(app, "Fake tall video").locator(".tile").filter(has_text="Plays everywhere")
+    tile.get_by_role("radio").check()
+    fits = tile.evaluate(
+        """t => { const words = document.createRange(), r = t.getBoundingClientRect();
+        words.selectNodeContents(t.querySelector('.tile-label'));
+        const m = getComputedStyle(t, '::after'), top = r.top + parseFloat(m.top), bottom = top + parseFloat(m.height);
+        const left = r.right - parseFloat(m.right) - parseFloat(m.width); // the selected mark in the corner
+        return [...words.getClientRects()].every((w) => w.left >= r.left && w.right <= r.right
+          && (w.bottom <= top || w.top >= bottom || w.right <= left)); }"""
+    )
+    assert fits, "the label runs under the selected mark or out of the tile"
+    assert app.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+
+
+def test_plays_everywhere_as_the_default_is_selected_or_falls_back_to_best(app, spool):
+    save_settings(spool, {"preset": "compatible"})
+    expect(app.get_by_text(re.compile(r"(Cmd|Ctrl)\+Enter downloads at Plays everywhere\."))).to_be_visible()
+    look_up(app, VIDEO)  # Best is already H.264 and AAC here, so it is not offered
+    expect(tray(app, "Fake video 1").get_by_role("radio", name=re.compile("^Best"))).to_be_checked()
+    app.keyboard.press("Escape")
+    look_up(app, TALL)
+    expect(tray(app, "Fake tall video").get_by_role("radio", name=re.compile("^Plays everywhere"))).to_be_checked()
+
+
+def test_a_starting_download_says_what_spool_does_first(app, spool, monkeypatch):
+    looking = threading.Event()  # the look for a newer engine is held until the test has seen it
+    monkeypatch.setattr(spool[1].engines, "newer", lambda name: looking.wait(30) and False)
+    try:
+        add(spool, [("https://fake.test/403", "Fake refused video")])
+        row = group(app, "Downloading").get_by_role("listitem")
+        expect(row.locator(".meta")).to_have_text("Getting a newer engine.", timeout=15000)
+        assert_no_program_names(app, "getting a newer engine")
+    finally:
+        looking.set()
+    expect(group(app, "Stopped").get_by_text("The site refused the download.")).to_be_visible(timeout=15000)
+
+
+BROWSERS = ["Off", "Brave", "Chrome", "Chromium", "Edge", "Firefox", "Opera", "Safari", "Vivaldi", "Whale"]
+SIGNIN_HELP = (
+    "For private and age-restricted videos. Spool reads the sign-in the browser you pick already has, and uses it "
+    "only for videos that ask for one. A site may limit an account used this way."
+)
+HOMES = ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME")  # where an engine looks for a browser
+
+
+@pytest.fixture
+def own_home(monkeypatch, tmp_path):
+    """Every worker these tests start looks for a browser's sign-in in an empty folder, never this machine's."""
+    home = tmp_path / "home"
+    home.mkdir()
+    for name in HOMES:
+        monkeypatch.setenv(name, str(home))
+
+
+def sign_in_choice(page):
+    return page.get_by_role("dialog", name="Settings").get_by_role("group", name="Sign in with")
+
+
+def test_settings_offer_signing_in_with_a_browser_off_by_default(app, spool):
+    app.get_by_role("button", name="Settings", exact=True).click()
+    choice = sign_in_choice(app)
+    expect(choice).to_have_accessible_description(SIGNIN_HELP)
+    expect(choice.locator(".tile-label")).to_have_text(BROWSERS)
+    expect(choice.get_by_role("radio", name="Off")).to_be_checked()
+    assert_no_program_names(app, "sign-in choice")
+
+    with app.expect_request("**/api/settings") as saved:
+        choice.get_by_role("radio", name="Firefox").check()
+    assert saved.value.post_data_json == {"signin": "firefox"}
+    until(lambda: spool[1].snapshot()["settings"]["signin"] == "firefox")
+    with app.expect_request("**/api/settings") as saved:
+        app.keyboard.press("ArrowRight")  # the keyboard moves through the browsers, as through the qualities
+    assert saved.value.post_data_json == {"signin": "opera"}
+    expect(choice.get_by_role("radio", name="Opera")).to_be_checked()
+    until(lambda: spool[1].snapshot()["settings"]["signin"] == "opera")
+    with app.expect_request("**/api/settings") as saved:
+        choice.get_by_role("radio", name="Off").check()
+    assert saved.value.post_data_json == {"signin": None}
+    until(lambda: spool[1].snapshot()["settings"]["signin"] is None)
+
+
+def test_a_sign_in_choice_the_server_refuses_says_why_and_stays_as_it_was(app, spool):
+    # A mocked refusal: the real server accepts every browser the page offers.
+    app.route(
+        "**/api/settings",
+        lambda route: route.fulfill(
+            status=422, json={"error": {"kind": "invalid_signin", "message": "The server's words.", "hint": None}}
+        ),
+    )
+    app.get_by_role("button", name="Settings", exact=True).click()
+    choice = sign_in_choice(app)
+    choice.get_by_role("radio", name="Safari").check()
+    expect(app.get_by_role("dialog").get_by_role("alert")).to_have_text("The server's words.")
+    expect(choice.get_by_role("radio", name="Off")).to_be_checked()
+
+
+def test_a_download_that_needs_a_sign_in_opens_settings_at_the_choice(app, spool, own_home):
+    add(spool, [("https://fake.test/age?delay=0", "Fake age-checked video")])
+    stopped = group(app, "Stopped")
+    expect(stopped.get_by_text("This video needs a signed-in account. Choose your browser in Settings.")).to_be_visible(
+        timeout=15000
+    )
+    expect(stopped.get_by_role("button", name="Try again")).to_have_class("fill")  # once a browser is chosen
+    stopped.get_by_role("button", name="Choose a browser").click()
+    expect(sign_in_choice(app).get_by_role("radio", name="Off")).to_be_focused()
+
+
+def test_details_whose_sign_in_cannot_be_read_open_settings_at_the_browser_chosen(app, spool, own_home):
+    save_settings(spool, {"signin": "firefox"})  # its made-up store is missing from the empty home
+    look_up(app, "https://fake.test/age")
+    error = app.get_by_role("alert").filter(has_text="Spool couldn't read the sign-in from Firefox.")
+    expect(error.get_by_role("button")).to_have_text("Choose a browser")
+    error.get_by_role("button").click()
+    expect(sign_in_choice(app).get_by_role("radio", name="Firefox")).to_be_focused()

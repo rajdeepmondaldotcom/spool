@@ -245,16 +245,72 @@ def test_a_presets_file_type_and_a_lists_truncated_reach_the_page(app, monkeypat
     entry = {"url": "https://fake.test/v/1", "id": "v1", "title": "One", "presets": [preset]}
     info = {"event": "info", "kind": "playlist", "title": "A channel", "entries": [entry], "truncated": True}
     worker = tmp_path / "worker.py"
-    worker.write_text(f"import sys\nsys.stdin.read()\nprint({json.dumps(json.dumps(info))})\n")
+    worker.write_text(f"import sys\nsys.stdin.readline()\nprint({json.dumps(json.dumps(info))})\n")
     monkeypatch.setattr(spool.jobs, "WORKER", worker)
     status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/channel"})
     assert status == 200
     assert (body["kind"], body["title"], body["truncated"]) == ("playlist", "A channel", True)
     assert body["entries"] == [entry]
     info["truncated"] = False
-    worker.write_text(f"import sys\nsys.stdin.read()\nprint({json.dumps(json.dumps(info))})\n")
+    worker.write_text(f"import sys\nsys.stdin.readline()\nprint({json.dumps(json.dumps(info))})\n")
     assert app.json("POST", "/api/probe", {"url": "https://fake.test/channel"})[1]["truncated"] is False
 
 
 def test_a_probe_from_a_worker_that_says_nothing_of_truncation_is_not_truncated(app):
     assert app.json("POST", "/api/probe", {"url": "https://fake.test/video"})[1]["truncated"] is False
+
+
+# A note while starting
+
+
+def test_a_starting_job_may_carry_a_note_that_is_cleared_after(app, events, monkeypatch):
+    import threading
+
+    looking, go = threading.Event(), threading.Event()
+    monkeypatch.setattr(app.engines, "newer", lambda name: looking.set() or go.wait(20) and False)
+    job = add(app, "https://fake.test/broken")["jobs"][0]
+    assert looking.wait(20)
+    seen = events.until(lambda e, d: e == "job" and d["id"] == job["id"] and d["note"])[-1][1]
+    assert (seen["state"], seen["stage"], seen["note"]) == ("running", "starting", "Getting a newer engine.")
+    go.set()
+    failed = finished(events, job["id"])[-1][1]
+    assert (failed["state"], failed["note"]) == ("failed", None)
+
+
+# Signing in
+
+
+def test_the_snapshot_carries_the_signin_setting_and_a_failure_offers_settings(app, events, monkeypatch, tmp_path):
+    import spool.jobs
+
+    assert app.jobs.snapshot()["settings"]["signin"] is None
+    assert app.json("PUT", "/api/settings", {"signin": "firefox"})[1]["settings"]["signin"] == "firefox"
+    snap = events.until(lambda e, d: e == "snapshot" and d["settings"]["signin"] == "firefox")[-1][1]
+    assert snap["settings"]["signin"] == "firefox"
+    app.json("PUT", "/api/settings", {"signin": None})
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "import sys\nsys.stdin.readline()\n"
+        'print(\'{"event": "error", "message": "ERROR: Sign in to confirm your age"}\')\n'
+    )
+    monkeypatch.setattr(spool.jobs, "WORKER", worker)
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/x"})
+    assert (status, body["error"]["kind"], body["error"]["hint"]) == (422, "signin", "signin")
+    failed = finished(events, add(app, "https://fake.test/x")["jobs"][0]["id"])[-1][1]
+    assert (failed["error"]["kind"], failed["error"]["hint"]) == ("signin", "signin")
+
+
+# Plays everywhere
+
+
+def test_compatible_is_a_preset_wherever_one_is_accepted(app, events, monkeypatch, tmp_path):
+    import spool.jobs
+
+    worker = tmp_path / "worker.py"
+    worker.write_text("import sys\nsys.stdin.readline()\n")  # says nothing: the job fails, as it may here
+    monkeypatch.setattr(spool.jobs, "WORKER", worker)
+    status, body = app.json("PUT", "/api/settings", {"preset": "compatible"})
+    assert (status, body["settings"]["preset"]) == (200, "compatible")
+    job = add(app, "https://fake.test/x", "compatible")["jobs"][0]
+    assert job["preset"] == "compatible"
+    finished(events, job["id"])

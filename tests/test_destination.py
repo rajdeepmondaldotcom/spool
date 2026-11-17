@@ -24,7 +24,7 @@ def test_settings_change_the_destination_engine_and_preset(app, tmp_path):
     events.next()
     status, body = app.json("PUT", "/api/settings", {"dest": str(folder), "engine": "youtube-dl", "preset": "720"})
     assert status == 200
-    assert body["settings"] == {"dest": str(folder), "engine": "youtube-dl", "preset": "720"}
+    assert body["settings"] == {"dest": str(folder), "engine": "youtube-dl", "preset": "720", "signin": None}
     assert (body["dest"]["ok"], body["dest"]["problem"]) == (True, None)
     assert body["dest"]["free_bytes"] > 0
     snap = events.until(lambda e, d: e == "snapshot" and d["settings"]["dest"] == str(folder))[-1][1]
@@ -66,6 +66,7 @@ def test_a_read_only_folder_is_not_writable(app, tmp_path):
         ({"dest": 7}, "invalid_dest"),
         ({"engine": "ffmpeg"}, "invalid_engine"),
         ({"preset": "4k"}, "invalid_preset"),
+        ({"signin": "netscape"}, "invalid_signin"),
         ({"colour": "red"}, "invalid_setting"),
     ],
 )

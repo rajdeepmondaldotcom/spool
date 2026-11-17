@@ -82,24 +82,30 @@ def job_state(state):
 
 
 # A worker that a test holds in place, so a moment in a download is there to be seen however fast or slow the
-# machine is. Its link says what it does: https://fake.test/<words>?name=<file name>, where the words may hold
+# machine is. Its link says what it does: https://fake.test/<words>?name=<file name>&id=<video id, "v" if none>,
+# where the words may hold
 #   hold   wait after the first 100 bytes until the test calls go()
 #   child  start a helper process first, as an engine starts ffmpeg (a cancel must stop it too)
 #   burst  send 200 progress events at once before holding
 #   mp3    also write a half-made .mp3 beside the stream, as ffmpeg does
 # Without hold it writes 300 bytes and finishes. A .part already there is continued, and the log says so.
+# Like Spool's worker it tells the id before it writes, and with "hold" in the spec waits for the queue's go.
 HELD = r"""
 import json, os, pathlib, subprocess, sys, time
 from urllib.parse import parse_qs, urlsplit
-spec = json.loads(sys.stdin.read())
+spec = json.loads(sys.stdin.readline())
 here = pathlib.Path(sys.argv[0]).parent
 url = urlsplit(spec["url"])
 words = url.path
 title = parse_qs(url.query).get("name", ["Same video"])[0]
+vid = parse_qs(url.query).get("id", ["v"])[0]
 ext = "webm" if "mp3" in words else "mp4"
-name = os.path.join(spec["dest"], f"{title} [v].{ext}")
+name = os.path.join(spec["dest"], f"{title} [{vid}].{ext}")
 def say(**event):
     print(json.dumps(event), flush=True)
+say(event="id", id=vid)
+if spec.get("hold") and sys.stdin.readline().strip() != "go":
+    sys.exit()
 def progress(done):
     say(event="progress", status="downloading", part=1, downloaded=done, total=300, speed=None, eta=None,
         progress=done / 300, what="video")

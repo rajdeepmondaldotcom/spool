@@ -108,7 +108,7 @@ def test_events_start_with_a_snapshot(app):
     event, snap = events.next()
     events.close()
     assert event == "snapshot"
-    assert snap["settings"] == {"dest": str(app.dest), "engine": "yt-dlp", "preset": "best"}
+    assert snap["settings"] == {"dest": str(app.dest), "engine": "yt-dlp", "preset": "best", "signin": None}
     assert snap["dest"]["ok"] is True
     assert snap["engines"]["yt-dlp"]["installed"] is True
     assert snap["engines"]["yt-dlp"]["version"] == "2026.01.01"

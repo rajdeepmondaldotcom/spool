@@ -93,11 +93,20 @@ def test_a_real_playlist_is_read_flat(jobs):
 PICK = """
 import json, sys
 sys.path.insert(0, sys.argv[1])
+sys.path.insert(0, sys.argv[3])
 engine = __import__(sys.argv[2])
-formats, params = json.load(sys.stdin)
+import worker
+formats, params, preset = json.load(sys.stdin)
 info = {"id": "x", "title": "x", "formats": formats, "extractor": "test", "extractor_key": "Test",
         "webpage_url": "https://x.test/"}
 with engine.YoutubeDL({"quiet": True, "simulate": True, **params}) as ydl:
+    if preset == "compatible" and sys.argv[2] == "yt_dlp":  # the worker's own step before the engine chooses
+        from yt_dlp.postprocessor.common import PostProcessor
+        class Narrow(PostProcessor):
+            def run(self, information):
+                worker.narrow(ydl, information, True)
+                return [], information
+        ydl.add_post_processor(Narrow(), when="pre_process")
     chosen = ydl.process_video_result(info, download=False)  # the engine's own sorting and selection
 print(json.dumps("+".join(f["format_id"] for f in chosen.get("requested_formats") or [chosen])))
 """
@@ -131,9 +140,9 @@ WITH_SOUND = [fmt("v360", 360, 640, acodec="mp4a.40.2"), AUDIO]  # the top strea
 
 
 def pick(jobs, engine, module, formats, preset):
-    spec = json.dumps([formats, format_params(preset, True, module)])
+    spec = json.dumps([formats, format_params(preset, True, module), preset])
     out = subprocess.run(
-        [sys.executable, "-I", "-c", PICK, jobs.engines.path(engine), module],
+        [sys.executable, "-I", "-c", PICK, jobs.engines.path(engine), module, str(WORKER.parent)],
         input=spec,
         capture_output=True,
         text=True,
@@ -158,6 +167,22 @@ NEWER = [  # with no H.264 at the top, the codec nearest above it wins: VP9, the
     AUDIO,
 ]
 OLD_AND_NEW = [fmt("vp8", 720, 1280, vcodec="vp8", ext="webm"), fmt("vp9", 720, 1280, **VP9, filesize=9_000_000), AUDIO]
+TALL = [  # H.264 above 1080: plays everywhere takes the largest, and VP9 the top
+    fmt("v2160", 2160, 3840, **VP9, filesize=9_000_000),
+    fmt("v1440", 1440, 2560, filesize=6_000_000),
+    fmt("v1080", 1080, 1920, filesize=3_000_000),
+    AUDIO,
+    OPUS,
+]
+NO_H264 = [  # nothing plays everywhere: what class 1080 saves
+    fmt("v1440", 1440, 2560, **VP9, filesize=6_000_000),
+    fmt("v1080", 1080, 1920, **VP9, filesize=3_000_000),
+    fmt("v720", 720, 1280, vcodec="av01.0.08M.08", filesize=1_000_000),
+    OPUS,
+]
+SOUND_ONLY_IN_OPUS = [fmt("v1080", 1080, 1920, filesize=3_000_000), OPUS]  # H.264 with no AAC to join
+H264_IN_WEBM = [fmt("v1080", 1080, 1920, ext="webm"), fmt("v720", 720, 1280, filesize=1), AUDIO]  # not for MP4
+ONE_STREAM = [fmt("v360", 360, 640, acodec="mp4a.40.2"), fmt("v1080", 1080, 1920, **VP9), OPUS]  # both in one
 ORIGINAL = [  # the original language beats a dubbed track, before quality or size
     fmt("v720", 720, 1280),
     fmt("dub", None, **A140, filesize=3_000_000, language_preference=-1),
@@ -166,13 +191,15 @@ ORIGINAL = [  # the original language beats a dubbed track, before quality or si
 
 
 @pytest.mark.parametrize(
-    "formats", [NO_SIZE, NEWER, OLD_AND_NEW, ORIGINAL, LANDSCAPE, VERTICAL, VP9_TOP, TIE, WITH_SOUND]
+    "formats",
+    [NO_SIZE, NEWER, OLD_AND_NEW, ORIGINAL, LANDSCAPE, VERTICAL, VP9_TOP, TIE, WITH_SOUND]
+    + [TALL, NO_H264, SOUND_ONLY_IN_OPUS, H264_IN_WEBM, ONE_STREAM],
 )
-@pytest.mark.parametrize("preset", ["best", "1080", "720"])
+@pytest.mark.parametrize("preset", ["best", "compatible", "1080", "720"])
 def test_the_size_estimate_counts_the_streams_the_engine_picks(jobs, formats, preset):
-    from spool.worker import chosen
+    from spool.worker import picked
 
-    ours = chosen(formats, None if preset == "best" else int(preset), True)
+    ours = picked(formats, preset, True)
     assert "+".join(f["format_id"] for f in ours) == pick(jobs, "yt-dlp", "yt_dlp", formats, preset)
 
 
@@ -192,6 +219,11 @@ def test_the_size_estimate_counts_the_streams_the_engine_picks(jobs, formats, pr
         (VP9_TOP, "1080", "v1080+a140"),
         (TIE, "best", "v1080+a140"),
         (WITH_SOUND, "best", "v360"),  # no second sound, so the size estimate counts one stream
+        (TALL, "compatible", "v1440+a140"),  # the largest H.264 with AAC
+        (VP9_TOP, "compatible", "v720+a140"),
+        (NO_H264, "compatible", "v1080+a251"),  # none: what class 1080 saves
+        (SOUND_ONLY_IN_OPUS, "compatible", "v1080+a251"),
+        (ONE_STREAM, "compatible", "v360"),
     ],
 )
 def test_yt_dlp_picks_the_class_by_its_short_side_with_h264_only_as_a_tie_break(jobs, formats, preset, chosen):
@@ -337,25 +369,34 @@ FILM_720 = "Caminandes 3： Llamigos [SkVqJ1SGeL0] 720p"  # Spool's name for it:
 PICKS = """
 import json, sys
 sys.path.insert(0, sys.argv[1])
+sys.path.insert(0, sys.argv[3])
 import yt_dlp
+from yt_dlp.postprocessor.common import PostProcessor
+import worker
 presets = json.load(sys.stdin)
 with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
     info = ydl.extract_info(sys.argv[2], download=False, process=False)
 picks = {}
 for preset, params in presets.items():  # the engine's own choice for each preset, as a download makes it
     with yt_dlp.YoutubeDL({"quiet": True, "simulate": True, **params}) as ydl:
+        class Narrow(PostProcessor):  # the worker's own step before the engine chooses
+            def run(self, information):
+                worker.narrow(ydl, information, True)
+                return [], information
+        if preset == "compatible":
+            ydl.add_post_processor(Narrow(), when="pre_process")
         chosen = ydl.process_ie_result(dict(info, formats=[dict(f) for f in info["formats"]]), download=False)
     picks[preset] = "+".join(f["format_id"] for f in chosen.get("requested_formats") or [chosen])
 print(json.dumps({"formats": info["formats"], "picks": picks}, default=str))
 """
-FILM_PRESETS = ["best", "1080", "720", "480", "360", "240"]
+FILM_PRESETS = ["best", "compatible", "1080", "720", "480", "360", "240"]
 
 
 @pytest.fixture(scope="module")
 def film(jobs):
     presets = {p: format_params(p, True, "yt_dlp") for p in FILM_PRESETS}
     out = subprocess.run(
-        [sys.executable, "-I", "-c", PICKS, jobs.engines.path("yt-dlp"), FILM],
+        [sys.executable, "-I", "-c", PICKS, jobs.engines.path("yt-dlp"), FILM, str(WORKER.parent)],
         input=json.dumps(presets),
         capture_output=True,
         text=True,
@@ -367,9 +408,9 @@ def film(jobs):
 
 @pytest.mark.parametrize("preset", FILM_PRESETS)
 def test_on_a_real_video_spool_counts_the_streams_the_engine_picks_for_every_preset(film, preset):
-    from spool.worker import chosen
+    from spool.worker import picked
 
-    ours = chosen(film["formats"], None if preset == "best" else int(preset), True)
+    ours = picked(film["formats"], preset, True)
     assert "+".join(f["format_id"] for f in ours) == film["picks"][preset]
 
 
@@ -598,3 +639,53 @@ def test_pieces_a_stalled_piece_makes_spool_read_the_video_again_and_finish(jobs
     assert events[-1]["event"] == "done", events[-1]
     assert sorted(set(reads) - {None}) == ["1", "2"]  # read once more, not again and again
     assert open(events[-1]["path"], "rb").read() == STALL_BODY
+
+
+# Signing in: the real engine reads a made-up Firefox store in the test's own home, never a browser's
+
+HOMES = ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME")  # where the engine looks
+NOWHERE = "http://127.0.0.1:9/video"  # the sign-in is read before any request; this one goes nowhere
+
+
+def firefox_store(home):
+    """A Firefox profile with one cookie, where the engine looks for Firefox on this system, under home."""
+    import sqlite3
+
+    root = {"darwin": "Library/Application Support/Firefox/Profiles", "win32": "Mozilla/Firefox/Profiles"}
+    profile = home / root.get(sys.platform, "mozilla/firefox") / "test.default"
+    profile.mkdir(parents=True)
+    db = sqlite3.connect(profile / "cookies.sqlite")
+    db.execute("CREATE TABLE moz_cookies (host, name, value, path, expiry, isSecure, originAttributes)")
+    db.execute("INSERT INTO moz_cookies VALUES ('.x.test', 'session', 'made-up', '/', 4102444800000, 1, '')")
+    db.execute("PRAGMA user_version = 17")
+    db.commit()
+    db.close()
+    return profile / "cookies.sqlite"
+
+
+@pytest.mark.parametrize("problem", [None, "missing", "no rights"])
+def test_the_real_engine_reads_a_made_up_firefox_sign_in_and_names_what_it_cannot_read(jobs, tmp_path, problem):
+    if problem == "no rights" and (sys.platform == "win32" or os.geteuid() == 0):
+        pytest.skip("a file's read right cannot be taken away here")
+    if problem != "missing":
+        db = firefox_store(tmp_path)
+        if problem:
+            db.chmod(0)
+    spec = jobs._spec("yt-dlp", mode="probe", url=NOWHERE, signin="firefox")
+    env = {**os.environ, **dict.fromkeys(HOMES, str(tmp_path))}
+    out = subprocess.run(
+        [sys.executable, "-I", str(WORKER)],
+        input=json.dumps(spec),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    ).stdout
+    events = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+    read = [e["line"] for e in events if e["event"] == "log" and e["line"].startswith("Extracted ")]
+    if problem:
+        assert (events[-1]["event"], events[-1].get("kind")) == ("error", "signin_unread"), events[-1]
+        assert read == []
+    else:
+        assert read == ["Extracted 1 cookies from firefox"]
+        assert events[-1]["event"] == "error" and events[-1].get("kind") != "signin_unread", events[-1]

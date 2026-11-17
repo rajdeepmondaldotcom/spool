@@ -29,6 +29,7 @@ const local = {
 const canNotify = () => "Notification" in window;
 const notifying = () => canNotify() && Notification.permission === "granted" && local.get("spool-notify") === "on";
 const UNDO_MS = 5000, FLASH_MS = 2000, SHOWN = 10;
+const BROWSERS = { brave: "Brave", chrome: "Chrome", chromium: "Chromium", edge: "Edge", firefox: "Firefox", opera: "Opera", safari: "Safari", vivaldi: "Vivaldi", whale: "Whale" };
 
 function App() {
   const [snap, setSnap] = useState(null);
@@ -202,7 +203,7 @@ function App() {
   };
   const ctx = {
     snap, say, whenUpdated, field, connected, takeAway,
-    openSettings: (focusFolder) => settings.current.open(focusFolder),
+    openSettings: (focus) => settings.current.open(focus),
   };
   const notify = {
     asking: ask && !local.get("spool-notify"),
@@ -411,7 +412,7 @@ function Deck({ snap, say, whenUpdated, field, openSettings, turning, added, not
           <div class="deck-message" role="alert">
             <p id="link-error"><${Icon} d=${ICONS.alert} />${err.message}</p>
             <${Fix} hint=${err.hint} snap=${snap} engine=${snap.settings.engine} retry=${retry} whenUpdated=${whenUpdated}
-              changeFolder=${changeFolder} cls="secondary on-deck" />
+              changeFolder=${changeFolder} signIn=${() => openSettings("signin")} cls="secondary on-deck" />
           </div>`
           : html`<p id="link-help" class="help">Enter gets the details. ${modKey(snap.tools.platform)}+Enter downloads at ${f.presetName(snap.settings.preset)}.</p>`}
         <p class="notice" role="status">${notice}</p>
@@ -433,13 +434,14 @@ function Deck({ snap, say, whenUpdated, field, openSettings, turning, added, not
 }
 
 // The fix button chosen by the server's hint. A null or unknown hint has none.
-function Fix({ hint, snap, engine, retry, whenUpdated, changeFolder, cls }) {
+function Fix({ hint, snap, engine, retry, whenUpdated, changeFolder, signIn, cls }) {
   const busy = snap.engines[engine]?.busy;
   if (hint === "retry") return html`<button class=${cls} onClick=${retry}>Try again</button>`;
   if (hint === "resume") return html`<button class=${cls} onClick=${retry}>Resume</button>`;
   if (hint === "update_engine") return html`<button class=${cls} disabled=${!!busy} onClick=${() => whenUpdated(engine, retry)}>
     ${busy ? "Updating…" : "Update and try again"}</button>`;
   if (hint === "check_dest") return html`<button class=${cls} onClick=${changeFolder}>Change folder</button>`;
+  if (hint === "signin") return html`<button class=${cls} onClick=${signIn}>Choose a browser</button>`;
   if (hint === "install_ffmpeg") return html`<${CopyCommand} command=${f.ffmpegCommand(snap.tools.platform)} platform=${snap.tools.platform} cls=${cls} />`;
   return null;
 }
@@ -711,7 +713,7 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
     try { setLogText(await api.log(job.id)); } catch (e) { setProblem(e.message); say(e.message); }
   };
   const retry = () => act(() => api.retry(job.id));
-  const again = ["show_log", "check_dest", "install_ffmpeg"].includes(error.hint); // fixed outside Spool, then Try again
+  const again = ["show_log", "check_dest", "install_ffmpeg", "signin"].includes(error.hint); // fixed elsewhere, then Try again
   return html`
     <li class="${cls} stopped failed" data-job=${job.id}>
       <div class="state-icon danger"><${Icon} d=${ICONS.alert} /></div>
@@ -724,7 +726,7 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
             <button class="secondary" aria-describedby=${tid} aria-expanded=${logText != null ? "true" : "false"} aria-controls="log-${job.id}" onClick=${showLog}>
               ${logText != null ? "Hide log" : "Show log"}</button>`
             : html`<${Fix} hint=${error.hint} snap=${snap} engine=${job.engine} retry=${retry} whenUpdated=${whenUpdated}
-                changeFolder=${() => openSettings(true)} cls=${again ? "secondary" : "fill"} />`}
+                changeFolder=${() => openSettings(true)} signIn=${() => openSettings("signin")} cls=${again ? "secondary" : "fill"} />`}
           ${remove}
         </div>
         ${why}
@@ -733,21 +735,27 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
     </li>`;
 }
 
-// handle.current.open(focusFolder) lets "Change folder" land on the folder field.
+// handle.current.open(focus) lets "Change folder" land on the folder field (focus true) and "Choose a browser" on the
+// sign-in choice (focus "signin").
 function SettingsDialog({ snap, handle, notify, running }) {
   const dialog = useRef(), folder = useRef();
   const [quitting, setQuitting] = useState(null); // null, "asking", or the sentence for why Spool did not quit
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
+  const [signinError, setSigninError] = useState("");
   const [checking, setChecking] = useState(false);
   handle.current = {
-    open(focusFolder) {
-      setDraft(snap.settings.dest); setError(""); setQuitting(null);
+    open(focus) {
+      setDraft(snap.settings.dest); setError(""); setSigninError(""); setQuitting(null);
       dialog.current.showModal();
-      if (focusFolder) folder.current.focus();
+      if (focus === "signin") dialog.current.querySelector("[name=signin]:checked")?.focus({ focusVisible: true });
+      else if (focus) folder.current.focus();
     },
   };
   const save = (changes) => api.saveSettings(changes).then(() => setError("")).catch((e) => setError(e.message));
+  // A refused choice re-renders, which puts the saved one back as checked.
+  const signIn = (browser) => api.saveSettings({ signin: browser }).then(() => setSigninError("")).catch((e) => setSigninError(e.message));
+  const browser = snap.settings.signin || "";
   // The folder saves when the field loses focus, on Enter and on Done; unchanged text is not sent again.
   const saveFolder = () => { const d = draft.trim(); if (d && d !== snap.settings.dest) save({ dest: d }); };
   const choose = async () => {
@@ -786,6 +794,20 @@ function SettingsDialog({ snap, handle, notify, running }) {
         ${!error && snap.dest.problem === "missing" && html`
           <button type="button" class="secondary create" onClick=${() => save({ dest: snap.settings.dest, create: true })}>Create this folder</button>`}
       </form>
+      ${"signin" in snap.settings && html`
+        <fieldset class="quality signin" aria-describedby="signin-help">
+          <legend>Sign in with</legend>
+          <p id="signin-help" class="dim">For private and age-restricted videos. Spool reads the sign-in the browser you pick
+            already has, and uses it only for videos that ask for one. A site may limit an account used this way.</p>
+          <div class="tiles">
+            ${[["", "Off"], ...Object.entries(BROWSERS)].map(([id, name]) => html`
+              <label class="tile" key=${id}>
+                <input type="radio" name="signin" value=${id} checked=${browser === id} onChange=${() => signIn(id || null)} />
+                <span class="tile-label">${name}</span>
+              </label>`)}
+          </div>
+          ${signinError && html`<p class="danger-text" role="alert">${signinError}</p>`}
+        </fieldset>`}
       ${canNotify() && html`
         <label class="switch">
           <input type="checkbox" checked=${on} disabled=${blocked} aria-describedby=${blocked ? "notify-blocked" : undefined}

@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -19,14 +20,19 @@ IN_PIECES = (
 )
 
 
-def run(mode, url, engine="yt-dlp", at_once=None, **spec):
-    """The worker's events; at_once: fetch YouTube streams in that many pieces at once, which Spool ships off."""
+def run(mode, url, engine="yt-dlp", at_once=None, home=None, **spec):
+    """The worker's events; at_once: fetch YouTube streams in that many pieces at once, which Spool ships off.
+    home: the worker's home folder, where an engine looks for a browser's sign-in."""
     spec = {"engine": engine, "engine_path": str(FAKE), "mode": mode, "url": url, "ffmpeg": True, **spec}
     cmd = [sys.executable, "-I", str(WORKER)]
     if at_once:
         cmd = [sys.executable, "-I", "-c", IN_PIECES, str(WORKER.parent), str(at_once)]
-    out = subprocess.run(cmd, input=json.dumps(spec), capture_output=True, text=True, timeout=30).stdout
+    env = home and {**os.environ, **dict.fromkeys(HOMES, str(home))}
+    out = subprocess.run(cmd, input=json.dumps(spec), capture_output=True, text=True, timeout=30, env=env).stdout
     return [json.loads(line) for line in out.splitlines()]
+
+
+HOMES = ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME")  # where engines look for a browser
 
 
 def last(events):
@@ -283,10 +289,11 @@ def test_a_4_3_video_is_classed_by_its_short_side():
 
 
 def test_the_top_class_wins_even_when_only_a_lower_class_is_h264():
-    sizes, order = presets("https://fake.test/vp9-top")
+    [entry] = last(run("probe", "https://fake.test/vp9-top"))["entries"]
+    sizes = {p["id"]: p["size"] for p in entry["presets"]}
     assert sizes["best"] == 2_500_000 + 400_000  # VP9 1080p, not H.264 720p
-    assert best_detail("https://fake.test/vp9-top") == "1080p"
-    assert sizes["720"] == 1_500_000 + 400_000
+    assert entry["presets"][0]["detail"] == "1080p"
+    assert sizes["compatible"] == 1_500_000 + 400_000  # the H.264 720p, which class 720 would save too
 
 
 @pytest.mark.skipif(
@@ -411,7 +418,10 @@ def test_a_class_file_is_named_for_the_class_it_got(tmp_path):
 
 
 @pytest.mark.parametrize("ffmpeg", [True, False])
-@pytest.mark.parametrize("url", ["https://fake.test/video", "https://fake.test/no-combined", "https://fake.test/audio"])
+@pytest.mark.parametrize(
+    "url",
+    [f"https://fake.test/{s}" for s in ("video", "no-combined", "audio", "vp9-top", "h264-tall", "no-h264")],
+)
 def test_every_quality_offered_downloads(tmp_path, url, ffmpeg):
     [entry] = last(run("probe", url, ffmpeg=ffmpeg))["entries"]
     types = {p["id"]: p["ext"] for p in entry["presets"]}
@@ -605,7 +615,7 @@ def test_a_part_the_old_way_went_on_with_is_never_resumed_in_pieces(tmp_path):
     "url, types",
     [
         ("video", {"best": "mp4", "720": "mp4", "480": "mp4", "360": "mp4", "audio": "m4a", "mp3": "mp3"}),
-        ("vp9-top", {"best": "mkv", "720": "mp4", "480": "mp4", "360": "mp4", "audio": "m4a", "mp3": "mp3"}),
+        ("vp9-top", {"best": "mkv", "compatible": "mp4", "480": "mp4", "360": "mp4", "audio": "m4a", "mp3": "mp3"}),
     ],
 )
 def test_each_quality_names_the_type_of_file_it_saves(url, types):
@@ -710,3 +720,194 @@ def test_a_lookup_makes_one_engine_object():
     events = run("probe", TUBE)
     assert last(events)["event"] == "info"
     assert len(logged(events, "[fake] a new engine object")) == 1
+
+
+# The id before any file, and the queue's go
+
+
+def started(spec, engine="yt-dlp"):
+    """A worker whose stdin stays open after the spec, as the queue's does; killed if it outlives the test."""
+    spec = {"engine": engine, "engine_path": str(FAKE), "mode": "download", "ffmpeg": True, "preset": "best", **spec}
+    proc = subprocess.Popen(
+        [sys.executable, "-I", str(WORKER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    guard = threading.Timer(60, proc.kill)  # our own child: a worker that waits forever fails the test, not the run
+    guard.daemon = True
+    guard.start()
+    proc.stdin.write(json.dumps(spec) + "\n")
+    proc.stdin.flush()
+    return proc
+
+
+def until(proc, event):
+    """The worker's events up to and including the first of this kind."""
+    seen = []
+    for line in proc.stdout:
+        seen.append(json.loads(line))
+        if seen[-1]["event"] == event:
+            return seen
+    raise AssertionError(f"no {event} event: {seen[-3:]}")
+
+
+def test_without_hold_the_worker_never_reads_stdin_again(tmp_path):
+    proc = started({"url": "https://fake.test/video?delay=0", "dest": str(tmp_path)})
+    events = until(proc, "done")  # stdin is open and silent
+    kinds = [e["event"] for e in events]
+    assert kinds.count("id") == 1 and kinds.index("id") < kinds.index("file")
+    assert next(e for e in events if e["event"] == "id")["id"] == "vid-1"
+    proc.stdin.close()
+    proc.wait()
+
+
+@pytest.mark.parametrize("engine", ["yt-dlp", "youtube-dl"])
+def test_a_held_worker_tells_the_id_before_writing_and_goes_on_at_go(tmp_path, engine):
+    proc = started({"url": "https://fake.test/video?delay=0", "dest": str(tmp_path), "hold": True}, engine)
+    assert until(proc, "id")[-1]["id"] == "vid-1"
+    assert list(tmp_path.iterdir()) == []  # held: nothing is written until the go
+    proc.stdin.write("go\n")
+    proc.stdin.close()
+    assert last(until(proc, "done"))["event"] == "done"
+    proc.wait()
+
+
+@pytest.mark.parametrize("engine", ["yt-dlp", "youtube-dl"])
+def test_a_held_worker_stops_at_the_end_of_input_without_writing(tmp_path, engine):
+    proc = started({"url": "https://fake.test/video?delay=0", "dest": str(tmp_path), "hold": True}, engine)
+    until(proc, "id")
+    proc.stdin.close()
+    rest = [json.loads(line)["event"] for line in proc.stdout]
+    proc.wait()
+    assert "done" not in rest and "file" not in rest
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("engine", ["yt-dlp", "youtube-dl"])
+def test_an_item_of_a_list_tells_that_entrys_id(tmp_path, engine):
+    events = run(
+        "download", "https://fake.test/shared-playlist?delay=0", engine, dest=str(tmp_path), preset="best", item=2
+    )
+    assert last(events)["event"] == "done", last(events)
+    assert [e["id"] for e in events if e["event"] == "id"] == ["shared-2"]
+
+
+# Plays everywhere: H.264 and AAC in MP4
+
+
+def offered(url, ffmpeg=True):
+    [entry] = last(run("probe", url, ffmpeg=ffmpeg))["entries"]
+    return [(p["id"], p["label"], p["detail"], p["ext"]) for p in entry["presets"]]
+
+
+def test_plays_everywhere_is_offered_second_at_the_largest_class_with_h264_and_aac():
+    assert offered("https://fake.test/h264-tall") == [
+        ("best", "Best", "2160p", "mkv"),  # VP9
+        ("compatible", "Plays everywhere", "1440p", "mp4"),  # the largest H.264, so class 1440 is not offered again
+        ("1080", "1080p", None, "mp4"),
+        ("audio", "Audio", None, "m4a"),
+        ("mp3", "MP3", None, "mp3"),
+    ]
+
+
+@pytest.mark.parametrize("ffmpeg", [True, False])
+def test_plays_everywhere_is_not_offered_when_best_already_is_it(ffmpeg):
+    assert "compatible" not in [p[0] for p in offered("https://fake.test/video", ffmpeg)]
+
+
+def test_plays_everywhere_is_not_offered_without_h264_and_aac():
+    assert [p[0] for p in offered("https://fake.test/no-h264")] == ["best", "1080", "audio", "mp3"]
+
+
+def test_plays_everywhere_saves_the_largest_h264_with_aac_under_its_own_name(tmp_path):
+    events = run("download", "https://fake.test/h264-tall?delay=0", dest=str(tmp_path), preset="compatible")
+    done = last(events)
+    assert os.path.basename(done["path"]) == "Fake tall video [tall-1] 1440p H.264.mp4", done
+    assert logged(events, "[fake] chose ") == ["[fake] chose v1440+140"]
+
+
+def test_plays_everywhere_without_h264_saves_what_1080_would_by_the_same_name(tmp_path):
+    names = {}
+    for preset in ("compatible", "1080"):
+        (tmp_path / preset).mkdir()
+        events = run("download", "https://fake.test/no-h264?delay=0", dest=str(tmp_path / preset), preset=preset)
+        names[preset] = (os.path.basename(last(events)["path"]), logged(events, "[fake] chose "))
+    assert names["compatible"] == names["1080"] == ("Fake VP9 only video [nh-1] 1080p.webm", ["[fake] chose 248+251"])
+
+
+def test_plays_everywhere_downloads_with_youtube_dl_too(tmp_path):
+    done = last(
+        run("download", "https://fake.test/video?delay=0", "youtube-dl", dest=str(tmp_path), preset="compatible")
+    )
+    assert os.path.basename(done["path"]) == "Fake video 1 [vid-1] H.264.mp4", done
+
+
+def test_plays_everywhere_mirrors_the_engines_choice():
+    from spool.worker import format_params, ladder, picked
+
+    assert format_params("compatible", True, "yt_dlp") == format_params("best", True, "yt_dlp")  # Narrow does the rest
+    assert ladder("compatible", True).startswith("bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/")
+    assert ladder("compatible", True).endswith("/" + ladder("1080", True))
+    sys.path.insert(0, str(FAKE))
+    from _fake import NO_H264_FORMATS
+
+    assert picked(NO_H264_FORMATS, "compatible", True) == picked(NO_H264_FORMATS, "1080", True)
+
+
+# Signing in (the fake reads a made-up store under the test's own home, never a browser's)
+
+
+def store(home, browser, content="cookies"):
+    (home / ".fake-signin").mkdir(exist_ok=True)
+    (home / ".fake-signin" / browser).write_text(content)
+    return home / ".fake-signin" / browser
+
+
+def test_a_video_that_asks_for_an_account_saves_with_the_browsers_sign_in(tmp_path):
+    (tmp_path / "out").mkdir()
+    store(tmp_path, "firefox")
+    url = "https://fake.test/age?delay=0"
+    error = last(run("download", url, dest=str(tmp_path / "out"), preset="best", home=tmp_path))
+    assert "Sign in to confirm your age" in error["message"] and "kind" not in error  # the queue names this one
+    events = run("download", url, dest=str(tmp_path / "out"), preset="best", home=tmp_path, signin="firefox")
+    assert last(events)["event"] == "done", last(events)
+    assert logged(events, "Extracted ") == ["Extracted 1 cookies from firefox"]
+
+
+@pytest.mark.parametrize("mode", ["probe", "download"])
+@pytest.mark.parametrize("problem", ["missing", "no rights", "locked"])
+def test_a_sign_in_that_cannot_be_read_is_named(tmp_path, mode, problem):
+    if problem == "no rights":
+        if sys.platform == "win32" or os.geteuid() == 0:
+            pytest.skip("a file's read right cannot be taken away here")
+        store(tmp_path, "chrome").chmod(0)
+    elif problem == "locked":
+        store(tmp_path, "chrome", "locked")
+    (tmp_path / "out").mkdir()
+    url = "https://fake.test/age?delay=0"
+    error = last(run(mode, url, dest=str(tmp_path / "out"), preset="best", home=tmp_path, signin="chrome"))
+    assert (error["event"], error.get("kind")) == ("error", "signin_unread"), error
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+def test_youtube_dl_has_no_sign_in_and_fails_as_today(tmp_path):
+    url = "https://fake.test/age?delay=0"
+    error = last(run("download", url, "youtube-dl", dest=str(tmp_path), preset="best", home=tmp_path, signin="chrome"))
+    assert "Sign in to confirm your age" in error["message"] and "kind" not in error
+
+
+def test_plays_everywhere_of_a_stream_with_no_size_has_no_class():
+    from spool import worker
+
+    formats = [
+        {"format_id": "mp4", "ext": "mp4", "vcodec": "avc1.64001F", "acodec": "mp4a.40.2", "filesize": 100},
+        {"format_id": "v720", "ext": "webm", "width": 1280, "height": 720, "vcodec": "vp9", "acodec": "none"},
+        {"format_id": "a", "ext": "webm", "vcodec": "none", "acodec": "opus", "filesize": 10},
+    ]
+    entry = worker.entry({"id": "x", "title": "No size", "formats": formats}, ffmpeg=True)
+    assert [(p["id"], p["detail"]) for p in entry["presets"][:2]] == [("best", "720p"), ("compatible", None)]
+
+
+def test_a_decrypt_warning_on_a_try_without_the_sign_in_keeps_its_own_kind(tmp_path):
+    error = last(run("download", "https://fake.test/live?warn=decrypt", dest=str(tmp_path), preset="best"))
+    assert error.get("kind") == "live", error
+    error = last(run("probe", "https://fake.test/unavailable?warn=decrypt"))
+    assert "kind" not in error, error

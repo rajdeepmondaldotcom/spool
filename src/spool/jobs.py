@@ -20,7 +20,7 @@ from . import system
 from .engines import RELEASES, write_atomic
 
 WORKER = Path(__file__).with_name("worker.py")
-PRESETS = ("best", "2160", "1440", "1080", "720", "480", "360", "240", "audio", "mp3")
+PRESETS = ("best", "compatible", "2160", "1440", "1080", "720", "480", "360", "240", "audio", "mp3")
 AT_ONCE = 2
 try:
     VERSION = metadata.version("spool-dl")
@@ -50,11 +50,12 @@ class Jobs:
         self.state_file, self.logs = self.data / "state.json", self.data / "logs"
         self.logs.mkdir(exist_ok=True)
         saved = self._load()
-        self.settings = {"dest": str(system.default_dest()), "engine": "yt-dlp", "preset": "best"}
+        self.settings = {"dest": str(system.default_dest()), "engine": "yt-dlp", "preset": "best", "signin": None}
         valid = {
             "dest": lambda v: isinstance(v, str) and os.path.isabs(v),
             "engine": lambda v: isinstance(v, str) and v in RELEASES,
             "preset": lambda v: isinstance(v, str) and v in PRESETS,
+            "signin": browser,
         }
         self.settings.update({k: v for k, v in saved.get("settings", {}).items() if k in valid and valid[k](v)})
         # keys added after v0.1's first saves
@@ -66,6 +67,7 @@ class Jobs:
         ]
         self.lock = threading.RLock()
         self.procs = {}  # job id -> the worker running it
+        self.going = {}  # job id -> the video id its worker may be writing under; None: not known, so any
         self.dirty = set()
         self.subscribers = []
         self.closed = False
@@ -150,18 +152,28 @@ class Jobs:
                     raise
 
     def _probe(self, url, engine):
-        events = self._call({"mode": "probe", "url": url, "engine": engine})
-        result = next((e for e in reversed(events) if e.get("event") in ("info", "error")), None)
-        if result is None:
-            kind = "engine"
-        elif result["event"] == "error":
-            kind = result.get("kind") if result.get("kind") in KINDS else classify(result["message"])
-        else:
-            kind = None
-        if kind is None and not result["entries"]:
-            kind = "empty"
+        looked, signin = False, None
+        while True:
+            events = self._call({"mode": "probe", "url": url, "engine": engine, **signed(signin)})
+            result = next((e for e in reversed(events) if e.get("event") in ("info", "error")), None)
+            if result is None:
+                kind = "engine"
+            elif result["event"] == "error":
+                kind = result.get("kind") if result.get("kind") in KINDS else classify(result["message"])
+            else:
+                kind = None
+            if kind is None and not result["entries"]:
+                kind = "empty"
+            if kind in NEWER and not looked:
+                looked = True
+                if self.engines.newer(engine):
+                    continue
+            if kind == "signin" and not signin and self.settings["signin"] and engine == SIGNS_IN:
+                signin = self.settings["signin"]  # once more, signed in
+                continue
+            break
         if kind:
-            e = self._error(kind, engine, probe=True)
+            e = self._error(kind, engine, probe=True, signin=signin)
             raise Problem(422, kind, e["message"], e["hint"])
         return {
             "engine": engine,
@@ -303,7 +315,7 @@ class Jobs:
         """Save settings. A destination with a problem is still saved: the drive may come back."""
         changes = dict(changes)
         create = changes.pop("create", False)
-        if changes.keys() - {"dest", "engine", "preset"}:
+        if changes.keys() - {"dest", "engine", "preset", "signin"}:
             raise Problem(422, "invalid_setting", "Spool has no setting by that name.")
         if not isinstance(create, bool):
             raise Problem(422, "invalid_setting", "Create is true or false.")
@@ -319,6 +331,8 @@ class Jobs:
             raise Problem(422, "invalid_engine", "Spool doesn't know that engine.")
         if "preset" in changes and not (isinstance(changes["preset"], str) and changes["preset"] in PRESETS):
             raise Problem(422, "invalid_preset", "Spool doesn't know that quality.")
+        if "signin" in changes and not browser(changes["signin"]):
+            raise Problem(422, "invalid_signin", "Spool can't sign in with that browser.")
         with self.lock:
             self.settings.update(changes)
             self._save()
@@ -372,8 +386,14 @@ class Jobs:
             raise problem(503, "engine_not_ready")
         return engine
 
-    def _error(self, kind, engine, dest=None, probe=False):
-        """The error for a kind, with the folder's name and, for a refusal, whether an engine update may help."""
+    def _error(self, kind, engine, dest=None, probe=False, signin=None):
+        """The error for a kind, with the folder's name and, for a refusal, whether an engine update may help.
+        signin: the browser the failed try signed in with."""
+        if kind == "signin_unread" or (kind == "signin" and signin):
+            words = "signin_denied" if kind == "signin" else kind
+            return dict(error(words, BROWSERS.get(signin, "your browser")), kind=kind)
+        if kind == "signin" and self.settings["signin"] and engine != SIGNS_IN:  # a browser is chosen, to no avail
+            return dict(error("signin_elsewhere"), kind=kind)
         e = error(kind, dest and system.display(dest), probe)
         status = self.engines.status()[engine]
         if kind == "blocked" and status["latest"] and status["latest"] != status["version"]:
@@ -395,7 +415,7 @@ class Jobs:
         try:
             out = subprocess.run(
                 [sys.executable, "-I", "-X", "utf8", str(WORKER)],
-                input=json.dumps(self._spec(**spec)),
+                input=json.dumps(self._spec(**spec)) + "\n",  # one line
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -422,27 +442,46 @@ class Jobs:
         for job in reversed(self.jobs):
             if len(self.procs) >= AT_ONCE or self.closed:
                 return
-            if job["state"] == "queued" and job["id"] not in self.procs and not self._clash(job):
+            # a job with no id yet starts held: its worker tells the id, then waits for _go
+            if job["state"] == "queued" and job["id"] not in self.procs and not (job["entry_id"] and self._clash(job)):
                 job.update(state="running", stage="starting", started=time.time())
                 self._changed(job)
                 self.procs[job["id"]] = None  # no worker yet
+                if job["entry_id"]:
+                    self.going[job["id"]] = job["entry_id"]
                 threading.Thread(target=self._run, args=(job,), daemon=True).start()
 
     def _clash(self, job):
-        """A running job that may write the same file, so this one waits in the queue. A file's name carries the
-        video's id and is known only once the worker runs: two jobs in one folder run together only when both
-        have ids and they differ. A link added without its details (no id) runs alone in its folder."""
-        return next(
-            (
-                j
-                for j in self.jobs
-                if j is not job
-                and (j["state"] == "running" or j["id"] in self.procs)  # a cancelled job's worker may still write
-                and j["dest"] == job["dest"]
-                and not (job["entry_id"] and j["entry_id"] and j["entry_id"] != job["entry_id"])
-            ),
-            None,
+        """Whether another job's worker may be writing the same file, so this one waits. A file's name carries the
+        video's id: two jobs in one folder write together only when their ids differ. A job whose id is not known
+        writes alone in its folder."""
+        return any(
+            j is not job
+            and j["id"] in self.going  # until its worker is gone: a cancelled one may still write
+            and j["dest"] == job["dest"]
+            and (job["entry_id"] is None or self.going[j["id"]] in (None, job["entry_id"]))
+            for j in self.jobs
         )
+
+    def _go(self, job, proc, vid, hold):
+        """The worker named its video: keep the id, and tell a held worker go once no other job may be writing
+        that video in the same folder. Waits for that here, holding the slot; a cancel or a quit says stop."""
+        with self.lock:
+            if vid is not None and job["entry_id"] is None:
+                job["entry_id"] = text(vid, 200)
+                self._save()  # a later Retry knows it
+            if not hold:
+                return
+            while not self.closed and job["state"] == "running" and self._clash(job):
+                self.wake.wait(1)
+            go = not self.closed and job["state"] == "running"
+            if go:
+                self.going[job["id"]] = job["entry_id"]
+        try:
+            proc.stdin.write("go\n" if go else "")
+            proc.stdin.close()  # without a go, the end of input means stop
+        except OSError:
+            pass  # the worker is gone: its stdout says what happened
 
     def _rested(self):
         with self.lock:
@@ -452,10 +491,11 @@ class Jobs:
     def _run(self, job):
         """Run a job in the slot _pump reserved for it; the slot is freed only when its worker is gone."""
         try:
-            failure, switched, waited, furthest = None, False, 0, None
+            failure, switched, waited, furthest, looked = None, False, 0, None, False
+            signin = None  # the browser this run signs in with, once a try asked for an account
             while True:
                 dest_problem(self._check(job["dest"], but=job))
-                result = self._attempt(job)
+                result = self._attempt(job, signin)
                 if result is None or result["event"] == "done" or self.closed or job["state"] != "running":
                     break  # done, or cancelled or quit: nothing failed, so there is nothing to check
                 kind = result.get("kind") if result.get("kind") in KINDS else classify(result["message"])
@@ -463,7 +503,14 @@ class Jobs:
                     dest_problem(self._check(job["dest"], but=job))  # a drive unplugged mid-download says so
                 except Problem as p:
                     kind = p.kind
-                failure = self._error(kind, job["engine"], job["dest"])
+                if kind in NEWER and not looked:
+                    looked = True
+                    if self._newer(job):
+                        continue  # not one of the waits: a newer engine is a new chance
+                if kind == "signin" and not signin and self.settings["signin"] and job["engine"] == SIGNS_IN:
+                    signin = self.settings["signin"]  # once more at once, signed in
+                    continue
+                failure = self._error(kind, job["engine"], job["dest"], signin=signin)
                 if kind in ("unsupported", "empty") and not switched and self.engines.path(other(job["engine"])):
                     with self.lock:  # the other engine may read what this one can't
                         job["engine"], switched = other(job["engine"]), True
@@ -489,6 +536,8 @@ class Jobs:
                 pass
         with self.lock:
             self.procs.pop(job["id"], None)
+            self.going.pop(job["id"], None)
+            self.wake.notify_all()  # a held job may be waiting for this one's worker to be gone
             if self.closed:
                 return
             if job["state"] == "running" and result is not None:  # else cancelled, and perhaps retried since
@@ -503,6 +552,23 @@ class Jobs:
             if sum(j["state"] == "queued" for j in self.jobs) >= self.pace_from:  # a long list: let the site rest
                 self.rest_until = time.monotonic() + self.pace
             self._pump()
+
+    def _newer(self, job):
+        """Look for a newer engine, saying so on the job; True when one was installed and the job still runs."""
+        with self.lock:
+            if self.closed or job["state"] != "running":
+                return False
+            job.update(stage="starting", note=LOOKING, speed=None, eta=None)
+            self._changed(job)
+        # shortcut: a cancel shows at once but the slot stays taken until the look ends (minutes if the release page
+        # hangs); when that matters, run the look on its own thread and wait on self.wake
+        found = self.engines.newer(job["engine"])  # it may take seconds: never under the lock
+        with self.lock:
+            if self.closed or job["state"] != "running":
+                return False
+            job["note"] = None
+            self._changed(job)
+        return found
 
     def _wait(self, job, kind, waited):
         """Hold the job's slot until its next try. False when it was cancelled or Spool quit meanwhile."""
@@ -524,10 +590,19 @@ class Jobs:
             self._changed(job)
         return True
 
-    def _attempt(self, job):
-        """One worker run: its last event, or None if the job was cancelled before it could start."""
+    def _attempt(self, job, signin=None):
+        """One worker run: its last event, or None if the job was cancelled before it could start. signin: the
+        browser to read the sign-in from, on a try that uses it."""
+        hold = job["entry_id"] is None  # known after a first try that got as far as the id
         spec = self._spec(
-            job["engine"], mode="download", url=job["url"], dest=job["dest"], preset=job["preset"], item=job["item"]
+            job["engine"],
+            mode="download",
+            url=job["url"],
+            dest=job["dest"],
+            preset=job["preset"],
+            item=job["item"],
+            **signed(signin),
+            **({"hold": True} if hold else {}),
         )
         result = {"event": "error", "message": ""}
         with open(self.logs / f"{job['id']}.log", "a", encoding="utf-8") as log:
@@ -546,8 +621,13 @@ class Jobs:
                     errors="replace",  # ffmpeg shares the pipe and may write any bytes
                 )
                 self.procs[job["id"]] = proc
-            proc.stdin.write(json.dumps(spec))
-            proc.stdin.close()
+            try:
+                proc.stdin.write(json.dumps(spec) + "\n")  # one line; a held worker reads the go after it
+                proc.stdin.flush()
+                if not hold:
+                    proc.stdin.close()
+            except OSError:
+                pass  # the worker died at once: its stdout says what happened
             for line in proc.stdout:
                 event = parse(line)
                 if not event or event.get("event") == "log":
@@ -556,6 +636,9 @@ class Jobs:
                     self._progress(job, event)
                 elif event["event"] == "meta":
                     self._details(job, event)
+                elif event["event"] == "id":
+                    self._go(job, proc, event.get("id"), hold)
+                    hold = False
                 elif event["event"] == "file":
                     with self.lock:
                         job["files"].append(event["path"])
@@ -564,6 +647,10 @@ class Jobs:
                     result = event
                     break  # a child the engine left behind may hold the pipe open; this was the last word
             system.kill_leftovers(proc)  # it waits for the worker itself, and reaps it last
+            try:
+                proc.stdin.close()  # a worker that died before its id never read a go
+            except OSError:
+                pass
         return result
 
     def _progress(self, job, event):
@@ -650,7 +737,14 @@ MESSAGES = {  # kind -> (the sentence people read, hint). Every sentence the ser
     "too_long": ("That link is too long for Spool.", None),
     "unsupported": ("Spool can't read this link.", None),
     "empty": ("Spool found no video at this link.", None),
-    "unavailable": ("This video is private, removed, or needs a sign-in.", None),
+    "unavailable": ("This video isn't available. It may be private or removed.", None),
+    "signin": ("This video needs a signed-in account. Choose your browser in Settings.", "signin"),
+    "signin_elsewhere": ("This video needs a signed-in account, and Spool can't sign in for this link.", None),
+    "signin_denied": ("The account in {name} can't open this video.", None),  # kind signin, on a try signed in
+    "signin_unread": (
+        "Spool couldn't read the sign-in from {name}. Choose another browser in Settings, or try again.",
+        "signin",
+    ),
     "live": ("This is live now. Download it after it ends.", None),
     "playlist": ("This link is a list of videos. Paste it in the link field to choose from it.", None),
     "blocked": ("The site refused the download.", "retry"),  # update_engine when a newer engine exists
@@ -681,7 +775,21 @@ NOTES = {  # kind -> what a job waiting to try again says happened. Only these k
     "network": "The connection dropped.",
     "blocked": "The site refused the download.",
 }
-KINDS = ("live", "no_js", "playlist")  # the worker names these itself; its message is then not read
+NEWER = ("blocked", "engine")  # kinds a newer engine may fix: looked for once a run, and once a probe
+LOOKING = "Getting a newer engine."  # a job's note while it looks
+SIGNS_IN = "yt-dlp"  # shortcut: only the first engine reads a browser's sign-in, until the second can
+KINDS = ("live", "no_js", "playlist", "signin_unread")  # the worker names these itself; its message is then not read
+BROWSERS = {  # the signin setting -> the browser's proper name, for the sentences
+    "brave": "Brave",
+    "chrome": "Chrome",
+    "chromium": "Chromium",
+    "edge": "Edge",
+    "firefox": "Firefox",
+    "opera": "Opera",
+    "safari": "Safari",
+    "vivaldi": "Vivaldi",
+    "whale": "Whale",
+}
 DEST_KINDS = {
     "unplugged": "dest_unplugged",
     "missing": "dest_missing",
@@ -712,6 +820,16 @@ def dest_problem(check, status=None):
     """Raise the problem for a destination check, if it has one."""
     if check["problem"]:
         raise problem(status, DEST_KINDS[check["problem"]], check["display"])
+
+
+def browser(value):
+    """Whether value is a signin setting: None (off) or a browser Spool can read a sign-in from."""
+    return value is None or (isinstance(value, str) and value in BROWSERS)
+
+
+def signed(signin):
+    """The spec's signin, present only on a try that uses it."""
+    return {"signin": signin} if signin else {}
 
 
 def other(engine):
@@ -817,17 +935,13 @@ ERRORS = [  # (kind, lowercase pieces of engine messages); the first match wins.
     ("empty", ("found no video at this link",)),
     ("no_ffmpeg", ("ffmpeg not found", "ffprobe and ffmpeg not found", "ffmpeg is not installed", "ffprobe/avprobe")),
     ("engine", ("requested format is not available",)),  # the video is there; the log says what was asked
-    # before "unavailable": the robot check says "sign in" too. Never tried again by itself: more requests make it worse
+    # before "signin": the robot check says "sign in" too. Never tried again by itself: more requests make it worse
     ("limited", ("not a bot", "http error 429", "too many requests", "available, try again later")),
     ("blocked", ("http error 403",)),
-    (
-        "unavailable",
+    (  # before "unavailable": "Private video" and "login required" ride with words it has
+        "signin",
         (
-            "video unavailable",
-            "is unavailable",
             "private video",
-            "is not available",
-            "has been removed",
             "members-only",
             "registered users",
             "logged-in",
@@ -836,6 +950,15 @@ ERRORS = [  # (kind, lowercase pieces of engine messages); the first match wins.
             "login required",
             "confirm your age",
             "age-restricted",
+        ),
+    ),
+    (
+        "unavailable",
+        (
+            "video unavailable",
+            "is unavailable",
+            "is not available",
+            "has been removed",
             "in your country",
             "geo restrict",
             "http error 404",

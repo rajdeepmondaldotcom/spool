@@ -231,15 +231,15 @@ def test_probe_errors_have_a_kind_and_plain_words(app):
         ("ERROR: [youtube] abc: This content isn\ufffdt available, try again later.", "limited"),  # a mark lost
         ("ERROR: [youtube] abc: Sign in to confirm you\ufffdre not a bot.", "limited"),
         ("ERROR: [youtube] abc: Sign in to confirm you`re not a bot.", "limited"),
-        ("ERROR: [youtube] abc: Sign in to confirm your age. This video may be inappropriate", "unavailable"),
-        ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access", "unavailable"),
-        ("ERROR: [youtube] abc: This video is available to this channel's members-only content", "unavailable"),
+        ("ERROR: [youtube] abc: Sign in to confirm your age. This video may be inappropriate", "signin"),
+        ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access", "signin"),
+        ("ERROR: [youtube] abc: This video is available to this channel's members-only content", "signin"),
         ("ERROR: unable to download video data: HTTP Error 403: Forbidden", "blocked"),
-        ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access to this video", "unavailable"),
+        ("ERROR: [youtube] abc: Private video. Sign in if you've been granted access to this video", "signin"),
         ("ERROR: [youtube] abc: Video unavailable. This video has been removed by the uploader", "unavailable"),
         (
             "ERROR: [youtube] abc: Sign in to confirm your age. This video may be inappropriate for some users.",
-            "unavailable",
+            "signin",
         ),
         ("ERROR: Unsupported URL: https://example.com/", "unsupported"),
         (
@@ -261,17 +261,17 @@ def test_probe_errors_have_a_kind_and_plain_words(app):
         ("ERROR: [youtube] abc: Video unavailable", "unavailable"),
         (
             "ERROR: [vimeo] 123: This video is only available for registered users. Use --cookies, --cookies-from-browser, --username and --password, --netrc-cmd, or --netrc (vimeo) to provide account credentials",
-            "unavailable",
+            "signin",
         ),
         (
             "ERROR: [instagram] abc: Requested content is not available, rate-limit reached or login required",
-            "unavailable",
+            "signin",
         ),
-        ("ERROR: [twitter] 1: You need to log in to view this content", "unavailable"),
-        ("ERROR: [patreon] 1: You need to be logged-in to access this", "unavailable"),
+        ("ERROR: [twitter] 1: You need to log in to view this content", "signin"),
+        ("ERROR: [patreon] 1: You need to be logged-in to access this", "signin"),
         (
             "ERROR: [youtube] abc: Join this channel to get access to members-only content like this video, and other exclusive perks.",
-            "unavailable",
+            "signin",
         ),
         (
             "No supported JavaScript runtime could be found. ERROR: [youtube] KXItezz-BhA: Requested format is not available. Use --list-formats for a list of available formats",
@@ -309,7 +309,7 @@ def test_a_kind_the_worker_names_is_used_as_is(app, events, monkeypatch, tmp_pat
     worker = tmp_path / "worker.py"
     worker.write_text(
         "import sys\n"
-        "sys.stdin.read()\n"
+        "sys.stdin.readline()\n"
         'print(\'{"event": "error", "message": "HTTP Error 403 in a list", "kind": "playlist"}\')\n'
     )
     monkeypatch.setattr(spool.jobs, "WORKER", worker)
@@ -331,7 +331,14 @@ def test_a_kind_the_worker_names_is_used_as_is(app, events, monkeypatch, tmp_pat
         ("too_long", None, "That link is too long for Spool.", None),
         ("unsupported", None, "Spool can't read this link.", None),
         ("empty", None, "Spool found no video at this link.", None),
-        ("unavailable", None, "This video is private, removed, or needs a sign-in.", None),
+        ("unavailable", None, "This video isn't available. It may be private or removed.", None),
+        ("signin", None, "This video needs a signed-in account. Choose your browser in Settings.", "signin"),
+        (
+            "signin_unread",
+            "Safari",
+            "Spool couldn't read the sign-in from Safari. Choose another browser in Settings, or try again.",
+            "signin",
+        ),
         ("live", None, "This is live now. Download it after it ends.", None),
         ("blocked", None, "The site refused the download.", "retry"),
         (
@@ -582,7 +589,7 @@ def test_a_byte_that_is_not_utf8_from_the_worker_is_only_logged(app, events, mon
     worker = tmp_path / "worker.py"
     worker.write_text(
         "import sys\n"
-        "sys.stdin.read()\n"
+        "sys.stdin.readline()\n"
         "sys.stdout.buffer.write(b'\\xff\\xfe ffmpeg noise\\n')\n"
         'sys.stdout.buffer.write(b\'{"event": "error", "message": "ERROR: Unsupported URL: x"}\\n\')\n'
     )
@@ -801,58 +808,6 @@ def test_a_site_limiting_the_connection_never_offers_an_engine_update(tmp_path):
         assert jobs._error("limited", "yt-dlp")["hint"] == "retry"
     finally:
         jobs.close()
-
-
-HELD = """
-import json, os, pathlib, sys, time
-spec = json.loads(sys.stdin.read())
-here = pathlib.Path(sys.argv[0]).parent
-if not (here / "held").exists():  # the first run stops before it knows its file's name, until the test lets it go
-    (here / "held").touch()
-    end = time.time() + 20
-    while not (here / "release").exists() and time.time() < end:
-        time.sleep(0.02)
-name = os.path.join(spec["dest"], "Same video [v].mp4")
-print(json.dumps({"event": "file", "path": name}), flush=True)
-with open(name + ".part", "ab") as f:
-    f.write(b"x" * 100)
-os.replace(name + ".part", name)
-print(json.dumps({"event": "done", "path": name, "size": os.path.getsize(name)}), flush=True)
-"""
-
-
-def test_a_link_with_no_id_never_starts_beside_a_job_that_has_not_named_its_file(app, events, monkeypatch, tmp_path):
-    import spool.jobs
-
-    worker = tmp_path / "held" / "worker.py"
-    worker.parent.mkdir()
-    worker.write_text(HELD, encoding="utf-8")
-    monkeypatch.setattr(spool.jobs, "WORKER", worker)
-    first = app.json("POST", "/api/jobs", {"entries": [{"url": "https://fake.test/a"}], "preset": "best"})
-    end = time.time() + 10
-    while not worker.with_name("held").exists():  # the first job is running and its file has no name yet
-        assert time.time() < end
-        time.sleep(0.02)
-    second = app.json("POST", "/api/jobs", {"entries": [{"url": "https://fake.test/b"}], "preset": "best"})
-    second_id = second[1]["jobs"][0]["id"]
-    end = time.time() + 2
-    while time.time() < end:  # a free slot, and still it must not start
-        assert app.jobs.snapshot()["jobs"][0]["state"] == "queued"
-        time.sleep(0.05)
-    worker.with_name("release").touch()
-    ended = {}
-    ids = {first[1]["jobs"][0]["id"], second_id}
-    events.until(
-        lambda e, d: (
-            e == "job"
-            and d["id"] in ids
-            and d["state"] in ("done", "failed")
-            and not ended.update({d["id"]: d})
-            and len(ended) == 2
-        )
-    )
-    assert {d["state"] for d in ended.values()} == {"done"}
-    assert {d["size"] for d in ended.values()} == {100}  # each wrote it whole, one after the other
 
 
 def test_different_videos_with_ids_still_run_two_at_once(app, events):

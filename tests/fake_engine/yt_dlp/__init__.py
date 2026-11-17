@@ -12,3 +12,6 @@ class YoutubeDL(_fake.YoutubeDL):
 
     def add_post_processor(self, pp, when="post_process"):
         self.pps.append((self.WHEN[when], pp))
+
+    def sort_formats(self, info):
+        pass  # the fake ranks the formats when it chooses, by the params of that moment

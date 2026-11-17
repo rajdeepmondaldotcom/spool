@@ -58,7 +58,7 @@ Keep the Terminal window open while Spool works. Press Ctrl+C in it to stop Spoo
 | Do this | And Spool |
 |---|---|
 | Paste a link, then press Enter | Downloads it at the quality you used last |
-| Paste several links at once | Queues them all |
+| Paste several links at once | Queues them all and downloads two at a time |
 | Paste a channel's link | Lists its newest 100 videos to pick from |
 | Press Cmd+Enter in the link field (Ctrl+Enter on Windows and Linux) | Downloads without showing the choices |
 | Run `spool https://…` | Opens with that link ready |
@@ -68,12 +68,24 @@ Keep the Terminal window open while Spool works. Press Ctrl+C in it to stop Spoo
 
 - The quality you used last is remembered, so most downloads are a paste and one key.
 - The title, channel, date and chapter markers are saved inside the file.
+- Plays everywhere is a quality that saves an MP4 file that phones, TVs and video editors can open, at the largest size the site offers in that form.
 - Files are named `Title [id].ext`. A fixed quality adds itself, as in `Title [id] 720p.mp4`, so two qualities of one video can sit side by side.
 - Spool warns you before a download when the file won't fit, and says so when a drive is unplugged or full.
 - Cancel and resume. A download you cancelled, or one cut short by closing Spool, continues from where it stopped when you press Resume.
 - A dropped connection doesn't end a download. Spool waits, tries again by itself and carries on from where it was.
 - Open a finished file from its row, or show it in its folder.
-- When a site changes how it serves video, Spool updates its engine the next time it starts.
+- When a site changes how it serves video, Spool fetches a newer engine by itself and tries the download again.
+
+## Private and age-restricted videos
+
+Some videos open only for a signed-in account. Spool can use the sign-in that a browser on your computer already has:
+
+1. Open Settings.
+2. Under Sign in with, choose the browser you use that site in.
+
+It is off until you choose one, and Spool reads that sign-in only for a video that asks for one.
+
+A site may limit an account used this way. Choose Off to stop.
 
 ## Update and uninstall
 
@@ -102,7 +114,8 @@ Your downloaded files are not in that folder, and Spool does not delete them.
 | You see | What to do |
 |---|---|
 | "The site refused the download." | Press Try again. Sites refuse some requests and accept the next. |
-| "This video is private, removed, or needs a sign-in." | Spool can't sign in to sites, so it can't download these. |
+| "This video needs a signed-in account. Choose your browser in Settings." | Press Choose a browser, pick the browser you're signed in with, then press Try again. |
+| "Spool couldn't read the sign-in from …" | On a Mac, Safari's sign-in can be read only once your terminal app has Full Disk Access (System Settings, Privacy & Security). Chrome and browsers built on it make macOS ask for your Mac password once: choose Allow. Or choose another browser. |
 | "This quality needs a free helper…" | Run the command from step 3 of Install, then press Try again. |
 | "… isn't connected." | Plug the drive in, or press Change and pick another folder. |
 | "This tab lost its link to Spool." | Run `spool` again. It opens a working tab. |
@@ -119,11 +132,12 @@ Options: `spool --port 8000` picks the port, and `spool --no-open` starts withou
 - Spool listens on your own machine only (`127.0.0.1`). It talks to the sites you download from, and to GitHub to fetch its engine and updates.
 - Other websites can't drive it, and neither can other people using your computer. Every request needs a token that your tab holds, and Spool makes a new one each time it starts.
 - It has no analytics, and it loads no third-party scripts or fonts.
+- It reads a browser's sign-in only when you choose that browser in Settings, and only for a video that asks for one.
 
 ## Limits
 
-- Spool can't sign in to sites, so private and age-restricted videos won't download.
 - It doesn't download subtitles yet.
+- Spool reads a few links with its second engine, and that one can't sign in, so a private video there won't download.
 - It is built and used on macOS. Linux and Windows pass the automated tests but have had no hands-on run.
 
 ## Use it fairly
