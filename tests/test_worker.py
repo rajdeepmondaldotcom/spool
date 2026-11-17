@@ -892,3 +892,22 @@ def test_youtube_dl_has_no_sign_in_and_fails_as_today(tmp_path):
     url = "https://fake.test/age?delay=0"
     error = last(run("download", url, "youtube-dl", dest=str(tmp_path), preset="best", home=tmp_path, signin="chrome"))
     assert "Sign in to confirm your age" in error["message"] and "kind" not in error
+
+
+def test_plays_everywhere_of_a_stream_with_no_size_has_no_class():
+    from spool import worker
+
+    formats = [
+        {"format_id": "mp4", "ext": "mp4", "vcodec": "avc1.64001F", "acodec": "mp4a.40.2", "filesize": 100},
+        {"format_id": "v720", "ext": "webm", "width": 1280, "height": 720, "vcodec": "vp9", "acodec": "none"},
+        {"format_id": "a", "ext": "webm", "vcodec": "none", "acodec": "opus", "filesize": 10},
+    ]
+    entry = worker.entry({"id": "x", "title": "No size", "formats": formats}, ffmpeg=True)
+    assert [(p["id"], p["detail"]) for p in entry["presets"][:2]] == [("best", "720p"), ("compatible", None)]
+
+
+def test_a_decrypt_warning_on_a_try_without_the_sign_in_keeps_its_own_kind(tmp_path):
+    error = last(run("download", "https://fake.test/live?warn=decrypt", dest=str(tmp_path), preset="best"))
+    assert error.get("kind") == "live", error
+    error = last(run("probe", "https://fake.test/unavailable?warn=decrypt"))
+    assert "kind" not in error, error
