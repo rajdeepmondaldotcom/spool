@@ -110,14 +110,21 @@ export function listen({ snapshot, job, removed, connected, stopped }) {
   };
   // leading: when this tab took the stream, 0 while it follows. Each message names the newest lead its sender knows,
   // so one from a tab that lost the stream while it was suspended is ignored.
-  let leading = 0, newest = 0, stream, again = false, refused = false, watch;
+  let leading = 0, newest = 0, stream, again = false, refused = false, watch, holding;
   const post = (m) => channel.postMessage({ ...m, from: leading || newest });
   const emit = (m) => { deliver(m); post(m); };
   announce = () => emit({ event: "stopped", data: {} });
   const name = `spool-events-${token}`;
-  // Only a lock taken by another tab steps down; a browser that refuses locks reads its own stream, as one without them.
-  const take = (options = {}) => navigator.locks.request(name, options, lead)
-    .catch((e) => (e.name === "AbortError" ? down(!options.steal) : leading || lead()));
+  // A tab keeps one request in line at all times, and steps down only when it loses the lock it holds now (its own
+  // take-over can replace its older lock). A browser that refuses locks reads its own stream, as one without them.
+  const take = (options = {}) => {
+    const me = {};
+    navigator.locks.request(name, options, () => { holding = me; return lead(); }).catch((e) => {
+      if (e.name !== "AbortError") return leading || lead();
+      if (!options.steal) take();
+      if (holding === me) down();
+    });
+  };
   // A tab that follows asks for a snapshot and waits for the answer; one that hears nothing for long asks again.
   const ask = () => {
     if (ended || leading) return;
@@ -176,6 +183,7 @@ export function listen({ snapshot, job, removed, connected, stopped }) {
   };
   const lead = () => {
     clearTimeout(watch);
+    stream?.abort(); // this tab's earlier lead, if any, stops reading
     leading = newest = Math.max(Date.now(), newest + 1);
     // a tab that joins after the token was refused has to hear it too: the stream is not coming back
     reopen = () => { if (refused) return emit({ event: "unauthorized" }); again = true; stream?.abort(); };
@@ -183,11 +191,10 @@ export function listen({ snapshot, job, removed, connected, stopped }) {
     return new Promise(() => {}); // held until this tab closes, or another takes it
   };
   // The lock was taken while this tab was suspended: it follows again, and asks for the events it missed.
-  const down = (requeue) => {
+  const down = () => {
     leading = 0;
     stream?.abort();
     reopen = ask;
-    if (requeue) take(); // one that took the lock by force is still in line from before
     ask();
   };
   if (shared) { ask(); take(); } else lead();
