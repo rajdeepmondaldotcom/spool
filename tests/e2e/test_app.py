@@ -33,8 +33,9 @@ def group(page, name):
 
 
 def add(spool, links, preset="best"):
-    """Add jobs straight through the server, as another tab would. Returns the jobs."""
-    res = spool[1].add([{"url": u, "title": t} for u, t in links], preset)
+    """Add jobs straight through the server, as another tab would after a lookup: each with its video's id (here its
+    link), so different videos in one folder run together. Returns the jobs."""
+    res = spool[1].add([{"url": u, "id": u, "title": t} for u, t in links], preset)
     return res[0] if isinstance(res, tuple) else res
 
 
@@ -1488,3 +1489,23 @@ def test_after_quit_the_stream_is_not_asked_for_again(app, spool):
     vanish(spool[1])  # the stream ends without a word, as from a server that stopped before saying so
     app.wait_for_timeout(2500)
     assert len(made) == asked
+
+
+def test_two_videos_added_from_the_page_download_at_the_same_time(app, spool):
+    def slow(route):
+        response = route.fetch()
+        body = response.json()
+        for n, e in enumerate(body["entries"], 1):
+            e.update(url=f"https://fake.test/slow/{n}?delay=0.5", id=f"slow-{n}")
+        route.fulfill(response=response, json=body)
+
+    app.route("**/api/probe", slow)
+    look_up(app, "https://fake.test/playlist")
+    t = tray(app, "Fake playlist")
+    t.get_by_role("checkbox", name=re.compile("Fake video 3")).uncheck()
+    t.get_by_role("button", name="Download 2").click()
+    end = time.time() + 15
+    while sum(j["state"] == "running" for j in spool[1].snapshot()["jobs"]) < 2:
+        assert time.time() < end, "the two never ran together"
+        time.sleep(0.05)
+    expect(group(app, "Downloading").get_by_role("progressbar")).to_have_count(2)
