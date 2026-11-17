@@ -8,13 +8,20 @@ const KEY = "spool-token";
 const fragment = () => new URLSearchParams(location.hash.slice(1));
 const first = fragment();
 const kept = () => { try { return localStorage.getItem(KEY) || ""; } catch { return ""; } };
+const valid = (t) => t && /^[\w-]+$/.test(t);
 const given = first.get("t");
-const token = given && /^[\w-]+$/.test(given) ? given : kept();
+const token = valid(given) ? given : kept();
 const remember = () => { try { localStorage.setItem(KEY, token); } catch { /* private window: the token lives only in this page */ } };
 if (location.hash) history.replaceState(null, "", location.pathname + location.search);
 const auth = { "X-Spool-Token": token };
 // A tab left open across a restart holds a token that opens nothing. When a newer tab is let in, this one follows.
 window.addEventListener("storage", (e) => { if (e.key === KEY && e.newValue && e.newValue !== token) location.reload(); });
+// A launch link put in this tab's address changes only the fragment, so the page loads again to read it. Added before
+// onLink's listener, it stops that one from clearing the fragment the new load needs.
+window.addEventListener("hashchange", (e) => {
+  const t = fragment().get("t");
+  if (valid(t) && t !== token) { e.stopImmediatePropagation(); location.reload(); }
+});
 
 let unauthorized = () => {};
 export const onUnauthorized = (fn) => { unauthorized = fn; };

@@ -1102,6 +1102,38 @@ def test_a_tab_from_an_earlier_launch_works_again_once_a_new_tab_is_let_in(page,
     expect(page.get_by_label("Link to download")).to_be_visible()
 
 
+def test_a_tab_that_lost_its_link_works_again_when_the_launch_link_is_put_in_its_address(page, spool):
+    origin = spool[0].split("#")[0]
+    page.goto(origin + "#t=stale")
+    expect(page.get_by_text("This tab lost its link to Spool.", exact=False)).to_be_visible()
+    page.goto(spool[0] + "&url=https%3A%2F%2Ffake.test%2Fvideo")  # only the fragment changes: no new load by itself
+    expect(page.get_by_label("Link to download")).to_have_value(VIDEO)  # the link given with it waits in the field
+    expect(page).to_have_url(re.compile(r"/$"))
+
+
+def test_a_stopped_tab_works_again_when_the_next_launch_link_is_put_in_its_address(page, tmp_path, monkeypatch):
+    from spool import server
+
+    httpd, url, jobs, _ = serve_fake.start(tmp_path)
+    port = httpd.server_address[1]
+    page.goto(url)
+    page.get_by_label("Link to download").wait_for()
+    jobs.close()
+    httpd.shutdown()
+    httpd.server_close()
+    expect(page.get_by_text(STOPPED)).to_be_visible()
+    real = server.make_server
+    monkeypatch.setattr(server, "make_server", lambda *a, **k: real(*a, **{**k, "token": "next-launch"}))
+    httpd, url, jobs, _ = serve_fake.start(tmp_path, port=port)  # each launch has a new token
+    try:
+        page.goto(url.replace("fake-token", "next-launch"))
+        expect(page.get_by_label("Link to download")).to_be_visible()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        jobs.close()
+
+
 # api.js: silence that means the stream is gone; how long a question waits for an answer
 STALL_MS, ASK_MS = 40_000, 2_000
 
