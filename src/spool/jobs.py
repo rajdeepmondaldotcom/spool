@@ -20,7 +20,7 @@ from . import system
 from .engines import RELEASES, write_atomic
 
 WORKER = Path(__file__).with_name("worker.py")
-PRESETS = ("best", "2160", "1440", "1080", "720", "480", "360", "240", "audio", "mp3")
+PRESETS = ("best", "compatible", "2160", "1440", "1080", "720", "480", "360", "240", "audio", "mp3")
 AT_ONCE = 2
 try:
     VERSION = metadata.version("spool-dl")

@@ -298,3 +298,19 @@ def test_the_snapshot_carries_the_signin_setting_and_a_failure_offers_settings(a
     assert (status, body["error"]["kind"], body["error"]["hint"]) == (422, "signin", "signin")
     failed = finished(events, add(app, "https://fake.test/x")["jobs"][0]["id"])[-1][1]
     assert (failed["error"]["kind"], failed["error"]["hint"]) == ("signin", "signin")
+
+
+# Plays everywhere
+
+
+def test_compatible_is_a_preset_wherever_one_is_accepted(app, events, monkeypatch, tmp_path):
+    import spool.jobs
+
+    worker = tmp_path / "worker.py"
+    worker.write_text("import sys\nsys.stdin.readline()\n")  # says nothing: the job fails, as it may here
+    monkeypatch.setattr(spool.jobs, "WORKER", worker)
+    status, body = app.json("PUT", "/api/settings", {"preset": "compatible"})
+    assert (status, body["settings"]["preset"]) == (200, "compatible")
+    job = add(app, "https://fake.test/x", "compatible")["jobs"][0]
+    assert job["preset"] == "compatible"
+    finished(events, job["id"])

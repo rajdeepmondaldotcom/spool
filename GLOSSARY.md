@@ -8,7 +8,7 @@ The words the code uses. Where the screen uses a plainer word, it is in brackets
 | **Probe** (get details) | Reading a link's details without downloading anything. A probe returns entries. |
 | **Entry** | One downloadable video found by a probe. A single video is one entry. A playlist is many. |
 | **Item** | An entry's position in its playlist, counted from 1. Used when an entry has no link of its own. |
-| **Preset** | A named quality choice (`best`, `1080`, `audio`, `mp3` and so on). |
+| **Preset** | A named quality choice (`best`, `compatible`, `1080`, `audio`, `mp3` and so on). `compatible` (Plays everywhere) is H.264 picture and AAC sound in MP4 at the largest class that has them. |
 | **Class** | A numeric preset's size, measured on the picture's shorter side. A 1080×1920 video is class 1080. |
 | **Job** | One entry being downloaded with one preset to one destination. Jobs are what the queue holds. |
 | **State** | Where a job is in its life: `queued`, `running`, `done`, `failed` or `cancelled`. |
