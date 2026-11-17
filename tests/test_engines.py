@@ -19,8 +19,7 @@ def settle(engines, timeout=10):
     while any(s["busy"] for s in engines.status().values()):
         assert time.time() < end, engines.status()
         time.sleep(0.02)
-    time.sleep(0.05)  # let the latest-version checks land too
-    return engines.status()
+    return engines.status()  # an update learns the latest version before it stops being busy
 
 
 def probe_with(path, engine):

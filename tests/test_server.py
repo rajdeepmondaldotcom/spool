@@ -6,7 +6,7 @@ from importlib import metadata
 from pathlib import Path
 
 import pytest
-from support import job_state
+from support import Held, job_state
 
 from spool import server, system
 
@@ -159,7 +159,6 @@ def test_a_job_downloads_with_live_progress_to_the_destination(app):
     events.close()
     states = [d["state"] for e, d in seen if e == "job"]
     assert states[0] == "queued" and "running" in states and states[-1] == "done"
-    assert any(d.get("stage") == "downloading" and d["downloaded"] for e, d in seen if e == "job")
     done = seen[-1][1]
     assert done["path"] == str(app.dest / "Fake video 1 [vid-1].mp4")
     assert done["size"] == 3_400_000
@@ -167,18 +166,40 @@ def test_a_job_downloads_with_live_progress_to_the_destination(app):
     assert Path(done["path"]).exists()
 
 
-def test_job_events_are_throttled_to_four_a_second(app):
+def post(app, url, id="v", preset="best"):
+    status, body = app.json("POST", "/api/jobs", {"entries": [{"url": url, "id": id}], "preset": preset})
+    assert status == 201, body
+    return body["jobs"][0]["id"]
+
+
+def test_progress_reaches_the_page_while_a_download_runs(app, monkeypatch, tmp_path):
+    worker = Held(monkeypatch, tmp_path)
     events = app.events()
     events.next()
-    # 20 progress steps over about one second
-    entry = {"url": "https://fake.test/video?delay=0.05", "id": "vid-1", "title": "Fake video 1"}
-    began = time.monotonic()
-    app.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})
-    seen = events.until(job_state("done"))
-    took = time.monotonic() - began  # about a second here, several on a loaded machine
+    job_id = post(app, "https://fake.test/hold")
+    worker.held()  # mid-download, and it stays there: the page must hear how far it is
+    live = events.until(lambda e, d: e == "job" and d["id"] == job_id and d["downloaded"] == 100)[-1][1]
+    assert (live["state"], live["stage"], live["progress"]) == ("running", "downloading", 100 / 300)
+    worker.go()
+    assert events.until(job_state("done"))[-1][1]["size"] == 300
     events.close()
-    progress = [d for e, d in seen if e == "job" and d["state"] == "running"]
-    assert 2 <= len(progress) <= 4 * took + 4  # four a second, plus the stage changes, which go out at once
+
+
+def test_job_events_are_throttled_to_four_a_second(app, monkeypatch, tmp_path):
+    from spool.jobs import TICK
+
+    worker = Held(monkeypatch, tmp_path)
+    events = app.events()
+    events.next()
+    began = time.monotonic()
+    job_id = post(app, "https://fake.test/hold/burst")  # 201 progress events at once, then it holds
+    seen = events.until(lambda e, d: e == "job" and d["id"] == job_id and d["downloaded"] == 300)
+    took = time.monotonic() - began
+    running = [d for e, d in seen if e == "job" and d["id"] == job_id and d["state"] == "running"]
+    assert len(running) <= took / TICK + 2  # a tick never comes early; plus "starting", which goes out at once
+    worker.go()
+    events.until(job_state("done"))
+    events.close()
 
 
 def test_two_jobs_run_at_once_and_the_third_waits(app):
@@ -187,8 +208,7 @@ def test_two_jobs_run_at_once_and_the_third_waits(app):
     entries = [
         {"url": f"https://fake.test/slow/{n}?delay=0.2", "id": f"slow-{n}", "title": f"Slow {n}"} for n in (1, 2, 3)
     ]
-    app.json("POST", "/api/jobs", {"entries": entries, "preset": "best"})
-    events.until(lambda e, d: e == "job" and d["state"] == "running" and d["stage"] == "downloading")
+    app.json("POST", "/api/jobs", {"entries": entries, "preset": "best"})  # the queue starts what it can at once
     states = {j["title"]: j["state"] for j in app.jobs.snapshot()["jobs"]}
     assert states == {"Slow 1": "running", "Slow 2": "running", "Slow 3": "queued"}
     events.close()
@@ -248,8 +268,7 @@ def test_a_tab_that_closes_mid_request_is_quiet(app, monkeypatch, capfd):
     try:
         app.request("GET", "/api/jobs/x/log")
     except http.client.RemoteDisconnected:
-        pass
-    time.sleep(0.2)
+        pass  # the server had handled the error before it closed the connection
     assert "Traceback" not in capfd.readouterr().err
 
 

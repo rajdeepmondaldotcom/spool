@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 import pytest
-from support import job_state
+from support import Held, job_state, until
 
 from spool import system
 
@@ -155,16 +155,18 @@ def test_reveal_needs_a_finished_file_that_still_exists(app):
     sys.platform == "win32",
     reason="Windows cannot delete a folder holding an open file, so a vanishing folder is not covered there",
 )
-def test_a_destination_that_vanishes_mid_download_is_named_as_missing(app, tmp_path):
+def test_a_destination_that_vanishes_mid_download_is_named_as_missing(app, tmp_path, monkeypatch):
+    worker = Held(monkeypatch, tmp_path)
     folder = tmp_path / "Drive"
     folder.mkdir()
     app.json("PUT", "/api/settings", {"dest": str(folder)})
     events = app.events()
     events.next()
-    job = app.json("POST", "/api/jobs", {"entries": [entry("https://fake.test/slow?delay=0.1")], "preset": "best"})
+    job = app.json("POST", "/api/jobs", {"entries": [{"url": "https://fake.test/hold", "id": "v"}], "preset": "best"})
     job_id = job[1]["jobs"][0]["id"]
-    events.until(lambda e, d: e == "job" and d["id"] == job_id and d["stage"] == "downloading")
-    shutil.rmtree(folder)
+    worker.held()  # mid-download
+    shutil.rmtree(folder)  # the drive is unplugged
+    worker.go()  # its next write fails
     failed = events.until(lambda e, d: e == "job" and d["id"] == job_id and d["state"] == "failed")[-1][1]
     events.close()
     assert (failed["error"]["kind"], failed["error"]["hint"]) == ("dest_missing", "check_dest")
@@ -250,14 +252,16 @@ def test_a_snapshot_goes_out_when_the_stuck_check_finally_answers(app, tmp_path,
     assert seen[-1][1]["dest"]["problem"] is None
 
 
-def test_a_drive_busy_with_spools_own_download_is_answering(app, monkeypatch):
+def test_a_drive_busy_with_spools_own_download_is_answering(app, monkeypatch, tmp_path):
     """A slow drive queues the write test behind Spool's own writes: the running job is the proof it works."""
+    worker = Held(monkeypatch, tmp_path)
     events = app.events()
     events.next()
-    slow = dict(entry("https://fake.test/slow?delay=0.3"), id="slow-1")  # another video: the two run at once
-    first = app.json("POST", "/api/jobs", {"entries": [slow], "preset": "best"})
-    first = first[1]["jobs"][0]
-    events.until(lambda e, d: e == "job" and d["id"] == first["id"] and d["stage"] == "downloading")
+    first = app.json(
+        "POST", "/api/jobs", {"entries": [{"url": "https://fake.test/hold?name=First", "id": "a"}], "preset": "best"}
+    )[1]["jobs"][0]
+    worker.held("First")
+    until(lambda: app.jobs.snapshot()["jobs"][0]["stage"] == "downloading")  # Spool knows it is writing
     monkeypatch.setattr(system, "CHECK_TIMEOUT", 0.3)
     real = system.probe
     monkeypatch.setattr(system, "probe", lambda path, write: time.sleep(1) or real(path, write))  # past the limit
@@ -265,13 +269,15 @@ def test_a_drive_busy_with_spools_own_download_is_answering(app, monkeypatch):
     status, body = app.json("PUT", "/api/settings", {"dest": str(app.dest)})
     assert (status, body["dest"]["ok"], body["dest"]["problem"]) == (200, True, None)
     assert app.jobs.snapshot()["dest"]["ok"] is True  # the page leaves Download enabled
-    status, body = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})
+    entry = {"url": "https://fake.test/plain?name=Second", "id": "b"}
+    status, body = app.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})
     assert status == 201, body
     second = events.until(
         lambda e, d: e == "job" and d["id"] == body["jobs"][0]["id"] and d["state"] in ("done", "failed")
     )
     assert second[-1][1]["state"] == "done", second[-1][1]["error"]
 
+    worker.go()
     events.until(lambda e, d: e == "job" and d["id"] == first["id"] and d["state"] == "done", timeout=20)
     events.close()
     status, body = app.json("PUT", "/api/settings", {"dest": str(app.dest)})  # no job of Spool's there now

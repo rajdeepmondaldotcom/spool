@@ -203,7 +203,7 @@ def downloading(data):
     proc, line = launch(data)
     url = url_in(line)
     client = Client(url.split("/#")[0], url.split("#t=")[1])
-    entry = {"url": "https://fake.test/slow?delay=0.3", "id": "slow-1", "title": "Slow"}
+    entry = {"url": "https://fake.test/slow?delay=30", "id": "slow-1", "title": "Slow"}  # 30 s a step: it stays
     assert client.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})[0] == 201
     deadline = time.time() + 10
     while not list((data / "downloads").glob("*.part")):
@@ -239,9 +239,13 @@ def test_closing_the_terminal_window_shuts_down_the_same_way(data):
 
 def test_a_spool_started_with_nohup_outlives_its_terminal(data):
     proc = start(data, preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))  # what nohup does
-    assert "Spool is running at" in readline(proc)
+    line = readline(proc)
+    assert "Spool is running at" in line
     proc.send_signal(signal.SIGHUP)
-    time.sleep(0.5)
+    url = url_in(line)
+    # the main thread runs a pending signal's handler before it accepts the next connection, so an answer
+    # here means the hang-up has been dealt with, and Spool is still serving
+    assert Client(url.split("/#")[0], url.split("#t=")[1]).request("GET", "/api/jobs/x/log")[0] == 404
     assert proc.poll() is None and (data / "spool.lock").exists()
 
 
