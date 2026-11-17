@@ -79,7 +79,7 @@ export const updateEngine = (name) => call("POST", `/api/engines/${name}/update`
 // and passes every event to the others; when that tab closes, another takes the lock. A tab the browser suspends keeps
 // the lock: one that hears nothing from it asks, and if no answer comes, takes the stream over.
 const STALL_MS = 40000; // the server pings every 15 seconds; silence this long means it is suspended or gone
-const ASK_MS = 5000; // the tab holding the stream answers at once, even while Spool is down; silence means it is suspended
+const ASK_MS = 2000; // a running holder answers within milliseconds, even while Spool is down, and one taken from steps down
 let reopen = () => {};
 // A fresh snapshot (the server sends one on every connect), e.g. when the tab is seen again.
 export const refresh = () => reopen();
@@ -108,7 +108,9 @@ export function listen({ snapshot, job, removed, connected, stopped }) {
   const emit = (m) => { deliver(m); post(m); };
   announce = () => emit({ event: "stopped", data: {} });
   const name = `spool-events-${token}`;
-  const take = (options = {}) => navigator.locks.request(name, options, lead).catch(() => down(!options.steal));
+  // Only a lock taken by another tab steps down; a browser that refuses locks reads its own stream, as one without them.
+  const take = (options = {}) => navigator.locks.request(name, options, lead)
+    .catch((e) => (e.name === "AbortError" ? down(!options.steal) : leading || lead()));
   // A tab that follows asks for a snapshot and waits for the answer; one that hears nothing for long asks again.
   const ask = () => {
     if (ended || leading) return;

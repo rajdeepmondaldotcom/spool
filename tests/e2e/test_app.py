@@ -1102,10 +1102,8 @@ def test_a_tab_from_an_earlier_launch_works_again_once_a_new_tab_is_let_in(page,
     expect(page.get_by_label("Link to download")).to_be_visible()
 
 
-STALL_MS, ASK_MS = (
-    40_000,
-    5_000,
-)  # api.js: silence that means the stream is gone; how long a question waits for an answer
+# api.js: silence that means the stream is gone; how long a question waits for an answer
+STALL_MS, ASK_MS = 40_000, 2_000
 
 
 def suspend(page):
@@ -1160,6 +1158,23 @@ def test_a_suspended_tab_that_wakes_up_hands_the_stream_over(page, spool):
     until(lambda: len(spool[1].subscribers) == 1)  # the woken tab's stream is gone once Spool next writes to it
     held, pending = locks(second)
     assert (len(held), len(pending)) == (1, 2)  # one tab reads; both wait in line for when it closes
+
+
+def test_a_browser_that_refuses_the_lock_still_shows_the_page(page, spool):
+    # As when site storage is blocked: the browser refuses every lock at once.
+    page.add_init_script(
+        "LockManager.prototype.request = () => Promise.reject(new DOMException('blocked', 'SecurityError'));"
+    )
+    page.clock.install()  # nothing on a timer happens until the test moves the clock on
+    made = []
+    page.on("request", lambda r: "/api/events" in r.url and made.append(r))
+    page.goto(spool[0])
+    expect(page.get_by_label("Link to download")).to_be_visible(timeout=10000)
+    look_up(page, VIDEO)  # the page still answers
+    expect(tray(page, "Fake video 1")).to_be_visible()
+    page.clock.run_for(ASK_MS)  # past the question it asked on joining
+    fence(page)
+    assert len(made) == 1
 
 
 def test_tabs_never_take_the_stream_from_each_other_while_spool_is_down(page, spool):
