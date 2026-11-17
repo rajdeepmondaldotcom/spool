@@ -203,7 +203,7 @@ def downloading(data):
     proc, line = launch(data)
     url = url_in(line)
     client = Client(url.split("/#")[0], url.split("#t=")[1])
-    entry = {"url": "https://fake.test/slow?delay=0.3", "id": "slow-1", "title": "Slow"}
+    entry = {"url": "https://fake.test/slow?delay=30", "id": "slow-1", "title": "Slow"}  # 30 s a step: it stays
     assert client.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})[0] == 201
     deadline = time.time() + 10
     while not list((data / "downloads").glob("*.part")):
@@ -239,9 +239,13 @@ def test_closing_the_terminal_window_shuts_down_the_same_way(data):
 
 def test_a_spool_started_with_nohup_outlives_its_terminal(data):
     proc = start(data, preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))  # what nohup does
-    assert "Spool is running at" in readline(proc)
+    line = readline(proc)
+    assert "Spool is running at" in line
     proc.send_signal(signal.SIGHUP)
-    time.sleep(0.5)
+    url = url_in(line)
+    # the main thread runs a pending signal's handler before it accepts the next connection, so an answer
+    # here means the hang-up has been dealt with, and Spool is still serving
+    assert Client(url.split("/#")[0], url.split("#t=")[1]).request("GET", "/api/jobs/x/log")[0] == 404
     assert proc.poll() is None and (data / "spool.lock").exists()
 
 
@@ -290,3 +294,58 @@ def test_links_on_the_command_line_ride_in_the_fragment():
     assert carrying(["https://youtu.be/x?t=1", "https://v.test/a b"]) == (
         "&url=https%3A%2F%2Fyoutu.be%2Fx%3Ft%3D1%20https%3A%2F%2Fv.test%2Fa%20b"
     )
+
+
+def test_quit_from_the_page_shuts_down_as_ctrl_c_does(data):
+    proc, workers = downloading(data)
+    lock = json.loads((data / "spool.lock").read_text())
+    client = Client(f"http://127.0.0.1:{lock['port']}", lock["token"])
+    assert client.request("POST", "/api/quit")[0] == 204
+    stopped_cleanly(proc, data, workers)
+    saved = json.loads((data / "state.json").read_text())["jobs"]
+    assert [j["state"] for j in saved] == ["running"]  # read as interrupted at the next launch
+
+
+def test_a_launch_with_no_network_says_nothing_about_a_newer_spool(data):
+    proc, line = launch(data)
+    url = url_in(line)
+    client = Client(url.split("/#")[0], url.split("#t=")[1])
+    events = client.events()
+    try:
+        assert events.until(lambda e, d: e == "snapshot")[-1][1]["update"] is None
+    finally:
+        events.close()
+
+
+def test_a_newer_spool_found_at_launch_reaches_the_page(tmp_path, monkeypatch):
+    import spool.__main__ as launcher
+    from spool.engines import Engines
+    from spool.jobs import Jobs
+
+    monkeypatch.setattr(launcher, "VERSION", "0.2.0")
+    monkeypatch.setattr(
+        launcher, "newer_spool", lambda data, running: running == "0.2.0" and data == tmp_path and "0.2.1"
+    )
+    jobs = Jobs(tmp_path, Engines(tmp_path / "engines"))
+    q = jobs.subscribe()
+    q.get(timeout=5)
+    try:
+        threading.Thread(target=launcher.releases, args=(jobs, tmp_path), daemon=True).start()
+        while True:  # any other snapshot may come first; the one that matters must come
+            event, snap = q.get(timeout=5)
+            if event == "snapshot" and snap["update"]:
+                break
+        assert snap["update"] == {"version": "0.2.1"}
+    finally:
+        jobs.close()
+
+
+def test_quit_tells_the_open_tab_that_spool_stopped(data):
+    proc, line = launch(data)
+    url = url_in(line)
+    client = Client(url.split("/#")[0], url.split("#t=")[1])
+    events = client.events()
+    events.next()
+    assert client.request("POST", "/api/quit")[0] == 204
+    assert events.until(lambda e, d: e == "stopped")[-1] == ("stopped", {})
+    assert proc.wait(10) == 0

@@ -1,6 +1,8 @@
 """The queue: jobs and their states, settings, the one state file, live events and plain-word errors."""
 
+import glob
 import json
+import math
 import os
 import queue
 import re
@@ -25,7 +27,11 @@ try:
 except metadata.PackageNotFoundError:  # run from a source tree that was never installed
     VERSION = None
 LINK_LIMIT = 8192  # signed CDN links run to a few thousand characters
-RETRY_AFTER = 3  # seconds before the one automatic retry of a download refused before any bytes
+WAITS = (10, 30, 60, 120, 300)  # seconds before each try again of a download cut short; then it fails
+# Sites limit a guest to a few hundred videos an hour: with PACE_FROM or more queued, the next starts PACE seconds after
+# one finishes. A handful is never slowed.
+PACE = 8
+PACE_FROM = 5
 TICK = 0.25  # job progress goes out at most once a tick: four a second
 
 
@@ -53,6 +59,7 @@ class Jobs:
         self.settings.update({k: v for k, v in saved.get("settings", {}).items() if k in valid and valid[k](v)})
         # keys added after v0.1's first saves
         later = {"files": [], "item": None, "progress": None, "what": None, "started": None}
+        later |= {"note": None, "attempt": None, "attempts": None}
         keys = set(new_job({"url": "https://x.test"}, "best", "yt-dlp", "/")) - set(later)
         self.jobs = [  # newest first; a malformed record is dropped, not fatal
             {**later, **j} for j in saved.get("jobs", []) if isinstance(j, dict) and keys <= set(j)
@@ -62,9 +69,15 @@ class Jobs:
         self.dirty = set()
         self.subscribers = []
         self.closed = False
+        self.shown = None  # the folder and tools the last snapshot showed
+        self.waits = WAITS
+        self.pace, self.pace_from = PACE, PACE_FROM
+        self.rest_until, self.resting = 0.0, False  # the queue pauses until rest_until; resting: a timer will pump
+        self.wake = threading.Condition(self.lock)  # a job waiting to try again wakes for a cancel or a quit
+        self.newer = None  # a newer Spool's version, once a look at the releases finds one
         for job in self.jobs:
             if job["state"] in ("queued", "running"):
-                job.update(state="failed", stage=None, error=error("interrupted"))
+                job.update(state="failed", stage=None, note=None, eta=None, error=error("interrupted"))
         self._save()
         engines.on_change = self._snapshot_changed  # the event stream lives here, so engines report to it
         threading.Thread(target=self._tick, daemon=True).start()
@@ -94,19 +107,22 @@ class Jobs:
         if dest is None or dest["path"] != self.settings["dest"]:  # the setting changed since dest was checked
             dest = self._check(self.settings["dest"], write=False)
         there = self._there() if there is None else there
+        tools = self.tools()
         with self.lock:  # a job finished since there was taken keeps the file_exists it finished with
             jobs = [dict(j, file_exists=there.get(j["path"], j["file_exists"])) for j in self.jobs]
+            self.shown = dict(dest, free_bytes=None), tools  # what the pages now know of the folder and tools
             return {
                 "settings": dict(self.settings),
                 "dest": dest_message(dest),
                 "engines": self.engines.status(),
-                "tools": {k: v for k, v in self.tools().items() if k != "js_path"},
+                "tools": {k: v for k, v in tools.items() if k != "js_path"},
                 "version": VERSION,
+                "update": self.newer and {"version": self.newer},
                 "jobs": jobs,
             }
 
     def subscribe(self):
-        """A queue of (event, data), starting with a snapshot. (None, None) means Spool is closing."""
+        """A queue of (event, data), starting with a snapshot. ("stopped", {}) then (None, None): Spool is closing."""
         q, dest, there = queue.Queue(), self._check(self.settings["dest"], write=False), self._there()
         with self.lock:
             q.put(("snapshot", self.snapshot(dest, there)))
@@ -147,7 +163,13 @@ class Jobs:
         if kind:
             e = self._error(kind, engine, probe=True)
             raise Problem(422, kind, e["message"], e["hint"])
-        return {"engine": engine, "kind": result["kind"], "title": result["title"], "entries": result["entries"]}
+        return {
+            "engine": engine,
+            "kind": result["kind"],
+            "title": result["title"],
+            "entries": result["entries"],  # whole: each preset's ext rides along
+            "truncated": result.get("truncated", False),  # a channel with more videos than it lists
+        }
 
     def add(self, entries, preset, engine=None):
         """Add a job per entry. Returns (jobs, existing): an entry matching a job already in the list adds nothing."""
@@ -184,8 +206,9 @@ class Jobs:
             job = self._job(job_id)
             if job["state"] not in ("queued", "running"):
                 raise Problem(409, "conflict", "Only a waiting or running download can be cancelled.")
-            job.update(state="cancelled", stage=None, speed=None, eta=None, finished=time.time())
+            job.update(state="cancelled", stage=None, note=None, speed=None, eta=None, finished=time.time())
             self._changed(job)
+            self.wake.notify_all()
             proc = self.procs.get(job_id)
             self._pump()
         if proc:
@@ -226,7 +249,8 @@ class Jobs:
             self._publish("job_removed", {"id": job_id})
             self._save()
             keep = {job["path"]} | {j["path"] for j in self.jobs}
-            keep |= {f for j in self.jobs if j["state"] in ("queued", "running") for f in j["files"]}
+            going = [f for j in self.jobs if j["state"] in ("queued", "running") for f in j["files"]]
+            keep |= {f + end for f in going for end in ("", ".part", ".ytdl")}  # the engine writes beside each name
         (self.logs / f"{job_id}.log").unlink(missing_ok=True)
         remove_leftovers(job, keep)
 
@@ -251,6 +275,16 @@ class Jobs:
         if not path or not os.path.exists(path):
             raise problem(410, "gone")
         system.reveal(path)
+
+    def open(self, job_id):
+        with self.lock:
+            job = self._job(job_id)
+            state, path = job["state"], job["path"]
+        if state != "done":
+            raise Problem(409, "conflict", "Only a finished download can be opened.")
+        if not path or not os.path.exists(path):
+            raise problem(410, "gone")
+        system.open_file(path)
 
     def reveal_dest(self):
         dest = self.settings["dest"]
@@ -297,11 +331,16 @@ class Jobs:
     def close(self):
         with self.lock:
             self.closed = True
+            self.wake.notify_all()
             procs = [p for p in self.procs.values() if p]
             for q in self.subscribers:
+                q.put(("stopped", {}))
                 q.put((None, None))
         for proc in procs:
             system.kill(proc)
+        end = time.monotonic() + 1  # each open tab hears it before the process exits
+        while self.subscribers and time.monotonic() < end:
+            time.sleep(0.02)
 
     # Inside
 
@@ -355,10 +394,11 @@ class Jobs:
     def _call(self, spec, timeout=120):
         try:
             out = subprocess.run(
-                [sys.executable, "-I", str(WORKER)],
+                [sys.executable, "-I", "-X", "utf8", str(WORKER)],
                 input=json.dumps(self._spec(**spec)),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 errors="replace",  # ffmpeg shares the pipe and may write any bytes
                 timeout=timeout,
             ).stdout
@@ -371,39 +411,71 @@ class Jobs:
 
         A slot is an entry in procs: taken here, freed when the job's thread ends, so a cancelled worker that is
         still dying keeps its slot."""
+        rest = self.rest_until - time.monotonic()
+        if rest > 0:
+            if not self.resting:
+                self.resting = True
+                timer = threading.Timer(rest, self._rested)
+                timer.daemon = True
+                timer.start()
+            return
         for job in reversed(self.jobs):
             if len(self.procs) >= AT_ONCE or self.closed:
                 return
-            if job["state"] == "queued" and job["id"] not in self.procs:
+            if job["state"] == "queued" and job["id"] not in self.procs and not self._clash(job):
                 job.update(state="running", stage="starting", started=time.time())
                 self._changed(job)
                 self.procs[job["id"]] = None  # no worker yet
                 threading.Thread(target=self._run, args=(job,), daemon=True).start()
 
+    def _clash(self, job):
+        """A running job that may write the same file, so this one waits in the queue. A file's name carries the
+        video's id and is known only once the worker runs: two jobs in one folder run together only when both
+        have ids and they differ. A link added without its details (no id) runs alone in its folder."""
+        return next(
+            (
+                j
+                for j in self.jobs
+                if j is not job
+                and (j["state"] == "running" or j["id"] in self.procs)  # a cancelled job's worker may still write
+                and j["dest"] == job["dest"]
+                and not (job["entry_id"] and j["entry_id"] and j["entry_id"] != job["entry_id"])
+            ),
+            None,
+        )
+
+    def _rested(self):
+        with self.lock:
+            self.resting = False
+            self._pump()
+
     def _run(self, job):
         """Run a job in the slot _pump reserved for it; the slot is freed only when its worker is gone."""
         try:
-            failure = None
-            for attempt in (1, 2):
+            failure, switched, waited, furthest = None, False, 0, None
+            while True:
                 dest_problem(self._check(job["dest"], but=job))
                 result = self._attempt(job)
-                if result is None or result["event"] == "done":
-                    break
+                if result is None or result["event"] == "done" or self.closed or job["state"] != "running":
+                    break  # done, or cancelled or quit: nothing failed, so there is nothing to check
                 kind = result.get("kind") if result.get("kind") in KINDS else classify(result["message"])
                 try:
                     dest_problem(self._check(job["dest"], but=job))  # a drive unplugged mid-download says so
                 except Problem as p:
                     kind = p.kind
                 failure = self._error(kind, job["engine"], job["dest"])
-                if attempt == 2:
-                    break
-                if kind in ("unsupported", "empty") and self.engines.path(other(job["engine"])):
+                if kind in ("unsupported", "empty") and not switched and self.engines.path(other(job["engine"])):
                     with self.lock:  # the other engine may read what this one can't
-                        job["engine"] = other(job["engine"])
-                elif kind == "blocked" and not job["downloaded"]:
-                    time.sleep(RETRY_AFTER)  # a refusal before any bytes usually passes
-                else:
+                        job["engine"], switched = other(job["engine"]), True
+                    continue
+                # how far across the whole job: a stream already on disk does not count again as this run's part 1
+                reached = (job["progress"] or 0.0, job["downloaded"] or 0)
+                if furthest is not None and reached > furthest:
+                    waited = 0  # this try got further: a line that drops now and then still finishes
+                furthest = max(furthest or reached, reached)
+                if kind not in NOTES or waited == len(self.waits) or not self._wait(job, kind, waited):
                     break
+                waited += 1
         except Problem as p:
             result, failure = {"event": "error"}, {"kind": p.kind, "message": p.message, "hint": p.hint}
         except Exception:  # a spawn or write that fails must not leave the job "starting" and its slot taken
@@ -426,9 +498,31 @@ class Jobs:
                         j["files"] = [f for f in j["files"] if result["path"] not in (f, mp3_of(j, f))]
                 else:
                     job.update(state="failed", error=failure)
-                job.update(stage=None, speed=None, eta=None, finished=time.time())
+                job.update(stage=None, note=None, speed=None, eta=None, finished=time.time())
                 self._changed(job)
+            if sum(j["state"] == "queued" for j in self.jobs) >= self.pace_from:  # a long list: let the site rest
+                self.rest_until = time.monotonic() + self.pace
             self._pump()
+
+    def _wait(self, job, kind, waited):
+        """Hold the job's slot until its next try. False when it was cancelled or Spool quit meanwhile."""
+        end = time.monotonic() + self.waits[waited]
+        with self.lock:
+            if self.closed or job["state"] != "running":
+                return False
+            note = NOTES[kind]
+            job.update(stage="waiting", note=note, attempt=waited + 2, attempts=len(self.waits) + 1, speed=None)
+            job["eta"] = math.ceil(self.waits[waited])
+            self._changed(job)
+            while (left := end - time.monotonic()) > 0:
+                self.wake.wait(min(1.0, left))
+                if self.closed or job["state"] != "running":
+                    return False
+                job["eta"] = max(0, math.ceil(end - time.monotonic()))
+                self.dirty.add(job["id"])
+            job.update(stage="starting", note=None, eta=None)
+            self._changed(job)
+        return True
 
     def _attempt(self, job):
         """One worker run: its last event, or None if the job was cancelled before it could start."""
@@ -443,7 +537,7 @@ class Jobs:
                 log.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} {job['engine']} {job['preset']} {job['url']}\n")
                 log.flush()
                 proc = system.spawn(
-                    [sys.executable, "-I", str(WORKER)],
+                    [sys.executable, "-I", "-X", "utf8", str(WORKER)],  # UTF-8 pipes, whatever the code page
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=log,
@@ -543,15 +637,12 @@ class Jobs:
 
     def _watch(self):
         """Destination and tools have no events, so poll them once a second, apart from progress: a check can hang."""
-        last = None  # checked first when a page opens: a write test is not free
         while not self.closed:
             time.sleep(1)
             if self.closed or not self.subscribers:
                 continue
-            now = self._machine()
-            if now != last:
+            if self._machine() != self.shown:  # against what the pages were last sent, not the last poll
                 self._snapshot_changed()
-            last = now
 
 
 MESSAGES = {  # kind -> (the sentence people read, hint). Every sentence the server sends; none names a program.
@@ -563,6 +654,10 @@ MESSAGES = {  # kind -> (the sentence people read, hint). Every sentence the ser
     "live": ("This is live now. Download it after it ends.", None),
     "playlist": ("This link is a list of videos. Paste it in the link field to choose from it.", None),
     "blocked": ("The site refused the download.", "retry"),  # update_engine when a newer engine exists
+    "limited": (
+        "The site is limiting this connection for now. Wait an hour or so, then try again.",
+        "retry",
+    ),
     "network": ("Spool couldn't reach the site. Check your internet connection.", "retry"),
     "no_ffmpeg": ("This quality needs a free helper to join video and audio.", "install_ffmpeg"),
     "no_js": ("Spool couldn't set up what it needs for YouTube. Check your internet connection.", "retry"),
@@ -581,6 +676,10 @@ MESSAGES = {  # kind -> (the sentence people read, hint). Every sentence the ser
     "engine_not_ready": ("Spool is still setting up. Try again in a few seconds.", None),
     "not_found": ("Spool can't find that download.", None),
     "gone": ("Spool can't find the file. It was moved or deleted.", None),
+}
+NOTES = {  # kind -> what a job waiting to try again says happened. Only these kinds are tried again.
+    "network": "The connection dropped.",
+    "blocked": "The site refused the download.",
 }
 KINDS = ("live", "no_js", "playlist")  # the worker names these itself; its message is then not read
 DEST_KINDS = {
@@ -681,6 +780,9 @@ RUN = {  # a job's fields for one run, as it is before the run starts; Retry set
     "file_exists": False,
     "error": None,
     "finished": None,
+    "note": None,  # waiting: what happened, in NOTES's words
+    "attempt": None,  # waiting: the number of the try that comes next, out of attempts
+    "attempts": None,
 }
 
 
@@ -715,7 +817,9 @@ ERRORS = [  # (kind, lowercase pieces of engine messages); the first match wins.
     ("empty", ("found no video at this link",)),
     ("no_ffmpeg", ("ffmpeg not found", "ffprobe and ffmpeg not found", "ffmpeg is not installed", "ffprobe/avprobe")),
     ("engine", ("requested format is not available",)),  # the video is there; the log says what was asked
-    ("blocked", ("http error 403", "not a bot", "http error 429", "too many requests")),  # the bot check says sign in
+    # before "unavailable": the robot check says "sign in" too. Never tried again by itself: more requests make it worse
+    ("limited", ("not a bot", "http error 429", "too many requests", "available, try again later")),
+    ("blocked", ("http error 403",)),
     (
         "unavailable",
         (
@@ -764,7 +868,7 @@ def classify(message):
     """An engine's message -> an error kind. The engine's own words stay in the job's log.
 
     File names carry the video's title, so an OS error's file names are not read."""
-    low = OS_ERROR.sub(r"\1", message.lower())
+    low = OS_ERROR.sub(r"\1", message.lower().replace("\u2019", "'"))  # a curly apostrophe reads as a straight one
     return next((kind for kind, pieces in ERRORS if any(p in low for p in pieces)), "engine")
 
 
@@ -773,11 +877,16 @@ def mp3_of(job, f):
     return os.path.splitext(f.removesuffix(".part"))[0] + ".mp3" if job["preset"] == "mp3" else None
 
 
+PIECE = re.compile(r"\.part-Frag\d+(\.part)?")  # one of several pieces of a stream fetched at once
+
+
 def remove_leftovers(job, keep):
     """Delete what the engine wrote for this job, except any finished file and what a running job still uses."""
     names = set()
     for f in job["files"]:
         names |= {f, f + ".part", f + ".ytdl"}
+        if f not in keep:  # a running twin's pieces are its own
+            names |= {p for p in glob.glob(glob.escape(f) + ".part-Frag*") if PIECE.fullmatch(p[len(f) :])}
         mp3 = mp3_of(job, f)
         if mp3 and job["state"] != "done" and job["started"]:  # ffmpeg's half-written .mp3 looks finished
             if os.path.exists(mp3) and os.path.getmtime(mp3) >= job["started"]:  # never an earlier run's mp3

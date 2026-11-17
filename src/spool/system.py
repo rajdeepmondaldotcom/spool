@@ -161,6 +161,17 @@ def open_folder(path):
     run(["open" if sys.platform == "darwin" else "explorer" if sys.platform == "win32" else "xdg-open", path])
 
 
+def open_file(path):
+    """Open a file with the system's default program. NotImplementedError when the machine has none."""
+    if sys.platform == "win32":
+        try:
+            os.startfile(path)
+        except OSError:  # no program is set for this type
+            raise NotImplementedError from None
+    else:
+        run(["open" if sys.platform == "darwin" else "xdg-open", path])
+
+
 def run(args):
     try:
         subprocess.run(args, check=False)

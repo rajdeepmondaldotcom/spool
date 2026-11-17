@@ -1,8 +1,10 @@
 """Engines are files Spool manages: fetched from the official release, checksum-verified, versioned, switched last."""
 
+import contextlib
 import functools
 import hashlib
 import io
+import json
 import os
 import platform
 import re
@@ -44,6 +46,38 @@ def final_url(url):
     """Where a redirect ends. The latest version is the tag in the redirect from releases/latest."""
     with urllib.request.urlopen(urllib.request.Request(url, method="HEAD"), timeout=30) as r:
         return r.geturl()
+
+
+SPOOL = "https://github.com/rajdeepmondaldotcom/spool/releases"
+VERSION = re.compile(r"v?(\d+(?:\.\d+){0,3})", re.ASCII)
+DAY = 24 * 60 * 60
+
+
+def newer_spool(folder, running, resolve=final_url, now=time.time):
+    """The latest release's version when it is newer than running, else None, silently on any failure.
+
+    The release page is asked at most once a day; its answer is kept in folder/update.json across restarts."""
+    file = Path(folder) / "update.json"
+    try:
+        saved = json.loads(file.read_text())
+        tag, checked = str(saved["tag"]), float(saved["checked"])
+    except (OSError, ValueError, KeyError, TypeError):
+        tag, checked = None, None
+    if checked is None or not 0 <= now() - checked < DAY:
+        try:
+            tag = resolve(f"{SPOOL}/latest").rstrip("/").rsplit("/", 1)[-1]
+        except Exception:
+            return None
+        with contextlib.suppress(OSError):  # a data folder that refuses writes only means asking again next time
+            write_atomic(file, json.dumps({"tag": tag, "checked": now()}).encode())
+    latest, ours = VERSION.fullmatch(tag), VERSION.fullmatch(running or "")
+    if latest and ours and numbers(latest[1]) > numbers(ours[1]):
+        return latest[1]
+    return None
+
+
+def numbers(version):
+    return tuple(int(n) for n in version.split("."))
 
 
 class Busy(Exception):

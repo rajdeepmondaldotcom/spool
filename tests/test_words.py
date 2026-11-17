@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 
 import spool
-from spool.jobs import MESSAGES
+from spool.jobs import MESSAGES, NOTES
 
 SOURCE = Path(spool.__file__).parent
 NAMES = re.compile(r"yt-dlp|youtube-dl|ffmpeg|ffprobe|deno", re.IGNORECASE)
@@ -35,6 +35,8 @@ def sentences():
                     yield where, "{" + ast.unparse(part.value) + "}"
     for kind, (words, _) in MESSAGES.items():
         yield f"MESSAGES[{kind}]", words
+    for kind, words in NOTES.items():
+        yield f"NOTES[{kind}]", words
 
 
 def test_no_message_or_printed_line_names_a_program():

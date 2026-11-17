@@ -1,12 +1,13 @@
 import http.client
 import json
+import re
 import socket
 import time
 from importlib import metadata
 from pathlib import Path
 
 import pytest
-from support import job_state
+from support import Held, job_state
 
 from spool import server, system
 
@@ -159,7 +160,6 @@ def test_a_job_downloads_with_live_progress_to_the_destination(app):
     events.close()
     states = [d["state"] for e, d in seen if e == "job"]
     assert states[0] == "queued" and "running" in states and states[-1] == "done"
-    assert any(d.get("stage") == "downloading" and d["downloaded"] for e, d in seen if e == "job")
     done = seen[-1][1]
     assert done["path"] == str(app.dest / "Fake video 1 [vid-1].mp4")
     assert done["size"] == 3_400_000
@@ -167,18 +167,40 @@ def test_a_job_downloads_with_live_progress_to_the_destination(app):
     assert Path(done["path"]).exists()
 
 
-def test_job_events_are_throttled_to_four_a_second(app):
+def post(app, url, id="v", preset="best"):
+    status, body = app.json("POST", "/api/jobs", {"entries": [{"url": url, "id": id}], "preset": preset})
+    assert status == 201, body
+    return body["jobs"][0]["id"]
+
+
+def test_progress_reaches_the_page_while_a_download_runs(app, monkeypatch, tmp_path):
+    worker = Held(monkeypatch, tmp_path)
     events = app.events()
     events.next()
-    # 20 progress steps over about one second
-    entry = {"url": "https://fake.test/video?delay=0.05", "id": "vid-1", "title": "Fake video 1"}
-    began = time.monotonic()
-    app.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})
-    seen = events.until(job_state("done"))
-    took = time.monotonic() - began  # about a second here, several on a loaded machine
+    job_id = post(app, "https://fake.test/hold")
+    worker.held()  # mid-download, and it stays there: the page must hear how far it is
+    live = events.until(lambda e, d: e == "job" and d["id"] == job_id and d["downloaded"] == 100)[-1][1]
+    assert (live["state"], live["stage"], live["progress"]) == ("running", "downloading", 100 / 300)
+    worker.go()
+    assert events.until(job_state("done"))[-1][1]["size"] == 300
     events.close()
-    progress = [d for e, d in seen if e == "job" and d["state"] == "running"]
-    assert 2 <= len(progress) <= 4 * took + 4  # four a second, plus the stage changes, which go out at once
+
+
+def test_job_events_are_throttled_to_four_a_second(app, monkeypatch, tmp_path):
+    from spool.jobs import TICK
+
+    worker = Held(monkeypatch, tmp_path)
+    events = app.events()
+    events.next()
+    began = time.monotonic()
+    job_id = post(app, "https://fake.test/hold/burst")  # 201 progress events at once, then it holds
+    seen = events.until(lambda e, d: e == "job" and d["id"] == job_id and d["downloaded"] == 300)
+    took = time.monotonic() - began
+    running = [d for e, d in seen if e == "job" and d["id"] == job_id and d["state"] == "running"]
+    assert len(running) <= took / TICK + 2  # a tick never comes early; plus "starting", which goes out at once
+    worker.go()
+    events.until(job_state("done"))
+    events.close()
 
 
 def test_two_jobs_run_at_once_and_the_third_waits(app):
@@ -187,8 +209,7 @@ def test_two_jobs_run_at_once_and_the_third_waits(app):
     entries = [
         {"url": f"https://fake.test/slow/{n}?delay=0.2", "id": f"slow-{n}", "title": f"Slow {n}"} for n in (1, 2, 3)
     ]
-    app.json("POST", "/api/jobs", {"entries": entries, "preset": "best"})
-    events.until(lambda e, d: e == "job" and d["state"] == "running" and d["stage"] == "downloading")
+    app.json("POST", "/api/jobs", {"entries": entries, "preset": "best"})  # the queue starts what it can at once
     states = {j["title"]: j["state"] for j in app.jobs.snapshot()["jobs"]}
     assert states == {"Slow 1": "running", "Slow 2": "running", "Slow 3": "queued"}
     events.close()
@@ -248,8 +269,7 @@ def test_a_tab_that_closes_mid_request_is_quiet(app, monkeypatch, capfd):
     try:
         app.request("GET", "/api/jobs/x/log")
     except http.client.RemoteDisconnected:
-        pass
-    time.sleep(0.2)
+        pass  # the server had handled the error before it closed the connection
     assert "Traceback" not in capfd.readouterr().err
 
 
@@ -304,3 +324,81 @@ def test_starting_the_server_never_looks_up_this_machines_name(monkeypatch):
         assert httpd.server_address[0] == "127.0.0.1"
     finally:
         httpd.server_close()
+
+
+# Open and quit
+
+
+def test_open_plays_the_finished_file_or_says_why_not(app, monkeypatch, tmp_path):
+    opened = []
+    monkeypatch.setattr(system, "open_file", opened.append)  # never a real player
+    events = app.events()
+    events.next()
+    entry = {"url": "https://fake.test/video?delay=0", "id": "vid-1", "title": "Fake video 1"}
+    [job] = app.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})[1]["jobs"]
+    slow = app.json("POST", "/api/jobs", {"entries": [{"url": "https://fake.test/slow"}], "preset": "best"})[1]
+    done = events.until(lambda e, d: e == "job" and d["id"] == job["id"] and d["state"] == "done")[-1][1]
+    events.close()
+    elsewhere = tmp_path / "not-the-job.mp4"
+    elsewhere.write_bytes(b"x")
+    assert app.request("POST", f"/api/jobs/{job['id']}/open", {"path": str(elsewhere)})[0] == 204
+    assert opened == [done["path"]]  # the job's file, whatever the request says
+    status, body = app.json("POST", f"/api/jobs/{slow['jobs'][0]['id']}/open")
+    assert (status, body["error"]["message"]) == (409, "Only a finished download can be opened.")
+    assert app.json("POST", "/api/jobs/nope/open")[0] == 404
+
+    def none(path):
+        raise NotImplementedError
+
+    monkeypatch.setattr(system, "open_file", none)
+    status, body = app.json("POST", f"/api/jobs/{job['id']}/open")
+    assert (status, body["error"]) == (
+        501,
+        {"kind": "not_supported", "message": "Spool can't open files on this system.", "hint": None},
+    )
+    Path(done["path"]).unlink()
+    status, body = app.json("POST", f"/api/jobs/{job['id']}/open")
+    assert (status, body["error"]["kind"]) == (410, "gone")
+    assert opened == [done["path"]]
+    assert raw(app, "POST", f"/api/jobs/{job['id']}/open", {"Host": host(app), **TOKEN})[0] == 403  # no Origin
+
+
+def test_quit_answers_then_stops_the_server_and_passes_the_access_checks(app):
+    assert raw(app, "POST", "/api/quit", {"Host": host(app), "Origin": f"http://{host(app)}"})[0] == 401
+    assert raw(app, "POST", "/api/quit", {"Host": host(app), "Origin": "http://evil.test", **TOKEN})[0] == 403
+    assert raw(app, "GET", "/api/quit", {"Host": host(app), **TOKEN})[0] == 405
+    assert app.request("GET", "/api/jobs/x/log")[0] == 404  # still serving
+    status, data, _ = app.request("POST", "/api/quit")
+    assert (status, data) == (204, b"")
+    end = time.time() + 5
+    while True:
+        try:
+            conn = http.client.HTTPConnection(*app.httpd.server_address, timeout=1)
+            conn.request("GET", "/api/jobs/x/log", headers={"Host": host(app), **TOKEN})
+            conn.getresponse()
+        except OSError:  # refused, or accepted and never answered
+            break
+        assert time.time() < end, "the server is still answering"
+        time.sleep(0.1)
+
+
+def test_the_snapshot_says_when_a_newer_spool_exists(app):
+    assert app.jobs.snapshot()["update"] is None
+    app.jobs.newer = "0.2.1"
+    assert app.jobs.snapshot()["update"] == {"version": "0.2.1"}
+
+
+def test_every_open_stream_hears_that_spool_stopped_then_ends(app):
+    streams = []
+    for _ in range(2):
+        conn = http.client.HTTPConnection(*app.httpd.server_address, timeout=10)
+        conn.request("GET", "/api/events", headers={"Host": host(app), **TOKEN})
+        reply = conn.getresponse()
+        assert reply.status == 200
+        streams.append(reply)
+    app.engines.on_change()  # a snapshot at the worst moment, as an engine update finishing sends one
+    app.jobs.close()  # what Quit, Ctrl+C and a closed terminal all end in
+    for reply in streams:
+        events = re.findall(rb"event: (\w+)\ndata: (.*)\n\n", reply.read())  # read() returns only once it ends
+        assert events[-1] == (b"stopped", b"{}")  # whatever came before, stopped is last
+        assert [name for name, _ in events].count(b"stopped") == 1

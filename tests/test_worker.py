@@ -14,11 +14,18 @@ WORKER = Path(spool.__file__).with_name("worker.py")
 FAKE = Path(__file__).with_name("fake_engine")
 
 
-def run(mode, url, engine="yt-dlp", **spec):
+IN_PIECES = (
+    "import sys; sys.path.insert(0, sys.argv[1]); import worker; worker.AT_ONCE = int(sys.argv[2]); worker.run()"
+)
+
+
+def run(mode, url, engine="yt-dlp", at_once=None, **spec):
+    """The worker's events; at_once: fetch YouTube streams in that many pieces at once, which Spool ships off."""
     spec = {"engine": engine, "engine_path": str(FAKE), "mode": mode, "url": url, "ffmpeg": True, **spec}
-    out = subprocess.run(
-        [sys.executable, "-I", str(WORKER)], input=json.dumps(spec), capture_output=True, text=True, timeout=30
-    ).stdout
+    cmd = [sys.executable, "-I", str(WORKER)]
+    if at_once:
+        cmd = [sys.executable, "-I", "-c", IN_PIECES, str(WORKER.parent), str(at_once)]
+    out = subprocess.run(cmd, input=json.dumps(spec), capture_output=True, text=True, timeout=30).stdout
     return [json.loads(line) for line in out.splitlines()]
 
 
@@ -406,14 +413,16 @@ def test_a_class_file_is_named_for_the_class_it_got(tmp_path):
 @pytest.mark.parametrize("ffmpeg", [True, False])
 @pytest.mark.parametrize("url", ["https://fake.test/video", "https://fake.test/no-combined", "https://fake.test/audio"])
 def test_every_quality_offered_downloads(tmp_path, url, ffmpeg):
-    _, order = presets(url, ffmpeg=ffmpeg)
-    for preset in order:
+    [entry] = last(run("probe", url, ffmpeg=ffmpeg))["entries"]
+    types = {p["id"]: p["ext"] for p in entry["presets"]}
+    for preset in types:
         if preset == "mp3":
             continue  # its file is whatever the audio part gave
         dest = tmp_path / preset
         dest.mkdir()
         done = last(run("download", url + "?delay=0", dest=str(dest), preset=preset, ffmpeg=ffmpeg))
         assert done["event"] == "done", (preset, done)
+        assert done["path"].endswith("." + types[preset])  # the type the lookup named
 
 
 def test_without_ffmpeg_a_playlist_offers_no_classes():
@@ -479,3 +488,225 @@ def test_the_fake_deletes_a_folder_only_inside_the_tests_own(tmp_path):
     )
     assert out.returncode != 0
     assert (tmp_path / "other").exists()
+
+
+# YouTube in pieces: four connections at once
+
+
+def stream(*sizes):
+    """The bytes of the fake's streams joined in order: each byte is its offset mod 256."""
+    sys.path.insert(0, str(FAKE))
+    from _fake import data
+
+    return b"".join(data(0, n) for n in sizes)
+
+
+TUBE = "https://fake.test/tube"
+TUBE_NAME = "Fake tube video [tube-1]"
+TUBE_BYTES = (25_000_000, 400_000)  # its 720p video, then its m4a audio
+
+
+def pieces_run(*args, **spec):
+    return run(*args, at_once=4, **spec)
+
+
+def test_spool_ships_with_youtube_streams_fetched_whole_as_in_0_1_2(tmp_path):
+    from spool.worker import AT_ONCE
+
+    assert AT_ONCE == 1
+    events = run("download", TUBE, dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert pieces(events) == [] and logged(events, "[fake] tries a piece") == []  # no ranged piece requests
+    assert sorted(p.name for p in tmp_path.iterdir()) == [f"{TUBE_NAME}.mp4"]  # no .ytdl, no piece files
+    assert (tmp_path / f"{TUBE_NAME}.mp4").read_bytes() == stream(*TUBE_BYTES)
+
+
+def pieces(events):
+    return logged(events, "[dashsegments] ")
+
+
+def test_youtube_streams_are_fetched_in_four_pieces_at_once(tmp_path):
+    events = pieces_run("download", TUBE, dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert [line.split("; ")[1] for line in pieces(events)] == ["pieces at once: 4"] * 2  # video, then audio
+    assert (tmp_path / f"{TUBE_NAME}.mp4").read_bytes() == stream(*TUBE_BYTES)
+    named = {os.path.basename(e["path"]) for e in events if e["event"] == "file"}
+    assert not any("-Frag" in n or n.endswith(".ytdl") for n in named)  # names as today; the queue cleans the rest
+
+
+def test_other_sites_are_fetched_as_today(tmp_path):
+    events = run("download", "https://fake.test/video?delay=0", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done" and pieces(events) == []
+    events = run("download", "https://fake.test/hls", dest=str(tmp_path), preset="best")
+    assert logged(events, "[fake] pieces at once: ") == ["[fake] pieces at once: 1"]
+
+
+def test_a_stream_youtube_gives_no_size_for_is_fetched_as_today(tmp_path):
+    events = pieces_run("download", TUBE, dest=str(tmp_path), preset="best", ffmpeg=False)  # the combined stream
+    assert last(events)["event"] == "done", last(events)
+    assert pieces(events) == []
+
+
+def test_progress_in_pieces_counts_the_stream_size_and_never_goes_back(tmp_path):
+    events = pieces_run("download", TUBE, dest=str(tmp_path), preset="best")
+    ticks = [e for e in events if e["event"] == "progress" and e["status"] == "downloading"]
+    values = [e["progress"] for e in ticks]
+    assert values == sorted(values), values
+    video = [e for e in ticks if e["what"] == "video"]
+    assert video and all(e["total"] == 25_000_000 for e in video)  # the stream's size, not the swinging guess
+    assert [e["progress"] for e in video] == [pytest.approx(e["downloaded"] / sum(TUBE_BYTES)) for e in video]
+
+
+def test_a_part_left_by_the_old_way_is_finished_the_old_way_not_joined_wrongly(tmp_path):
+    (tmp_path / f"{TUBE_NAME}.f136.mp4.part").write_bytes(stream(3_000_000))  # no .ytdl beside it
+    events = pieces_run("download", TUBE, dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert (tmp_path / f"{TUBE_NAME}.mp4").read_bytes() == stream(*TUBE_BYTES)
+
+
+def test_a_download_cut_in_pieces_resumes_in_pieces(tmp_path):
+    events = pieces_run("download", TUBE + "?stop=2", dest=str(tmp_path), preset="best")
+    assert "done" not in {e["event"] for e in events}
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert f"{TUBE_NAME}.f136.mp4.ytdl" in left and f"{TUBE_NAME}.f136.mp4.part-Frag2" in left
+    events = pieces_run("download", TUBE, dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert (tmp_path / f"{TUBE_NAME}.mp4").read_bytes() == stream(*TUBE_BYTES)
+
+
+def test_a_refusal_on_pieces_is_fetched_the_old_way_in_the_same_job(tmp_path):
+    events = pieces_run("download", TUBE + "?refuse=pieces", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert (tmp_path / f"{TUBE_NAME}.mp4").read_bytes() == stream(*TUBE_BYTES)
+    values = [e["progress"] for e in events if e["event"] == "progress" and e["progress"] is not None]
+    assert values == sorted(values)
+
+
+def test_a_throttled_piece_reads_the_video_again_and_goes_on_in_pieces(tmp_path):
+    events = pieces_run("download", TUBE + "?throttle=piece", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert logged(events, "[fake] throttled: ") and not logged(events, "[spool] fetching in pieces failed")
+    assert len(pieces(events)) == 3  # the video, again after reading it anew, then the audio
+    assert (tmp_path / f"{TUBE_NAME}.mp4").read_bytes() == stream(*TUBE_BYTES)
+
+
+def test_a_part_the_old_way_went_on_with_is_never_resumed_in_pieces(tmp_path):
+    pieces_run("download", TUBE + "?stop=2", dest=str(tmp_path), preset="best")  # one piece and its .ytdl
+    pieces_run("download", TUBE + "?refuse=pieces&cut=old", dest=str(tmp_path), preset="best")  # the old way, cut
+    events = pieces_run("download", TUBE, dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert (tmp_path / f"{TUBE_NAME}.mp4").read_bytes() == stream(*TUBE_BYTES)
+
+
+# The file type of each quality
+
+
+@pytest.mark.parametrize(
+    "url, types",
+    [
+        ("video", {"best": "mp4", "720": "mp4", "480": "mp4", "360": "mp4", "audio": "m4a", "mp3": "mp3"}),
+        ("vp9-top", {"best": "mkv", "720": "mp4", "480": "mp4", "360": "mp4", "audio": "m4a", "mp3": "mp3"}),
+    ],
+)
+def test_each_quality_names_the_type_of_file_it_saves(url, types):
+    [entry] = last(run("probe", f"https://fake.test/{url}"))["entries"]
+    assert {p["id"]: p["ext"] for p in entry["presets"]} == types
+
+
+def test_a_flat_list_does_not_know_its_file_types():
+    entry = last(run("probe", "https://fake.test/playlist"))["entries"][0]
+    assert {p["ext"] for p in entry["presets"]} == {None}
+
+
+# Channel links
+
+
+def test_a_channel_link_lists_its_uploaded_videos_newest_first():
+    for url in ("https://www.youtube.com/@FakeChannel", "https://www.youtube.com/channel/UCfake/"):
+        info = last(run("probe", url))
+        assert (info["event"], info["kind"], info["title"]) == ("info", "playlist", "Fake Channel"), info
+        assert len(info["entries"]) == 100 and info["truncated"] is True
+        first = info["entries"][0]
+        assert (first["id"], first["url"], first["item"]) == (
+            "videos-150",
+            "https://www.youtube.com/watch?v=videos-150",
+            None,
+        )
+
+
+def test_a_channel_link_that_names_a_tab_lists_that_tab():
+    info = last(run("probe", "https://www.youtube.com/@FakeChannel/shorts"))
+    assert [e["id"] for e in info["entries"]] == ["shorts-3", "shorts-2", "shorts-1"]
+    assert (info["title"], info["truncated"]) == ("Fake Channel", False)
+
+
+def test_an_ordinary_playlist_is_listed_whole():
+    info = last(run("probe", "https://fake.test/playlist"))
+    assert (len(info["entries"]), info["truncated"]) == (3, False)
+
+
+# What a reviewer found in pieces mode (each proved against the real engine with a local stand-in for the site)
+
+
+def throttled(events):
+    return logged(events, "[fake] throttled: ")
+
+
+def test_a_slow_line_reads_the_video_again_at_most_once(tmp_path):
+    events = pieces_run("download", TUBE + "?throttle=line", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert len(throttled(events)) <= 1  # each read is a page request to a site that may be limiting this line
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_a_stream_fetched_whole_has_no_floor_as_in_0_1_2(tmp_path, stale):
+    if stale:  # the video goes whole, the audio in pieces
+        (tmp_path / f"{TUBE_NAME}.f136.mp4.part").write_bytes(stream(3_000_000))
+    events = pieces_run("download", TUBE, dest=str(tmp_path), preset="best", ffmpeg=stale)
+    assert last(events)["event"] == "done", last(events)
+    assert logged(events, "[fake] a stream fetched whole with a floor") == []
+
+
+@pytest.mark.parametrize(
+    "fault, real",
+    [
+        ("ignore=range", TUBE_BYTES),  # the host sends the whole stream for each piece: three times too big
+        ("size=small", TUBE_BYTES),  # the site says 5 MB less than it sends: the end would be cut off
+    ],
+)
+def test_a_stream_of_the_wrong_size_is_fetched_again_whole(tmp_path, fault, real):
+    events = pieces_run("download", f"{TUBE}?{fault}", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert (tmp_path / f"{TUBE_NAME}.mp4").read_bytes() == stream(*real)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [f"{TUBE_NAME}.mp4"]
+
+
+def test_a_kill_between_a_piece_and_its_count_does_not_add_the_piece_twice(tmp_path):
+    pieces_run("download", TUBE + "?stop=2&between=1", dest=str(tmp_path), preset="best")
+    events = pieces_run("download", TUBE, dest=str(tmp_path), preset="best")  # the resume adds piece 2 again
+    assert last(events)["event"] == "done", last(events)
+    assert (tmp_path / f"{TUBE_NAME}.mp4").read_bytes() == stream(*TUBE_BYTES)
+
+
+@pytest.mark.parametrize("fault", ["refuse=limit", "fail=merge"])  # the site's limit; a join that fails
+def test_only_a_failure_to_fetch_pieces_goes_on_the_old_way(tmp_path, fault):
+    events = pieces_run("download", f"{TUBE}?{fault}", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "error"
+    assert logged(events, "[spool] fetching in pieces failed") == []
+
+
+def test_a_piece_is_tried_again_twice_with_a_pause(tmp_path):
+    events = pieces_run("download", TUBE, dest=str(tmp_path), preset="best")
+    assert set(logged(events, "[fake] tries a piece ")) == {"[fake] tries a piece 2 more times, pausing [1, 2]"}
+
+
+def test_no_piece_file_remains_after_going_on_the_old_way(tmp_path):
+    events = pieces_run("download", TUBE + "?refuse=pieces", dest=str(tmp_path), preset="best")
+    assert last(events)["event"] == "done", last(events)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [f"{TUBE_NAME}.mp4"]  # no .part-Frag3 beside it
+
+
+def test_a_lookup_makes_one_engine_object():
+    events = run("probe", TUBE)
+    assert last(events)["event"] == "info"
+    assert len(logged(events, "[fake] a new engine object")) == 1

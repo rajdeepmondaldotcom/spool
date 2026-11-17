@@ -2,6 +2,7 @@
 
 import http.client
 import json
+import os
 import queue
 import socket
 import threading
@@ -78,3 +79,105 @@ class Events:
 
 def job_state(state):
     return lambda event, data: event == "job" and data["state"] == state
+
+
+# A worker that a test holds in place, so a moment in a download is there to be seen however fast or slow the
+# machine is. Its link says what it does: https://fake.test/<words>?name=<file name>, where the words may hold
+#   hold   wait after the first 100 bytes until the test calls go()
+#   child  start a helper process first, as an engine starts ffmpeg (a cancel must stop it too)
+#   burst  send 200 progress events at once before holding
+#   mp3    also write a half-made .mp3 beside the stream, as ffmpeg does
+# Without hold it writes 300 bytes and finishes. A .part already there is continued, and the log says so.
+HELD = r"""
+import json, os, pathlib, subprocess, sys, time
+from urllib.parse import parse_qs, urlsplit
+spec = json.loads(sys.stdin.read())
+here = pathlib.Path(sys.argv[0]).parent
+url = urlsplit(spec["url"])
+words = url.path
+title = parse_qs(url.query).get("name", ["Same video"])[0]
+ext = "webm" if "mp3" in words else "mp4"
+name = os.path.join(spec["dest"], f"{title} [v].{ext}")
+def say(**event):
+    print(json.dumps(event), flush=True)
+def progress(done):
+    say(event="progress", status="downloading", part=1, downloaded=done, total=300, speed=None, eta=None,
+        progress=done / 300, what="video")
+def write(n):
+    with open(name + ".part", "ab") as f:
+        f.write(b"x" * n)
+    return os.path.getsize(name + ".part")
+if "child" in words:
+    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+say(event="file", path=name)
+if os.path.exists(name + ".part"):
+    say(event="log", line=f"[download] Resuming download at byte {os.path.getsize(name + '.part')}")
+progress(write(100))
+if "mp3" in words:
+    pathlib.Path(name[: -len(ext)] + "mp3").write_bytes(b"half")
+if "burst" in words:
+    for n in range(1, 201):
+        progress(100 + n)
+    say(event="log", line="[spool] burst sent")
+if "hold" in words:
+    (here / f"held-{title}").touch()
+    end = time.time() + 60
+    while not (here / "go").exists() and time.time() < end:
+        time.sleep(0.02)
+try:
+    progress(write(100))
+    progress(write(100))
+except OSError as exc:
+    say(event="error", message=f"ERROR: unable to write data: {exc}")
+    sys.exit()
+os.replace(name + ".part", name)
+say(event="done", path=name, size=os.path.getsize(name))
+"""
+
+
+class Held:
+    """The held worker in place of Spool's, for a test. held(title) waits until that file's job is held."""
+
+    def __init__(self, monkeypatch, folder):
+        import spool.jobs
+
+        self.dir = folder / "held-worker"
+        self.dir.mkdir(parents=True)
+        (self.dir / "worker.py").write_text(HELD, encoding="utf-8")
+        monkeypatch.setattr(spool.jobs, "WORKER", self.dir / "worker.py")
+
+    def held(self, title="Same video", timeout=20):
+        until(lambda: (self.dir / f"held-{title}").exists(), timeout)
+
+    def go(self):
+        (self.dir / "go").touch()
+
+
+def until(test, timeout=20):
+    """Wait for something that will happen; the timeout only stops a broken test from hanging."""
+    end = time.time() + timeout
+    while not test():
+        assert time.time() < end, "it never happened"
+        time.sleep(0.02)
+
+
+class WriteTests:
+    """Spool's folder write tests, made visible: once armed, each leaves its file in the folder (as macOS shows the
+    real one for an instant), so a test that lists a folder while Spool checks it sees the file every time."""
+
+    def __init__(self, monkeypatch):
+        from spool import system
+
+        self.armed, self.left, real = False, [], system.probe_dest
+
+        def probe_dest(path):
+            if self.armed:
+                left = os.path.join(path, f".spool-write-test-held-{len(self.left)}")
+                open(left, "w").close()
+                self.left.append(left)
+            return real(path)
+
+        monkeypatch.setattr(system, "probe_dest", probe_dest)
+
+    def arm(self):
+        self.armed = True

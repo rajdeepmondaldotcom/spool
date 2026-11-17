@@ -5,7 +5,7 @@ import time
 
 import pytest
 from serve_fake import FakeGitHub
-from support import job_state
+from support import Held, job_state, until
 
 from spool import system
 
@@ -31,10 +31,25 @@ def finished(events, job_id):
 # One percentage
 
 
-def test_progress_is_one_rising_number_across_video_and_audio(app, events):
-    job = add(app, "https://fake.test/video?delay=0.08")["jobs"][0]  # each part spans several 0.25 s ticks
+def every_progress(app, monkeypatch):
+    """The job as it stands after each progress event a worker sends: none is lost to the four-a-second throttle,
+    however fast or slow the machine is."""
+    seen, progress = [], app.jobs._progress
+
+    def record(job, event):
+        progress(job, event)
+        with app.jobs.lock:
+            seen.append(dict(job))
+
+    monkeypatch.setattr(app.jobs, "_progress", record)
+    return seen
+
+
+def test_progress_is_one_rising_number_across_video_and_audio(app, events, monkeypatch):
+    every = every_progress(app, monkeypatch)
+    job = add(app, "https://fake.test/video?delay=0")["jobs"][0]
     seen = finished(events, job["id"])
-    running = [d for e, d in seen if e == "job" and d["id"] == job["id"] and d["progress"] is not None]
+    running = [d for d in every if d["id"] == job["id"] and d["progress"] is not None] + [seen[-1][1]]
     progress = [d["progress"] for d in running]
     assert progress == sorted(progress) and progress[-1] == 1.0
     assert seen[-1][1]["state"] == "done"
@@ -44,10 +59,11 @@ def test_progress_is_one_rising_number_across_video_and_audio(app, events):
     assert by_what["video"] < 0.9  # the 3 MB video is most of the 3.4 MB job, but not all of it
 
 
-def test_an_audio_job_says_audio(app, events):
-    job = add(app, "https://fake.test/audio?delay=0.05", "audio")["jobs"][0]
-    seen = finished(events, job["id"])
-    assert {d["what"] for e, d in seen if e == "job" and d["stage"] == "downloading"} == {"audio"}
+def test_an_audio_job_says_audio(app, events, monkeypatch):
+    every = every_progress(app, monkeypatch)
+    job = add(app, "https://fake.test/audio?delay=0", "audio")["jobs"][0]
+    finished(events, job["id"])
+    assert {d["what"] for d in every if d["stage"] == "downloading"} == {"audio"}
 
 
 def test_youtube_dl_progress_rises_too(app, events):
@@ -58,11 +74,14 @@ def test_youtube_dl_progress_rises_too(app, events):
     assert progress == sorted(progress) and progress[-1] == 1.0
 
 
-def test_the_join_says_how_far_it_is(app, events):
-    job = add(app, "https://fake.test/video?delay=0.02&join=0.15")["jobs"][0]
+def test_the_join_says_how_far_it_is(app, events, monkeypatch):
+    every = every_progress(app, monkeypatch)
+    job = add(app, "https://fake.test/video?delay=0&join=0.15")["jobs"][
+        0
+    ]  # the join takes 1.5 s at least: the worker reports it once a second
     seen = finished(events, job["id"])
     assert seen[-1][1]["state"] == "done"
-    mine = [d for e, d in seen if e == "job" and d["id"] == job["id"]]
+    mine = [d for d in every if d["id"] == job["id"]] + [seen[-1][1]]
     join = [d for d in mine if d["stage"] == "processing" and d["what"] == "join"]
     assert len(join) >= 2, [(d["stage"], d["what"]) for d in mine]
     assert {d["total"] for d in join} == {3_400_000}
@@ -114,10 +133,7 @@ def github():  # a newer engine is published but fails its checksum, so it is ne
     return FakeGitHub(corrupt=True)
 
 
-def test_a_refusal_offers_the_update_when_a_newer_engine_exists(app, events, monkeypatch):
-    import spool.jobs
-
-    monkeypatch.setattr(spool.jobs, "RETRY_AFTER", 0)
+def test_a_refusal_offers_the_update_when_a_newer_engine_exists(app, events):
     end = time.time() + 10
     while app.engines.status()["yt-dlp"]["busy"]:
         assert time.time() < end
@@ -187,15 +203,13 @@ def test_a_folder_problem_carries_its_sentence(app, tmp_path):
     assert snap["dest"]["message"] == body["dest"]["message"]
 
 
-def test_the_interrupted_job_can_resume(tmp_path):
+def test_the_interrupted_job_can_resume(tmp_path, monkeypatch):
     from serve_fake import start
 
+    worker = Held(monkeypatch, tmp_path)
     httpd, _, jobs, _ = start(tmp_path)
-    job = jobs.add([{"url": "https://fake.test/slow?delay=0.1"}], "best")[0][0]
-    end = time.time() + 10
-    while not jobs.snapshot()["jobs"][0]["downloaded"]:
-        assert time.time() < end
-        time.sleep(0.05)
+    job = jobs.add([{"url": "https://fake.test/hold", "id": "v"}], "best")[0][0]
+    worker.held()  # caught mid-download by the quit
     httpd.shutdown()
     jobs.close()
     httpd, _, jobs, _ = start(tmp_path)
@@ -205,12 +219,10 @@ def test_the_interrupted_job_can_resume(tmp_path):
             "message": "Spool was closed before this download finished.",
             "hint": "resume",
         }
+        worker.go()
         jobs.retry(job["id"])
-        end = time.time() + 15
-        while jobs.snapshot()["jobs"][0]["state"] != "done":
-            assert time.time() < end
-            time.sleep(0.05)
-        assert "Resuming download at byte" in jobs.log(job["id"])
+        until(lambda: jobs.snapshot()["jobs"][0]["state"] == "done")
+        assert "Resuming download at byte 100" in jobs.log(job["id"])
     finally:
         httpd.shutdown()
         jobs.close()
@@ -219,3 +231,30 @@ def test_the_interrupted_job_can_resume(tmp_path):
 def test_a_finished_job_reports_done_with_full_progress(app, events):
     done = events.until(job_state("done")) if add(app, "https://fake.test/audio?delay=0", "audio") else None
     assert done[-1][1]["progress"] == 1.0
+
+
+# What the worker adds rides through unchanged
+
+
+def test_a_presets_file_type_and_a_lists_truncated_reach_the_page(app, monkeypatch, tmp_path):
+    import json
+
+    import spool.jobs
+
+    preset = {"id": "best", "label": "Best", "detail": "1080p", "size": 3_400_000, "ext": "mkv"}
+    entry = {"url": "https://fake.test/v/1", "id": "v1", "title": "One", "presets": [preset]}
+    info = {"event": "info", "kind": "playlist", "title": "A channel", "entries": [entry], "truncated": True}
+    worker = tmp_path / "worker.py"
+    worker.write_text(f"import sys\nsys.stdin.read()\nprint({json.dumps(json.dumps(info))})\n")
+    monkeypatch.setattr(spool.jobs, "WORKER", worker)
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/channel"})
+    assert status == 200
+    assert (body["kind"], body["title"], body["truncated"]) == ("playlist", "A channel", True)
+    assert body["entries"] == [entry]
+    info["truncated"] = False
+    worker.write_text(f"import sys\nsys.stdin.read()\nprint({json.dumps(json.dumps(info))})\n")
+    assert app.json("POST", "/api/probe", {"url": "https://fake.test/channel"})[1]["truncated"] is False
+
+
+def test_a_probe_from_a_worker_that_says_nothing_of_truncation_is_not_truncated(app):
+    assert app.json("POST", "/api/probe", {"url": "https://fake.test/video"})[1]["truncated"] is False

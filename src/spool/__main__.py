@@ -8,12 +8,13 @@ import secrets
 import signal
 import sys
 import threading
+import time
 import webbrowser
 from urllib.parse import quote
 
 from . import server, system
-from .engines import Engines, JsRuntime, write_atomic
-from .jobs import Jobs
+from .engines import Engines, JsRuntime, newer_spool, write_atomic
+from .jobs import VERSION, Jobs
 
 PORT = 7766  # fixed by default, so a tab or bookmark survives a restart
 
@@ -60,6 +61,7 @@ def main(argv=None):
         threading.Thread(
             target=js.start, daemon=True
         ).start()  # it asks other programs their version: never wait on them
+        threading.Thread(target=releases, args=(jobs, data), daemon=True).start()
         print(f"Spool is running at {url}", flush=True)
         print("Press Ctrl+C to stop it.", flush=True)
         if not args.no_open:
@@ -76,6 +78,16 @@ def main(argv=None):
         httpd.server_close()
         jobs.close()  # kills every worker's process group; their jobs read as interrupted next time
         lock.unlink(missing_ok=True)
+
+
+def releases(jobs, data):
+    """Whether a newer Spool is out: looked at now and hourly; the release page itself is asked once a day at most."""
+    while not jobs.closed:
+        newer = newer_spool(data, VERSION)
+        if newer != jobs.newer:
+            jobs.newer = newer
+            jobs._snapshot_changed()
+        time.sleep(60 * 60)
 
 
 def carrying(links):

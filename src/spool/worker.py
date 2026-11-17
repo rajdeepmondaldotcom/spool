@@ -3,12 +3,14 @@
 Spec on stdin: {engine, engine_path, mode: "probe" | "download", url, ffmpeg, js_runtime?, dest?, preset?, item?}.
 Events: {"event": "log" | "progress" | "meta" | "file" | "info" | "done" | "error", ...}; an error carries "kind"
 ("live", "no_js" or "playlist") when the worker knows it. A progress event's status is the engine's ("downloading",
-"finished"), or "processing" for how far a join, tags or MP3 step has written its file.
+"finished"), or "processing" for how far a join, tags or MP3 step has written its file. An info event of a list
+carries "truncated": a channel has more videos than it lists. Each preset carries "ext", the type of file it saves.
 Standard library only; run with python -I.
 """
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -89,7 +91,20 @@ MP3_RATE = 128_000 // 8  # bytes a second: the engines' default MP3 quality aver
 
 
 def preset(pid, size=None, detail=None):
-    return {"id": pid, "label": LABELS.get(pid, f"{pid}p"), "detail": detail, "size": size}
+    return {"id": pid, "label": LABELS.get(pid, f"{pid}p"), "detail": detail, "size": size, "ext": None}
+
+
+def file_type(streams, compatible):
+    """The type of file a preset's streams save: one stream keeps its own; two are joined into the container the
+    engine picks for them (yt-dlp's get_compatible_ext, as its join calls it). None when unknown."""
+    if None in streams or (len(streams) > 1 and not compatible):
+        return None  # shortcut: youtube-dl has no such rule to ask; upgrade if it matters there
+    if len(streams) == 1:
+        return streams[0].get("ext")
+    video, audio = streams
+    return compatible(
+        vcodecs=[video.get("vcodec")], acodecs=[audio.get("acodec")], vexts=[video["ext"]], aexts=[audio["ext"]]
+    )
 
 
 def short(f):
@@ -156,16 +171,21 @@ def ranking(n):
     return key
 
 
+def picked(formats, preset, ffmpeg):
+    """The streams a preset downloads, by the rule yt-dlp uses; (None,) if none fit."""
+    if preset in AUDIO:
+        audio = [f for f in formats if has(f, "acodec") and not has(f, "vcodec")]
+        both = [f for f in formats if has(f, "acodec") and has(f, "vcodec")]
+        m4a = [f for f in audio if f.get("ext") == "m4a"]
+        return (max(m4a or audio or both, key=lambda f: f.get("abr") or f.get("tbr") or 0, default=None),)
+    return chosen(formats, None if preset == "best" else int(preset), ffmpeg)
+
+
 def estimate(formats, preset, ffmpeg, duration):
     """Estimated bytes for a preset, choosing streams by the rule yt-dlp uses. None when unknown."""
-    audio = [f for f in formats if has(f, "acodec") and not has(f, "vcodec")]
-    both = [f for f in formats if has(f, "acodec") and has(f, "vcodec")]
     if preset == "mp3":
         return int(duration * MP3_RATE) if duration else None
-    if preset == "audio":
-        m4a = [f for f in audio if f.get("ext") == "m4a"]
-        return size(duration, max(m4a or audio or both, key=lambda f: f.get("abr") or f.get("tbr") or 0, default=None))
-    return size(duration, *chosen(formats, None if preset == "best" else int(preset), ffmpeg))
+    return size(duration, *picked(formats, preset, ffmpeg))
 
 
 def chosen(formats, n, ffmpeg):
@@ -181,7 +201,7 @@ def chosen(formats, n, ffmpeg):
     return (max(both or (formats if whole else []), key=key, default=None),)
 
 
-def entry(info, ffmpeg):
+def entry(info, ffmpeg, compatible=None):
     if info.get("_type") in ("url", "url_transparent"):  # without ffmpeg a class is whatever one stream a site has
         presets = [preset(p) for p in (FLAT_PRESETS if ffmpeg else ("best", "audio"))]
     else:
@@ -193,6 +213,8 @@ def entry(info, ffmpeg):
         heights = [str(h) for h in HEIGHTS if h in classes and h != best]
         ids = ["best"] * bool(top) + heights + ["audio"] + ["mp3"] * bool(ffmpeg)  # no Best when nothing fits
         presets = [preset(p, estimate(formats, p, ffmpeg, info.get("duration"))) for p in ids]
+        for p in presets:  # the MP3 step decides its type, whatever stream it starts from
+            p["ext"] = "mp3" if p["id"] == "mp3" else file_type(picked(formats, p["id"], ffmpeg), compatible)
         if top:
             presets[0]["detail"] = best and f"{best}p"
     if ffmpeg and presets[-1]["id"] != "mp3":
@@ -228,7 +250,7 @@ def where(d, n, spec, plan=()):
         parts = [{}] * (1 if spec["preset"] in AUDIO or not spec["ffmpeg"] else 2)
         i = min(max(n, 1), len(parts)) - 1
         what = "audio" if spec["preset"] in AUDIO or i == 1 else "video"
-    done, total = d.get("downloaded_bytes"), d.get("total_bytes") or d.get("total_bytes_estimate")
+    done, total = d.get("downloaded_bytes"), total_of(d)
     frac = 1.0 if d.get("status") == "finished" else min(1.0, done / total) if done is not None and total else None
     sizes = [bytes_of(f, (info or {}).get("duration")) for f in parts]
     if frac is None:
@@ -236,6 +258,47 @@ def where(d, n, spec, plan=()):
     if all(sizes):
         return (sum(sizes[:i]) + frac * sizes[i]) / sum(sizes), what
     return (i + frac) / len(parts), what
+
+
+def total_of(d):
+    """A progress hook's total bytes. In pieces the engine gives none until the end and its guess swings, so the
+    stream's own size comes first."""
+    return d.get("total_bytes") or (d.get("info_dict") or {}).get("filesize") or d.get("total_bytes_estimate")
+
+
+# shortcut: YouTube streams come whole, one connection, as in 0.1.2. In pieces (AT_ONCE > 1, 4 measured best on a
+# home line) a 239 MB film came at 9.7 MB/s against 7.9 whole in one run; but one run stalled six minutes on one piece
+# and one got a 403 on the data, while one connection fetched 35 GB and 3.4 GB without a failure. Raise it only after
+# many clean real-site runs in pieces, with no stall, no refusal, and a measured gain. Tests set it where they need it.
+AT_ONCE = 1
+THROTTLED = 20_000  # bytes a second: a piece slower for 3 seconds makes the engine read the video again and go on
+# with fresh links. Pieces join in order, so one throttled piece (seen: 1 KB/s for minutes) holds up the rest. Only on
+# the first read: the engine's re-reads have no limit, and on a slow line every piece is below it
+PIECE = 10 << 20  # bytes a piece: the size yt-dlp's own pieces mode (formats=dashy) asks YouTube for
+PIECE_TRIES = 2  # tries again for a piece, after 1 s then 2 s; then the stream comes whole, and a site that limits
+# is not sent four connections' worth of quick tries
+NOT_PIECES = ("http error 429", "too many requests", "not a bot", "no space left", "errno 28")  # pieces would not help
+
+
+class Wrong(Exception):
+    """A stream fetched in pieces is not the size the site gave."""
+
+
+def in_pieces(f):
+    """Fetch a YouTube stream as byte ranges, several at once, as the engine's DASH downloader does. Each piece asks
+    for its full width: a stream longer than the site said then comes out too big, and Wrong catches it."""
+    url = f["url"] + ("&" if "?" in f["url"] else "?")
+    f["fragments"] = [{"url": f"{url}range={a}-{a + PIECE - 1}"} for a in range(0, f["filesize"], PIECE)]
+    f["protocol"] = "http_dash_segments"
+    f.pop("downloader_options", None)  # its whole-file chunking
+
+
+def dropped(name):
+    """Remove a stream fetched in pieces from the destination: its file, .part, .ytdl and pieces, so it comes whole."""
+    folder, base = os.path.split(name)
+    for n in os.listdir(folder or "."):
+        if n in (base, base + ".part", base + ".ytdl") or n.startswith(base + ".part-Frag"):
+            os.remove(os.path.join(folder, n))
 
 
 STEPS = {"Merger": "join", "Metadata": "tags", "ExtractAudio": "mp3"}  # yt-dlp's steps that write a whole file
@@ -283,12 +346,25 @@ def watch(what, out, total, part, stop):
             return
 
 
-def probe(engine, params, spec):
+CHANNEL = re.compile(  # a YouTube channel's home, or one of its tabs of videos
+    r"(?P<home>https?://(?:www\.|m\.)?youtube\.com/(?:@[^/?#]+|(?:channel|c|user)/[^/?#]+))"
+    r"(?:/(?P<tab>videos|shorts|streams))?/?(?:[?#].*)?"
+)
+LISTED = 100  # a channel lists its newest videos, at most this many
+
+
+def probe(engine, module, params, spec):
+    url, channel = spec["url"], CHANNEL.fullmatch(spec["url"])
+    if channel:  # its home lists its tabs; its uploads are the Videos tab
+        url = f"{channel['home']}/{channel['tab'] or 'videos'}"
+        params["playlistend"] = LISTED + 1  # one more tells that there are more; the engine reads no further
     params.update(extract_flat="in_playlist", skip_download=True)
     with engine.YoutubeDL(params) as ydl:
-        info = ydl.extract_info(spec["url"], download=False)
+        info = ydl.extract_info(url, download=False)
     if info.get("_type") == "playlist":
-        found = [(n, entry(e, spec["ffmpeg"])) for n, e in enumerate(info.get("entries") or [], 1) if e]
+        listed = list(info.get("entries") or [])
+        truncated = bool(channel) and len(listed) > LISTED
+        found = [(n, entry(e, spec["ffmpeg"])) for n, e in enumerate(listed[:LISTED] if channel else listed, 1) if e]
         urls = [e["url"] for _, e in found]
         for n, e in found:  # no link of its own: download it as item n of the probed link
             if (
@@ -297,9 +373,17 @@ def probe(engine, params, spec):
                 or e["url"] == spec["url"]
             ):
                 e.update(url=spec["url"], item=n)
-        emit(event="info", kind="playlist", title=info.get("title"), entries=[e for _, e in found])
+        title = (info.get("channel") or info.get("uploader")) if channel else None
+        emit(
+            event="info",
+            kind="playlist",
+            title=title or info.get("title"),
+            entries=[e for _, e in found],
+            truncated=truncated,
+        )
     else:
-        emit(event="info", kind="video", title=info.get("title"), entries=[entry(info, spec["ffmpeg"])])
+        compatible = getattr(import_module(module + ".utils"), "get_compatible_ext", None)
+        emit(event="info", kind="video", title=info.get("title"), entries=[entry(info, spec["ffmpeg"], compatible)])
 
 
 def download(engine, module, params, spec):
@@ -322,6 +406,10 @@ def download(engine, module, params, spec):
 
     plan = []
     seen = set()
+    pieces = [module == "yt_dlp"]  # off once pieces failed: then the job goes on the old way, one connection
+    used = {}  # this run's streams in pieces: format_id -> the file it is fetched to
+    finished = set()  # this run's streams finished, by format_id
+    reads = [0]  # times this job read the video in pieces mode
 
     def wrote(name):
         if name not in seen:
@@ -343,6 +431,27 @@ def download(engine, module, params, spec):
             base, ext = os.path.splitext(ydl.prepare_filename(information))
             for e in {ext, ".mp3" if spec["preset"] == "mp3" else ext}:  # the merge and the metadata step write here
                 wrote(base + ".temp" + e)
+            split = information.get("requested_formats")  # the engine's names for each stream's file
+            fast = AT_ONCE > 1 and pieces[0] and information.get("extractor_key") == "Youtube"
+            reads[0] += fast
+            used.clear()
+            finished.clear()
+            for f in plan:
+                name = f"{base}.f{f['format_id']}.{f['ext']}" if split else base + ext
+                fresh = not os.path.exists(name + ".part") or os.path.exists(name + ".ytdl")
+                if fast and f.get("protocol") == "https" and f.get("filesize") and fresh:
+                    in_pieces(f)  # a .part the old way left goes on the old way: in pieces it is appended from 0
+                    used[f["format_id"]] = here(name)
+                elif f.get("protocol") == "https" and os.path.exists(name + ".ytdl"):
+                    os.remove(name + ".ytdl")  # once the old way adds to a .part, pieces must never resume it
+            ydl.params.update(  # the old way's values otherwise, as in 0.1.2
+                concurrent_fragment_downloads=AT_ONCE if used else 1,
+                skip_unavailable_fragments=not used,  # a piece skipped is a hole in the file
+                # a stream fetched whole has no floor, as in 0.1.2: it applies to every download of the run
+                throttledratelimit=THROTTLED if reads[0] == 1 and len(used) == len(plan) else None,
+                fragment_retries=PIECE_TRIES if used else 10,
+                retry_sleep_functions={"fragment": lambda n: 2**n} if used else {},
+            )
             return [], information
 
     joined = []  # the join takes chapters and details from the audio part: no second pass over the joined file
@@ -377,7 +486,7 @@ def download(engine, module, params, spec):
         def run(self, information):
             return ([], information) if joined else tags(information)
 
-    part = {"n": 0, "last": None}
+    part = {"n": 0, "last": None, "top": None}
     stepping = [threading.Event()]
 
     def step(d):
@@ -404,6 +513,8 @@ def download(engine, module, params, spec):
             part["n"] += 1
         part["last"] = d.get("status")
         progress, what = where(d, part["n"], spec, plan)
+        if progress is not None:  # never backwards: pieces finish out of order, and the old way may take over
+            part["top"] = progress = max(progress, part["top"] or 0)
         emit(
             event="progress",
             status=d.get("status"),
@@ -411,10 +522,17 @@ def download(engine, module, params, spec):
             progress=progress,
             what=what,
             downloaded=d.get("downloaded_bytes"),
-            total=d.get("total_bytes") or d.get("total_bytes_estimate"),
+            total=total_of(d),
             speed=d.get("speed"),
             eta=d.get("eta"),
         )
+        fid = (d.get("info_dict") or {}).get("format_id")
+        if d.get("status") == "finished" and fid in used:
+            finished.add(fid)
+            if os.path.getsize(d["filename"]) != d["info_dict"]["filesize"]:  # a piece came twice, or too much
+                raise Wrong(
+                    f"{d['filename']} is {os.path.getsize(d['filename'])} bytes, not {d['info_dict']['filesize']}"
+                )
         if module == "yt_dlp" and spec["ffmpeg"] and d.get("status") == "finished" and d.get("info_dict"):
             tag_audio(d)
 
@@ -464,17 +582,34 @@ def download(engine, module, params, spec):
             ydl.add_post_processor(Capture(), when="after_move")
         else:
             ydl.add_post_processor(Capture())
+
+        def fetch():
+            try:
+                ydl.download([spec["url"]])
+            except Exception as exc:
+                if not (joined and merging):
+                    raise
+                # the parts stay on disk, so the engine finds them and only joins again
+                emit(
+                    event="log", line=f"[spool] the join with the details failed, so Spool joined the plain way: {exc}"
+                )
+                ydl.params["postprocessor_args"].pop("merger+ffmpeg_o")
+                joined.clear()
+                plain.append(True)
+                ydl.download([spec["url"]])
+
         try:
-            ydl.download([spec["url"]])
+            fetch()
         except Exception as exc:
-            if not (joined and merging):
-                raise
-            # the parts stay on disk, so the engine finds them and only joins again
-            emit(event="log", line=f"[spool] the join with the details failed, so Spool joined the plain way: {exc}")
-            ydl.params["postprocessor_args"].pop("merger+ffmpeg_o")
-            joined.clear()
-            plain.append(True)
-            ydl.download([spec["url"]])
+            now = next((f["format_id"] for f in plan if f["format_id"] not in finished), None)
+            if not (isinstance(exc, Wrong) or now in used) or any(w in str(exc).lower() for w in NOT_PIECES):
+                raise  # only a failure to fetch pieces goes on the old way
+            emit(event="log", line=f"[spool] fetching in pieces failed, so Spool fetches it whole: {exc}")
+            for name in used.values():
+                dropped(name)  # what came in pieces is not trusted: it comes again whole
+            pieces[0] = False
+            part.update(n=0, last=None)
+            fetch()
     if refused:
         raise refused[0]
     path = final.get("path")
@@ -496,12 +631,12 @@ def main():
     elif module == "yt_dlp" and spec.get("js_runtime") not in (None, "deno"):
         params["js_runtimes"] = {spec["js_runtime"]: {}}  # yt-dlp enables deno by itself
     if spec["mode"] == "probe":
-        probe(engine, params, spec)
+        probe(engine, module, params, spec)
     else:
         download(engine, module, params, spec)
 
 
-if __name__ == "__main__":
+def run():
     sys.stdout = sys.stderr  # an engine that prints must not corrupt the event stream
     try:
         main()
@@ -511,3 +646,7 @@ if __name__ == "__main__":
             message, kind = "No supported JavaScript runtime could be found.\n" + message, "no_js"
         emit(event="error", message=message, **({"kind": kind} if kind else {}))
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    run()

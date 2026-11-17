@@ -64,6 +64,8 @@ export const retry = (id) => call("POST", `/api/jobs/${id}/retry`, {});
 export const remove = (id) => call("DELETE", `/api/jobs/${id}`, undefined, true);
 export const clearFinished = (ids) => call("POST", "/api/jobs/clear", { ids }, true);
 export const reveal = (id) => call("POST", `/api/jobs/${id}/reveal`);
+export const open = (id) => call("POST", `/api/jobs/${id}/open`);
+export const quit = () => call("POST", "/api/quit");
 export const revealFolder = () => call("POST", "/api/dest/reveal");
 export const log = (id) => call("GET", `/api/jobs/${id}/log`);
 export const saveSettings = (changes) => call("PUT", "/api/settings", changes);
@@ -79,9 +81,14 @@ const STALL_MS = 40000; // the server pings every 15 seconds; silence this long 
 let reopen = () => {};
 // A fresh snapshot (the server sends one on every connect), e.g. when the tab is seen again.
 export const refresh = () => reopen();
+// Spool was quit: every tab hears it and none opens the stream again. The server says so too, but this tab
+// knows already, and a stream may end before the word arrives.
+let announce = () => {};
+export const stopped = () => announce();
 
-export function listen({ snapshot, job, removed, connected }) {
-  const handlers = { snapshot, job, job_removed: (d) => removed(d.id) };
+export function listen({ snapshot, job, removed, connected, stopped }) {
+  const handlers = { snapshot, job, job_removed: (d) => removed(d.id), stopped };
+  let ended = false;
   // shortcut: a browser without Web Locks reads its own stream in every tab, so a seventh tab stalls there
   const shared = !!(navigator.locks && window.BroadcastChannel);
   const channel = shared ? new BroadcastChannel(`spool-${token}`) : { postMessage() {} };
@@ -89,9 +96,11 @@ export function listen({ snapshot, job, removed, connected }) {
     if (event === "connected") return connected(data);
     if (event === "unauthorized") return unauthorized();
     if (event === "snapshot") { remember(); connected(true); }
+    if (event === "stopped") { ended = true; stream?.abort(); }
     handlers[event]?.(data);
   };
   const emit = (m) => { deliver(m); channel.postMessage(m); };
+  announce = () => emit({ event: "stopped", data: {} });
   let leading = false, stream, again = false, refused = false;
   channel.onmessage = ({ data }) => (data.event === "refresh" ? leading && reopen() : deliver(data));
   reopen = () => channel.postMessage({ event: "refresh" });
@@ -107,6 +116,7 @@ export function listen({ snapshot, job, removed, connected }) {
     if (data.length && handlers[event]) emit({ event, data: JSON.parse(data.join("\n")) });
   };
   const open = async () => {
+    if (ended) return;
     stream = new AbortController();
     let timer;
     const quiet = () => { clearTimeout(timer); timer = setTimeout(() => stream.abort(), STALL_MS); };
@@ -130,6 +140,7 @@ export function listen({ snapshot, job, removed, connected }) {
       }
     } catch { /* the server went away, went quiet, or we asked for a fresh stream; fall through */ }
     clearTimeout(timer);
+    if (ended) return;
     if (again) { again = false; return open(); }
     emit({ event: "connected", data: false });
     setTimeout(open, 2000);
