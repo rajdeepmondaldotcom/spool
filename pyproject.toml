@@ -1,6 +1,6 @@
 [project]
 name = "spool-dl"
-version = "0.2.0"
+version = "0.3.0"
 description = "Save any video to your own disk. Paste a link, pick a quality, get the file."
 readme = "README.md"
 license = "MIT"
