@@ -1,10 +1,12 @@
 """A download the connection or the site cut short tries again by itself (contract point 3)."""
 
 import json
+import threading
 import time
 
 import pytest
 from serve_fake import start
+from support import until
 
 import spool.jobs
 
@@ -349,3 +351,116 @@ def test_text_from_a_worker_arrives_intact_whatever_the_systems_code_page(app, e
     assert failed["error"]["kind"] == "limited"
     status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/big"})  # the probe's path too
     assert (status, body["error"]["kind"]) == (422, "limited")
+
+
+# A newer engine by itself
+
+
+def held_newer(app, monkeypatch, answer=True):
+    """Engines.newer in place, held until go is set: what the queue asked for, while the job is there to see."""
+    asked, go = [], threading.Event()
+
+    def newer(name):
+        asked.append(name)
+        assert go.wait(20)
+        return answer
+
+    monkeypatch.setattr(app.engines, "newer", newer)
+    return asked, go
+
+
+def job(app, job_id):
+    return next(j for j in app.jobs.snapshot()["jobs"] if j["id"] == job_id)
+
+
+@pytest.mark.parametrize("message", ["ERROR: unable to download video data: HTTP Error 403: Forbidden", "ERROR: broke"])
+def test_a_refusal_or_an_engine_error_gets_a_newer_engine_and_tries_again_at_once(
+    app, events, monkeypatch, tmp_path, message
+):
+    count = stub(monkeypatch, tmp_path, message, runs=2)
+    asked, go = held_newer(app, monkeypatch)
+    job_id = add(app, "https://fake.test/big")  # the test server waits for nothing: a wait would fail it
+    until(lambda: asked)
+    held = job(app, job_id)
+    assert (held["state"], held["stage"], held["note"]) == ("running", "starting", "Getting a newer engine.")
+    go.set()
+    done = wait_for(events, job_id, lambda d: d["state"] in ("done", "failed"))[-1][1]
+    assert (done["state"], done["note"]) == ("done", None)
+    assert (asked, count.read_text()) == (["yt-dlp"], "2")
+
+
+def test_with_no_newer_engine_the_job_goes_on_as_before_and_asks_once_a_run(app, events, monkeypatch, tmp_path):
+    count = stub(monkeypatch, tmp_path, "ERROR: unable to download video data: HTTP Error 403: Forbidden", further=0)
+    asked, go = held_newer(app, monkeypatch, answer=False)
+    go.set()
+    app.jobs.waits = (0.05, 0.05)
+    job_id = add(app, "https://fake.test/big")
+    failed = wait_for(events, job_id, lambda d: d["state"] == "failed")[-1][1]
+    assert (failed["error"]["kind"], failed["note"], failed["stage"]) == ("blocked", None, None)
+    assert (asked, count.read_text()) == (["yt-dlp"], "3")  # two waits, and one look for the run
+    assert app.json("POST", f"/api/jobs/{job_id}/retry")[0] == 200  # a new run asks again
+    wait_for(events, job_id, lambda d: d["state"] == "failed")
+    assert asked == ["yt-dlp"] * 2
+
+
+def test_what_a_newer_engine_cannot_fix_does_not_ask_for_one(app, events, monkeypatch, tmp_path):
+    stub(monkeypatch, tmp_path, "ERROR: Unable to download webpage: The read operation timed out")
+    asked, go = held_newer(app, monkeypatch)
+    go.set()
+    job_id = add(app, "https://fake.test/big")
+    assert wait_for(events, job_id, lambda d: d["state"] == "failed")[-1][1]["error"]["kind"] == "network"
+    assert asked == []
+
+
+def test_cancelling_while_it_looks_for_a_newer_engine_runs_no_more(app, events, monkeypatch, tmp_path):
+    count = stub(monkeypatch, tmp_path, "ERROR: broke", runs=2)
+    asked, go = held_newer(app, monkeypatch)
+    job_id = add(app, "https://fake.test/big")
+    until(lambda: asked)
+    assert app.json("POST", f"/api/jobs/{job_id}/cancel")[1]["note"] is None
+    go.set()
+    until(lambda: job_id not in app.jobs.procs)
+    assert (job(app, job_id)["state"], count.read_text()) == ("cancelled", "1")
+
+
+PROBE = """
+import json, pathlib, sys
+spec = json.loads(sys.stdin.readline())
+count = pathlib.Path(sys.argv[0]).with_name("runs")
+n = int(count.read_text()) + 1 if count.exists() else 1
+count.write_text(str(n))
+with open(count.with_name("specs"), "a") as f:
+    f.write(json.dumps(spec) + "\\n")
+if n < RUNS:
+    print(json.dumps({"event": "error", "message": MESSAGE}))
+else:
+    entry = {"url": spec["url"], "id": "p1", "title": "Probed", "presets": []}
+    print(json.dumps({"event": "info", "kind": "video", "title": "Probed", "entries": [entry]}))
+"""
+
+
+def probe_stub(monkeypatch, tmp_path, message, runs=99):
+    worker = tmp_path / "probe-stub" / "worker.py"
+    worker.parent.mkdir()
+    worker.write_text(PROBE.replace("RUNS", str(runs)).replace("MESSAGE", repr(message)), encoding="utf-8")
+    monkeypatch.setattr(spool.jobs, "WORKER", worker)
+    return worker.with_name("runs")
+
+
+def test_a_probe_gets_a_newer_engine_once(app, monkeypatch, tmp_path):
+    count = probe_stub(monkeypatch, tmp_path, "ERROR: HTTP Error 403: Forbidden", runs=2)
+    asked, go = held_newer(app, monkeypatch)
+    go.set()
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/big"})
+    assert (status, body["title"], asked, count.read_text()) == (200, "Probed", ["yt-dlp"], "2")
+    count.write_text("0")  # the next probe fails once
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/big", "engine": "yt-dlp"})
+    assert (status, asked, count.read_text()) == (200, ["yt-dlp"] * 2, "2")  # a new probe asks again, when it fails
+
+
+def test_a_probe_that_still_fails_after_a_newer_engine_says_so(app, monkeypatch, tmp_path):
+    count = probe_stub(monkeypatch, tmp_path, "ERROR: broke")
+    asked, go = held_newer(app, monkeypatch)
+    go.set()
+    status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/big", "engine": "yt-dlp"})
+    assert (status, body["error"]["kind"], asked, count.read_text()) == (422, "engine", ["yt-dlp"], "2")

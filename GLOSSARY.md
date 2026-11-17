@@ -15,6 +15,8 @@ The words the code uses. Where the screen uses a plainer word, it is in brackets
 | **Stage** | What a running job is doing right now: `starting`, `downloading` or `processing`. |
 | **Part** | One stream of a running job. Most video jobs have two parts, the video stream then the audio stream, joined at the end. |
 | **Engine** | The program Spool runs to fetch a video. Spool keeps its own copies of two and uses the second when the first fails on a link. |
+| **Source** | A release page an engine's builds come from. The first engine has two, its stable releases and its daily builds; launch installs from the stable one, and a newer engine may come from either. Versions compare by their numbers, so no update goes backwards. |
+| **Note** | A running job's short line on what is happening: why it waits to try again, or that it is getting a newer engine. |
 | **Worker** | A child process that runs one engine call (a probe or a download) and reports as JSON lines. |
 | **Destination** (folder) | The folder finished files are saved to. |
 | **Snapshot** | The whole state the browser needs, sent when it connects: settings, destination, engines, tools and jobs. |

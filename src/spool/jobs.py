@@ -150,16 +150,23 @@ class Jobs:
                     raise
 
     def _probe(self, url, engine):
-        events = self._call({"mode": "probe", "url": url, "engine": engine})
-        result = next((e for e in reversed(events) if e.get("event") in ("info", "error")), None)
-        if result is None:
-            kind = "engine"
-        elif result["event"] == "error":
-            kind = result.get("kind") if result.get("kind") in KINDS else classify(result["message"])
-        else:
-            kind = None
-        if kind is None and not result["entries"]:
-            kind = "empty"
+        looked = False
+        while True:
+            events = self._call({"mode": "probe", "url": url, "engine": engine})
+            result = next((e for e in reversed(events) if e.get("event") in ("info", "error")), None)
+            if result is None:
+                kind = "engine"
+            elif result["event"] == "error":
+                kind = result.get("kind") if result.get("kind") in KINDS else classify(result["message"])
+            else:
+                kind = None
+            if kind is None and not result["entries"]:
+                kind = "empty"
+            if kind in NEWER and not looked:
+                looked = True
+                if self.engines.newer(engine):
+                    continue
+            break
         if kind:
             e = self._error(kind, engine, probe=True)
             raise Problem(422, kind, e["message"], e["hint"])
@@ -452,7 +459,7 @@ class Jobs:
     def _run(self, job):
         """Run a job in the slot _pump reserved for it; the slot is freed only when its worker is gone."""
         try:
-            failure, switched, waited, furthest = None, False, 0, None
+            failure, switched, waited, furthest, looked = None, False, 0, None, False
             while True:
                 dest_problem(self._check(job["dest"], but=job))
                 result = self._attempt(job)
@@ -463,6 +470,10 @@ class Jobs:
                     dest_problem(self._check(job["dest"], but=job))  # a drive unplugged mid-download says so
                 except Problem as p:
                     kind = p.kind
+                if kind in NEWER and not looked:
+                    looked = True
+                    if self._newer(job):
+                        continue  # not one of the waits: a newer engine is a new chance
                 failure = self._error(kind, job["engine"], job["dest"])
                 if kind in ("unsupported", "empty") and not switched and self.engines.path(other(job["engine"])):
                     with self.lock:  # the other engine may read what this one can't
@@ -503,6 +514,21 @@ class Jobs:
             if sum(j["state"] == "queued" for j in self.jobs) >= self.pace_from:  # a long list: let the site rest
                 self.rest_until = time.monotonic() + self.pace
             self._pump()
+
+    def _newer(self, job):
+        """Look for a newer engine, saying so on the job; True when one was installed and the job still runs."""
+        with self.lock:
+            if self.closed or job["state"] != "running":
+                return False
+            job.update(stage="starting", note=LOOKING, speed=None, eta=None)
+            self._changed(job)
+        found = self.engines.newer(job["engine"])  # it may take seconds: never under the lock
+        with self.lock:
+            if self.closed or job["state"] != "running":
+                return False
+            job["note"] = None
+            self._changed(job)
+        return found
 
     def _wait(self, job, kind, waited):
         """Hold the job's slot until its next try. False when it was cancelled or Spool quit meanwhile."""
@@ -681,6 +707,8 @@ NOTES = {  # kind -> what a job waiting to try again says happened. Only these k
     "network": "The connection dropped.",
     "blocked": "The site refused the download.",
 }
+NEWER = ("blocked", "engine")  # kinds a newer engine may fix: looked for once a run, and once a probe
+LOOKING = "Getting a newer engine."  # a job's note while it looks
 KINDS = ("live", "no_js", "playlist")  # the worker names these itself; its message is then not read
 DEST_KINDS = {
     "unplugged": "dest_unplugged",

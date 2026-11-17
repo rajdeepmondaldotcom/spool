@@ -258,3 +258,20 @@ def test_a_presets_file_type_and_a_lists_truncated_reach_the_page(app, monkeypat
 
 def test_a_probe_from_a_worker_that_says_nothing_of_truncation_is_not_truncated(app):
     assert app.json("POST", "/api/probe", {"url": "https://fake.test/video"})[1]["truncated"] is False
+
+
+# A note while starting
+
+
+def test_a_starting_job_may_carry_a_note_that_is_cleared_after(app, events, monkeypatch):
+    import threading
+
+    looking, go = threading.Event(), threading.Event()
+    monkeypatch.setattr(app.engines, "newer", lambda name: looking.set() or go.wait(20) and False)
+    job = add(app, "https://fake.test/broken")["jobs"][0]
+    assert looking.wait(20)
+    seen = events.until(lambda e, d: e == "job" and d["id"] == job["id"] and d["note"])[-1][1]
+    assert (seen["state"], seen["stage"], seen["note"]) == ("running", "starting", "Getting a newer engine.")
+    go.set()
+    failed = finished(events, job["id"])[-1][1]
+    assert (failed["state"], failed["note"]) == ("failed", None)
