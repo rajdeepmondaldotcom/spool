@@ -65,7 +65,7 @@ def add_entry(app, entry, preset="best"):
 
 HELD = """
 import json, os, pathlib, sys, time
-spec = json.loads(sys.stdin.read())
+spec = json.loads(sys.stdin.readline())
 here = pathlib.Path(sys.argv[0]).parent
 name = os.path.join(spec["dest"], "Same video [v].mp4")
 print(json.dumps({"event": "file", "path": name}), flush=True)

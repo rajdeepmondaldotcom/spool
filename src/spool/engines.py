@@ -22,6 +22,11 @@ RELEASES = {
     "yt-dlp": "https://github.com/yt-dlp/yt-dlp/releases",
     "youtube-dl": "https://github.com/ytdl-org/ytdl-nightly/releases",
 }
+SOURCES = {  # where a newer build may be: the stable releases first, then any others
+    "yt-dlp": (RELEASES["yt-dlp"], "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases"),
+    "youtube-dl": (RELEASES["youtube-dl"],),
+}
+HOUR = 60 * 60
 MODULE = {"yt-dlp": "yt_dlp", "youtube-dl": "youtube_dl"}
 TAG = re.compile(r"v?\d[\w.\-]{0,62}", re.ASCII)  # a version: never ".", "..", "current" or "latest"
 LIMIT = 300 << 20  # bytes in one fetched or unpacked file; deno's program, the largest, is about 80 MB
@@ -80,6 +85,12 @@ def numbers(version):
     return tuple(int(n) for n in version.split("."))
 
 
+def order(tag):
+    """A tag's numbers, for comparing versions; () for a tag that is not one, so it is never the newer."""
+    found = tag and VERSION.fullmatch(tag)
+    return numbers(found[1]) if found else ()
+
+
 class Busy(Exception):
     pass
 
@@ -88,9 +99,11 @@ class Engines:
     def __init__(self, root, fetch=http_get, resolve=final_url):
         self.root, self.fetch, self.resolve = Path(root), fetch, resolve
         self.lock = threading.Lock()
+        self.done = threading.Condition(self.lock)  # an update has ended
         self.busy = dict.fromkeys(RELEASES)
         self.error = dict.fromkeys(RELEASES)
         self.latest = dict.fromkeys(RELEASES)
+        self.asked = {}  # engine -> when newer() last looked (monotonic)
         self.on_change = lambda: None  # called, outside the lock, whenever status() would answer differently
 
     def version(self, name):
@@ -109,7 +122,7 @@ class Engines:
                 name: {
                     "installed": self.version(name) is not None,
                     "version": self.version(name),
-                    "latest": self.latest[name],
+                    "latest": self.latest[name] and max(self.latest[name], self.version(name), key=order),
                     "busy": self.busy[name],
                     "error": self.error[name],
                 }
@@ -138,21 +151,49 @@ class Engines:
         self.on_change()
         threading.Thread(target=self._update, args=(name,), daemon=True).start()
 
-    def _latest(self, name):
-        tag = self.resolve(f"{RELEASES[name]}/latest").rstrip("/").rsplit("/", 1)[-1]
+    def newer(self, name):
+        """Install the newest build of any source when it is newer than the installed one; True when one was.
+        Looks at most once an hour; while an update of name runs, waits for it. Never raises."""
+        before = self.version(name)
+        with self.lock:
+            if self.busy[name]:
+                while self.busy[name]:
+                    self.done.wait()
+                return self.version(name) != before
+            if time.monotonic() - self.asked.get(name, -HOUR) < HOUR:
+                return False
+            self.asked[name] = time.monotonic()
+            self.busy[name] = "updating" if before else "installing"
+            self.error[name] = None
+        self.on_change()
+        self._update(name, SOURCES[name])
+        return self.version(name) != before
+
+    def _latest(self, name, source):
+        tag = self.resolve(f"{source}/latest").rstrip("/").rsplit("/", 1)[-1]
         if not TAG.fullmatch(tag):
             raise ValueError(f"unexpected release tag {tag!r}")
         with self.lock:
-            self.latest[name] = tag
+            self.latest[name] = max(self.latest[name], tag, key=order)
         self.on_change()
         return tag
 
-    def _update(self, name):
+    def _update(self, name, sources=None):
+        """Install the newest of sources' latest builds (the stable releases by default) if it is newer."""
         error = None
         try:
-            tag = self._latest(name)
-            if tag != self.version(name):
-                self._install(name, tag)
+            found, failed = [], None
+            for source in sources or (RELEASES[name],):
+                try:
+                    found.append((self._latest(name, source), source))
+                except Exception as exc:  # another source may still answer
+                    failed = failed or exc
+            if not found:
+                raise failed
+            tag, source = max(found, key=lambda f: order(f[0]))  # the first source wins a tie
+            installed = self.version(name)
+            if not installed or order(tag) > order(installed):  # never backwards
+                self._install(name, tag, source)
         except Exception as exc:
             log(self.root, f"update {name}", exc)
             did = "update" if self.version(name) else "set up"  # the first fetch is a setup: there is nothing to update
@@ -166,10 +207,11 @@ class Engines:
         with self.lock:
             self.busy[name] = None
             self.error[name] = error
+            self.done.notify_all()
         self.on_change()
 
-    def _install(self, name, tag):
-        base, asset = f"{RELEASES[name]}/download/{tag}", name  # each release names its file after the engine
+    def _install(self, name, tag, source):
+        base, asset = f"{source}/download/{tag}", name  # each release names its file after the engine
         sums = self.fetch(f"{base}/SHA2-256SUMS").decode()
         expected = next((line.split()[0] for line in sums.splitlines() if line.split()[1:] == [asset]), None)
         if expected is None:

@@ -50,10 +50,11 @@ def fake_engine_zip():
 
 
 class FakeGitHub:
-    """Stands in for github.com: the latest tag is `latest` and each release holds the fake engine as a zip."""
+    """Stands in for github.com: the latest tag is `latest` (the daily builds' is `nightly`, else the same) and each
+    release holds the fake engine as a zip."""
 
-    def __init__(self, delay=0.0, corrupt=False, offline=False, latest=LATEST):
-        self.delay, self.corrupt, self.offline, self.latest = delay, corrupt, offline, latest
+    def __init__(self, delay=0.0, corrupt=False, offline=False, latest=LATEST, nightly=None):
+        self.delay, self.corrupt, self.offline, self.latest, self.nightly = delay, corrupt, offline, latest, nightly
         self.asset = fake_engine_zip()
         self.fetched = []
 
@@ -66,7 +67,8 @@ class FakeGitHub:
     def resolve(self, url):
         self.check(url)
         assert url.endswith("/releases/latest"), url
-        return url.replace("/latest", f"/tag/{self.latest}")
+        tag = self.nightly if self.nightly and "-nightly-builds/" in url else self.latest
+        return url.replace("/latest", f"/tag/{tag}")
 
     def fetch(self, url):
         self.check(url)

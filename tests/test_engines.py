@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from serve_fake import INSTALLED, LATEST, FakeGitHub, install_fake_engines
 
-from spool.engines import Busy, Engines
+from spool.engines import RELEASES, Busy, Engines
 from spool.jobs import WORKER
 
 
@@ -364,3 +364,96 @@ def test_a_failed_look_says_nothing_and_asks_again_next_time(tmp_path):
     releases.fail = False
     assert newer_spool(tmp_path, "0.2.0", resolve=releases) == "0.2.1"
     assert len(releases.asked) == 2
+
+
+# A newer engine by itself
+
+NIGHTLY = "2026.02.03.232655"
+DAILY = "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases"
+
+
+def installed(tmp_path, github):
+    install_fake_engines(tmp_path)
+    return Engines(tmp_path / "engines", fetch=github.fetch, resolve=github.resolve)
+
+
+def test_newer_installs_the_newest_build_of_every_source(tmp_path):
+    github = FakeGitHub(nightly=NIGHTLY)
+    engines = installed(tmp_path, github)
+    assert engines.newer("yt-dlp") is True
+    status = engines.status()["yt-dlp"]
+    assert (status["version"], status["latest"], status["busy"], status["error"]) == (NIGHTLY, NIGHTLY, None, None)
+    assert f"{DAILY}/download/{NIGHTLY}/yt-dlp" in github.fetched
+    assert probe_with(engines.path("yt-dlp"), "yt-dlp")["event"] == "info"
+
+
+def test_newer_asks_at_most_once_an_hour_per_engine(tmp_path):
+    github = FakeGitHub(latest=INSTALLED)
+    engines = installed(tmp_path, github)
+    assert engines.newer("yt-dlp") is False
+    asked = list(github.fetched)
+    assert len(asked) == 2  # each source's latest, and nothing to fetch
+    github.latest = LATEST
+    assert engines.newer("yt-dlp") is False  # within the hour: not asked again
+    assert github.fetched == asked
+    assert engines.newer("youtube-dl") is True  # another engine has its own hour
+    assert [u for u in github.fetched if u.endswith("/latest")][2:] == [f"{RELEASES['youtube-dl']}/latest"]
+    engines.asked["yt-dlp"] -= 3601
+    assert engines.newer("yt-dlp") is True
+
+
+def test_newer_never_raises_and_says_false_when_offline(tmp_path):
+    engines = installed(tmp_path, FakeGitHub(offline=True))
+    assert engines.newer("yt-dlp") is False
+    assert engines.status()["yt-dlp"]["version"] == INSTALLED
+
+
+def test_one_source_offline_still_finds_the_other(tmp_path):
+    github = FakeGitHub(nightly=NIGHTLY)
+    resolve = github.resolve
+    github.resolve = lambda url: resolve(url) if "nightly" in url else (_ for _ in ()).throw(OSError("down"))
+    engines = installed(tmp_path, github)
+    assert engines.newer("yt-dlp") is True
+    assert engines.version("yt-dlp") == NIGHTLY
+
+
+def test_newer_waits_for_an_update_already_running(tmp_path):
+    github = FakeGitHub(delay=0.3)
+    engines = installed(tmp_path, github)
+    engines.update("yt-dlp")
+    assert engines.newer("yt-dlp") is True  # the running update installed LATEST
+    assert engines.status()["yt-dlp"]["version"] == LATEST
+    engines.update("youtube-dl")
+    settle(engines)  # it has LATEST now: nothing is newer
+    assert engines.newer("youtube-dl") is False
+
+
+@pytest.mark.parametrize("launch", [True, False])
+def test_no_update_replaces_the_engine_with_an_older_one(tmp_path, launch):
+    github = FakeGitHub(nightly=NIGHTLY)
+    engines = installed(tmp_path, github)
+    assert engines.newer("yt-dlp") is True
+    engines = Engines(tmp_path / "engines", fetch=github.fetch, resolve=github.resolve)  # a new launch
+    if launch:
+        engines.start()
+    else:
+        engines.update("yt-dlp")
+    status = settle(engines)["yt-dlp"]
+    assert (status["version"], status["latest"], status["error"]) == (NIGHTLY, NIGHTLY, None)
+    assert not (tmp_path / "engines" / "yt-dlp" / LATEST).exists()
+
+
+def test_latest_is_never_older_than_the_installed_version(tmp_path):
+    github = FakeGitHub(latest="2025.06.01")
+    engines = installed(tmp_path, github)
+    engines.update("yt-dlp")
+    status = settle(engines)["yt-dlp"]
+    assert (status["version"], status["latest"]) == (INSTALLED, INSTALLED)
+
+
+def test_the_second_engine_has_one_source(tmp_path):
+    github = FakeGitHub(nightly=NIGHTLY)
+    engines = installed(tmp_path, github)
+    assert engines.newer("youtube-dl") is True
+    assert engines.version("youtube-dl") == LATEST
+    assert not [u for u in github.fetched if "yt-dlp" in u]
