@@ -284,10 +284,11 @@ def test_a_4_3_video_is_classed_by_its_short_side():
 
 
 def test_the_top_class_wins_even_when_only_a_lower_class_is_h264():
-    sizes, order = presets("https://fake.test/vp9-top")
+    [entry] = last(run("probe", "https://fake.test/vp9-top"))["entries"]
+    sizes = {p["id"]: p["size"] for p in entry["presets"]}
     assert sizes["best"] == 2_500_000 + 400_000  # VP9 1080p, not H.264 720p
-    assert best_detail("https://fake.test/vp9-top") == "1080p"
-    assert sizes["720"] == 1_500_000 + 400_000
+    assert entry["presets"][0]["detail"] == "1080p"
+    assert sizes["compatible"] == 1_500_000 + 400_000  # the H.264 720p, which class 720 would save too
 
 
 @pytest.mark.skipif(
@@ -412,7 +413,10 @@ def test_a_class_file_is_named_for_the_class_it_got(tmp_path):
 
 
 @pytest.mark.parametrize("ffmpeg", [True, False])
-@pytest.mark.parametrize("url", ["https://fake.test/video", "https://fake.test/no-combined", "https://fake.test/audio"])
+@pytest.mark.parametrize(
+    "url",
+    [f"https://fake.test/{s}" for s in ("video", "no-combined", "audio", "vp9-top", "h264-tall", "no-h264")],
+)
 def test_every_quality_offered_downloads(tmp_path, url, ffmpeg):
     [entry] = last(run("probe", url, ffmpeg=ffmpeg))["entries"]
     types = {p["id"]: p["ext"] for p in entry["presets"]}
@@ -606,7 +610,7 @@ def test_a_part_the_old_way_went_on_with_is_never_resumed_in_pieces(tmp_path):
     "url, types",
     [
         ("video", {"best": "mp4", "720": "mp4", "480": "mp4", "360": "mp4", "audio": "m4a", "mp3": "mp3"}),
-        ("vp9-top", {"best": "mkv", "720": "mp4", "480": "mp4", "360": "mp4", "audio": "m4a", "mp3": "mp3"}),
+        ("vp9-top", {"best": "mkv", "compatible": "mp4", "480": "mp4", "360": "mp4", "audio": "m4a", "mp3": "mp3"}),
     ],
 )
 def test_each_quality_names_the_type_of_file_it_saves(url, types):
@@ -779,3 +783,65 @@ def test_an_item_of_a_list_tells_that_entrys_id(tmp_path, engine):
     )
     assert last(events)["event"] == "done", last(events)
     assert [e["id"] for e in events if e["event"] == "id"] == ["shared-2"]
+
+
+# Plays everywhere: H.264 and AAC in MP4
+
+
+def offered(url, ffmpeg=True):
+    [entry] = last(run("probe", url, ffmpeg=ffmpeg))["entries"]
+    return [(p["id"], p["label"], p["detail"], p["ext"]) for p in entry["presets"]]
+
+
+def test_plays_everywhere_is_offered_second_at_the_largest_class_with_h264_and_aac():
+    assert offered("https://fake.test/h264-tall") == [
+        ("best", "Best", "2160p", "mkv"),  # VP9
+        ("compatible", "Plays everywhere", "1440p", "mp4"),  # the largest H.264, so class 1440 is not offered again
+        ("1080", "1080p", None, "mp4"),
+        ("audio", "Audio", None, "m4a"),
+        ("mp3", "MP3", None, "mp3"),
+    ]
+
+
+@pytest.mark.parametrize("ffmpeg", [True, False])
+def test_plays_everywhere_is_not_offered_when_best_already_is_it(ffmpeg):
+    assert "compatible" not in [p[0] for p in offered("https://fake.test/video", ffmpeg)]
+
+
+def test_plays_everywhere_is_not_offered_without_h264_and_aac():
+    assert [p[0] for p in offered("https://fake.test/no-h264")] == ["best", "1080", "audio", "mp3"]
+
+
+def test_plays_everywhere_saves_the_largest_h264_with_aac_under_its_own_name(tmp_path):
+    events = run("download", "https://fake.test/h264-tall?delay=0", dest=str(tmp_path), preset="compatible")
+    done = last(events)
+    assert os.path.basename(done["path"]) == "Fake tall video [tall-1] 1440p H.264.mp4", done
+    assert logged(events, "[fake] chose ") == ["[fake] chose v1440+140"]
+
+
+def test_plays_everywhere_without_h264_saves_what_1080_would_by_the_same_name(tmp_path):
+    names = {}
+    for preset in ("compatible", "1080"):
+        (tmp_path / preset).mkdir()
+        events = run("download", "https://fake.test/no-h264?delay=0", dest=str(tmp_path / preset), preset=preset)
+        names[preset] = (os.path.basename(last(events)["path"]), logged(events, "[fake] chose "))
+    assert names["compatible"] == names["1080"] == ("Fake VP9 only video [nh-1] 1080p.webm", ["[fake] chose 248+251"])
+
+
+def test_plays_everywhere_downloads_with_youtube_dl_too(tmp_path):
+    done = last(
+        run("download", "https://fake.test/video?delay=0", "youtube-dl", dest=str(tmp_path), preset="compatible")
+    )
+    assert os.path.basename(done["path"]) == "Fake video 1 [vid-1] H.264.mp4", done
+
+
+def test_plays_everywhere_mirrors_the_engines_choice():
+    from spool.worker import format_params, ladder, picked
+
+    assert format_params("compatible", True, "yt_dlp") == format_params("best", True, "yt_dlp")  # Narrow does the rest
+    assert ladder("compatible", True).startswith("bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/")
+    assert ladder("compatible", True).endswith("/" + ladder("1080", True))
+    sys.path.insert(0, str(FAKE))
+    from _fake import NO_H264_FORMATS
+
+    assert picked(NO_H264_FORMATS, "compatible", True) == picked(NO_H264_FORMATS, "1080", True)

@@ -55,7 +55,7 @@ def format_params(preset, ffmpeg, module):
     if preset in AUDIO:
         return {"format": AUDIO[preset]}
     if module == "yt_dlp":  # its sorter's res is the short side; resolution first, H.264 + AAC only break ties
-        res = "res" if preset == "best" else f"res:{preset}"
+        res = "res" if preset in ("best", "compatible") else f"res:{preset}"  # compatible: Narrow does the rest
         return {"format": "bv*+ba/b" if ffmpeg else "b", "format_sort": [res, "fps", "vcodec:h264", "acodec:aac"]}
     return {"format": ladder(preset, ffmpeg)}
 
@@ -68,6 +68,10 @@ def ladder(preset, ffmpeg):
     Upgrade if youtube-dl gains format sorting, or drop the ladder if yt-dlp becomes the only engine."""
     if preset == "best":
         return "bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best" if ffmpeg else "best"
+    if preset == "compatible":  # H.264 and AAC in MP4 when the video has them, else what class 1080 saves
+        mp4 = "[vcodec^=avc1][ext=mp4]"
+        pair = f"bestvideo{mp4}+bestaudio[acodec^=mp4a][ext=m4a]/" if ffmpeg else ""
+        return f"{pair}best{mp4}[acodec^=mp4a]/" + ladder("1080", ffmpeg)
     n = int(preset)
     fit, tall = f"[height<={LONG[n]}][width<={LONG[n]}]", f"[height<={n}]"
     if not ffmpeg:
@@ -85,7 +89,7 @@ NAME = {  # yt-dlp's spool_* fields are set by the Name step in download(); yout
 }
 HEIGHTS = (2160, 1440, 1080, 720, 480, 360, 240)
 FLAT_PRESETS = ("best", "1080", "720", "480", "audio")  # a flat playlist listing has no formats to read
-LABELS = {"best": "Best", "audio": "Audio", "mp3": "MP3"}
+LABELS = {"best": "Best", "compatible": "Plays everywhere", "audio": "Audio", "mp3": "MP3"}
 CLASS = {str(h): f" {h}p" for h in HEIGHTS}  # two classes of one video must not share a file name
 
 
@@ -173,8 +177,39 @@ def ranking(n):
     return key
 
 
+def fits(f):
+    """H.264 picture and AAC sound, as far as the stream has them, in a file an MP4 can hold: plays everywhere."""
+    video = not has(f, "vcodec") or str(f.get("vcodec")).startswith(("avc", "h264"))
+    audio = not has(f, "acodec") or str(f.get("acodec")).startswith(("mp4a", "aac"))
+    return video and audio and f.get("ext") in ("mp4", "m4a")
+
+
+def everywhere(formats, ffmpeg):
+    """The formats preset compatible chooses among, like Best: those that fit, when they hold one stream with picture
+    and sound, or a pair to join. None when they do not."""
+    fit = [f for f in formats if fits(f)]
+    both = any(has(f, "vcodec") and has(f, "acodec") for f in fit)
+    pair = any(not has(f, "acodec") for f in fit) and any(not has(f, "vcodec") for f in fit)
+    return fit if both or (ffmpeg and pair) else None
+
+
+def narrow(ydl, info, ffmpeg):
+    """Preset compatible, before yt-dlp chooses: only what plays everywhere, else class 1080's order."""
+    if not info.get("formats"):
+        return  # a list, or a site with one stream: nothing to choose
+    fit = everywhere(info["formats"], ffmpeg)
+    if fit:
+        info["formats"] = fit
+    else:
+        ydl.params["format_sort"] = format_params("1080", ffmpeg, "yt_dlp")["format_sort"]
+        ydl.sort_formats(info)
+
+
 def picked(formats, preset, ffmpeg):
     """The streams a preset downloads, by the rule yt-dlp uses; (None,) if none fit."""
+    if preset == "compatible":
+        fit = everywhere(formats, ffmpeg)
+        return chosen(fit, None, ffmpeg) if fit else chosen(formats, 1080, ffmpeg)
     if preset in AUDIO:
         audio = [f for f in formats if has(f, "acodec") and not has(f, "vcodec")]
         both = [f for f in formats if has(f, "acodec") and has(f, "vcodec")]
@@ -210,15 +245,21 @@ def entry(info, ffmpeg, compatible=None):
         formats = info.get("formats") or [info]  # a site with one stream puts it on the info itself
         playable = formats if ffmpeg else [f for f in formats if has(f, "acodec")]  # no merging without ffmpeg
         classes = {klass(f) for f in playable if has(f, "vcodec")}
-        top = chosen(formats, None, ffmpeg)[0]
+        tops = chosen(formats, None, ffmpeg)
+        top = tops[0]
         best = klass(top) if top and has(top, "vcodec") else None  # Best's own class: offered once, as its detail
-        heights = [str(h) for h in HEIGHTS if h in classes and h != best]
-        ids = ["best"] * bool(top) + heights + ["audio"] + ["mp3"] * bool(ffmpeg)  # no Best when nothing fits
+        fit = everywhere(formats, ffmpeg)
+        comp = fit and chosen(fit, None, ffmpeg)  # what plays everywhere, offered once: not when Best is it
+        comp = comp if comp != tops else None
+        heights = [str(h) for h in HEIGHTS if h in classes and h != best and picked(formats, str(h), ffmpeg) != comp]
+        ids = ["best"] * bool(top) + ["compatible"] * bool(comp) + heights + ["audio"] + ["mp3"] * bool(ffmpeg)
         presets = [preset(p, estimate(formats, p, ffmpeg, info.get("duration"))) for p in ids]
         for p in presets:  # the MP3 step decides its type, whatever stream it starts from
             p["ext"] = "mp3" if p["id"] == "mp3" else file_type(picked(formats, p["id"], ffmpeg), compatible)
         if top:
             presets[0]["detail"] = best and f"{best}p"
+        if comp:
+            presets[1]["detail"] = f"{klass(comp[0])}p"
     if ffmpeg and presets[-1]["id"] != "mp3":
         presets.append(preset("mp3"))
     thumbnails = info.get("thumbnails") or [{}]
@@ -440,8 +481,10 @@ def download(engine, module, params, spec):
             got = video and klass(video)  # a class preset gives the best below it: name the file for what it got
             information["spool_title"] = title.encode()[:150].decode(errors="ignore")
             information["spool_class"] = (
-                f" {got}p" if got and spec["preset"] in CLASS else CLASS.get(spec["preset"], "")
+                f" {got}p" if got and spec["preset"] in (*CLASS, "compatible") else CLASS.get(spec["preset"], "")
             )
+            if got and spec["preset"] == "compatible" and all(fits(f) for f in plan):
+                information["spool_class"] += " H.264"  # else it is what class 1080 saves, and named so
             base, ext = os.path.splitext(ydl.prepare_filename(information))
             for e in {ext, ".mp3" if spec["preset"] == "mp3" else ext}:  # the merge and the metadata step write here
                 wrote(base + ".temp" + e)
@@ -565,8 +608,9 @@ def download(engine, module, params, spec):
         return None
 
     # shortcut: youtube-dl has no step between choosing and naming, so its class is the preset's, even when a
-    # playlist entry has no such class, and its merge's .temp file goes unreported; drop with youtube-dl
-    cls = "" if module == "yt_dlp" else CLASS.get(spec["preset"], "")
+    # playlist entry has no such class or plays everywhere only as what class 1080 saves, and its merge's .temp file
+    # goes unreported; drop with youtube-dl
+    cls = "" if module == "yt_dlp" else {**CLASS, "compatible": " H.264"}.get(spec["preset"], "")
     params.update(
         match_filter=wanted,
         **format_params(spec["preset"], spec["ffmpeg"], module),
@@ -590,8 +634,18 @@ def download(engine, module, params, spec):
         os.chdir(spec["dest"])
     except OSError:
         raise RuntimeError("The destination folder is missing.") from None
+
+    class Narrow(PostProcessor):
+        """yt-dlp's step before it chooses the streams."""
+
+        def run(self, information):
+            narrow(ydl, information, spec["ffmpeg"])
+            return [], information
+
     with engine.YoutubeDL(params) as ydl:
         if module == "yt_dlp":
+            if spec["preset"] == "compatible":
+                ydl.add_post_processor(Narrow(), when="pre_process")
             ydl.add_post_processor(Name(), when="video")
             if spec["ffmpeg"]:  # after the MP3 step, which params added first
                 ydl.add_post_processor(Details(), when="post_process")

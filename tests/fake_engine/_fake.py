@@ -124,6 +124,24 @@ FOUR_THREE_FORMATS = [  # an old 4:3 video: 640x480 is class 480, 480x360 is cla
     {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "abr": 129, "filesize": 400_000},
 ]
 VP9_TOP_FORMATS = [f for f in VIDEO_FORMATS if f["format_id"] not in ("hls-1080", "137")]  # 1080 only in VP9
+V2160 = {"format_id": "v2160", "ext": "webm", "width": 3840, "height": 2160, "vcodec": "vp9", "filesize": 6_000_000}
+V1440 = {
+    "format_id": "v1440",
+    "ext": "mp4",
+    "width": 2560,
+    "height": 1440,
+    "vcodec": "avc1.640032",
+    "filesize": 4_000_000,
+}
+H264_TALL_FORMATS = [  # H.264 up to 1440p, and a 2160p only in VP9
+    {**V2160, "acodec": "none"},
+    {**V1440, "acodec": "none"},
+    *(f for f in VIDEO_FORMATS if f["format_id"] in ("137", "140", "251")),
+]
+NO_H264_FORMATS = [  # VP9 and Opus only: nothing plays everywhere
+    {**V1440, "ext": "webm", "vcodec": "vp9", "acodec": "none"},
+    *(f for f in VIDEO_FORMATS if f["format_id"] in ("248", "251")),
+]
 AUDIO_FORMATS = [
     {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "abr": 129, "filesize": 500_000},
     {"format_id": "251", "ext": "webm", "vcodec": "none", "acodec": "opus", "abr": 135, "filesize": 480_000},
@@ -323,6 +341,10 @@ def scenario(url):
         return {**video(url, n, "Fake 4:3 video", FOUR_THREE_FORMATS), "id": f"43-{n}"}, delay or 0
     if name == "vp9-top":
         return {**video(url, n, "Fake VP9 video", VP9_TOP_FORMATS), "id": f"vp9-{n}"}, delay or 0
+    if name == "h264-tall":
+        return {**video(url, n, "Fake tall video", H264_TALL_FORMATS), "id": f"tall-{n}"}, delay or 0
+    if name == "no-h264":
+        return {**video(url, n, "Fake VP9 only video", NO_H264_FORMATS), "id": f"nh-{n}"}, delay or 0
     if name == "hls":  # streams with a bitrate but no file size
         hls = [{"format_id": "hls-720", "ext": "mp4", "height": 720, "tbr": 800, "protocol": "m3u8_native"}]
         return {**video(url, n, "Fake streamed video", hls), "id": f"hls-{n}"}, 0
@@ -593,7 +615,10 @@ class YoutubeDL:
         if info.get("_rm"):
             self.remove_test_folder(info["_rm"])
         mp3 = any(p.get("key") == "FFmpegExtractAudio" for p in self.params.get("postprocessors", []))
+        for _, pp in (p for p in self.pps if p[0] == self.WHEN.get("pre_process")):
+            _, info = pp.run(info)  # yt-dlp's step before it chooses the streams
         parts = self.chosen(info)
+        self.log("[fake] chose " + "+".join(f["format_id"] for f in parts))
         if len(parts) == 2:
             info = {
                 **info,
@@ -632,7 +657,8 @@ class YoutubeDL:
                 self.pp_hook("finished", "ExtractAudio", about)
             else:
                 os.replace(files[0], final)
-        order = [pp for when, pp in sorted(self.pps, key=lambda x: x[0]) if when != self.WHEN.get("video")]
+        before = (self.WHEN.get("pre_process"), self.WHEN.get("video"))
+        order = [pp for when, pp in sorted(self.pps, key=lambda x: x[0]) if when not in before]
         self.log("[fake] ran: " + ", ".join(getattr(pp, "key", type(pp).__name__) for pp in order))
         if self.params.get("updatetime", True) and info.get("timestamp"):
             os.utime(final, (info["timestamp"], info["timestamp"]))
