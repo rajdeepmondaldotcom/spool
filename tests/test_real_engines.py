@@ -639,3 +639,53 @@ def test_pieces_a_stalled_piece_makes_spool_read_the_video_again_and_finish(jobs
     assert events[-1]["event"] == "done", events[-1]
     assert sorted(set(reads) - {None}) == ["1", "2"]  # read once more, not again and again
     assert open(events[-1]["path"], "rb").read() == STALL_BODY
+
+
+# Signing in: the real engine reads a made-up Firefox store in the test's own home, never a browser's
+
+HOMES = ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME")  # where the engine looks
+NOWHERE = "http://127.0.0.1:9/video"  # the sign-in is read before any request; this one goes nowhere
+
+
+def firefox_store(home):
+    """A Firefox profile with one cookie, where the engine looks for Firefox on this system, under home."""
+    import sqlite3
+
+    root = {"darwin": "Library/Application Support/Firefox/Profiles", "win32": "Mozilla/Firefox/Profiles"}
+    profile = home / root.get(sys.platform, "mozilla/firefox") / "test.default"
+    profile.mkdir(parents=True)
+    db = sqlite3.connect(profile / "cookies.sqlite")
+    db.execute("CREATE TABLE moz_cookies (host, name, value, path, expiry, isSecure, originAttributes)")
+    db.execute("INSERT INTO moz_cookies VALUES ('.x.test', 'session', 'made-up', '/', 4102444800000, 1, '')")
+    db.execute("PRAGMA user_version = 17")
+    db.commit()
+    db.close()
+    return profile / "cookies.sqlite"
+
+
+@pytest.mark.parametrize("problem", [None, "missing", "no rights"])
+def test_the_real_engine_reads_a_made_up_firefox_sign_in_and_names_what_it_cannot_read(jobs, tmp_path, problem):
+    if problem == "no rights" and (sys.platform == "win32" or os.geteuid() == 0):
+        pytest.skip("a file's read right cannot be taken away here")
+    if problem != "missing":
+        db = firefox_store(tmp_path)
+        if problem:
+            db.chmod(0)
+    spec = jobs._spec("yt-dlp", mode="probe", url=NOWHERE, signin="firefox")
+    env = {**os.environ, **dict.fromkeys(HOMES, str(tmp_path))}
+    out = subprocess.run(
+        [sys.executable, "-I", str(WORKER)],
+        input=json.dumps(spec),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    ).stdout
+    events = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+    read = [e["line"] for e in events if e["event"] == "log" and e["line"].startswith("Extracted ")]
+    if problem:
+        assert (events[-1]["event"], events[-1].get("kind")) == ("error", "signin_unread"), events[-1]
+        assert read == []
+    else:
+        assert read == ["Extracted 1 cookies from firefox"]
+        assert events[-1]["event"] == "error" and events[-1].get("kind") != "signin_unread", events[-1]

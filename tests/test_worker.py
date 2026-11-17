@@ -20,14 +20,19 @@ IN_PIECES = (
 )
 
 
-def run(mode, url, engine="yt-dlp", at_once=None, **spec):
-    """The worker's events; at_once: fetch YouTube streams in that many pieces at once, which Spool ships off."""
+def run(mode, url, engine="yt-dlp", at_once=None, home=None, **spec):
+    """The worker's events; at_once: fetch YouTube streams in that many pieces at once, which Spool ships off.
+    home: the worker's home folder, where an engine looks for a browser's sign-in."""
     spec = {"engine": engine, "engine_path": str(FAKE), "mode": mode, "url": url, "ffmpeg": True, **spec}
     cmd = [sys.executable, "-I", str(WORKER)]
     if at_once:
         cmd = [sys.executable, "-I", "-c", IN_PIECES, str(WORKER.parent), str(at_once)]
-    out = subprocess.run(cmd, input=json.dumps(spec), capture_output=True, text=True, timeout=30).stdout
+    env = home and {**os.environ, **dict.fromkeys(HOMES, str(home))}
+    out = subprocess.run(cmd, input=json.dumps(spec), capture_output=True, text=True, timeout=30, env=env).stdout
     return [json.loads(line) for line in out.splitlines()]
+
+
+HOMES = ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME")  # where engines look for a browser
 
 
 def last(events):
@@ -845,3 +850,45 @@ def test_plays_everywhere_mirrors_the_engines_choice():
     from _fake import NO_H264_FORMATS
 
     assert picked(NO_H264_FORMATS, "compatible", True) == picked(NO_H264_FORMATS, "1080", True)
+
+
+# Signing in (the fake reads a made-up store under the test's own home, never a browser's)
+
+
+def store(home, browser, content="cookies"):
+    (home / ".fake-signin").mkdir(exist_ok=True)
+    (home / ".fake-signin" / browser).write_text(content)
+    return home / ".fake-signin" / browser
+
+
+def test_a_video_that_asks_for_an_account_saves_with_the_browsers_sign_in(tmp_path):
+    (tmp_path / "out").mkdir()
+    store(tmp_path, "firefox")
+    url = "https://fake.test/age?delay=0"
+    error = last(run("download", url, dest=str(tmp_path / "out"), preset="best", home=tmp_path))
+    assert "Sign in to confirm your age" in error["message"] and "kind" not in error  # the queue names this one
+    events = run("download", url, dest=str(tmp_path / "out"), preset="best", home=tmp_path, signin="firefox")
+    assert last(events)["event"] == "done", last(events)
+    assert logged(events, "Extracted ") == ["Extracted 1 cookies from firefox"]
+
+
+@pytest.mark.parametrize("mode", ["probe", "download"])
+@pytest.mark.parametrize("problem", ["missing", "no rights", "locked"])
+def test_a_sign_in_that_cannot_be_read_is_named(tmp_path, mode, problem):
+    if problem == "no rights":
+        if sys.platform == "win32" or os.geteuid() == 0:
+            pytest.skip("a file's read right cannot be taken away here")
+        store(tmp_path, "chrome").chmod(0)
+    elif problem == "locked":
+        store(tmp_path, "chrome", "locked")
+    (tmp_path / "out").mkdir()
+    url = "https://fake.test/age?delay=0"
+    error = last(run(mode, url, dest=str(tmp_path / "out"), preset="best", home=tmp_path, signin="chrome"))
+    assert (error["event"], error.get("kind")) == ("error", "signin_unread"), error
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+def test_youtube_dl_has_no_sign_in_and_fails_as_today(tmp_path):
+    url = "https://fake.test/age?delay=0"
+    error = last(run("download", url, "youtube-dl", dest=str(tmp_path), preset="best", home=tmp_path, signin="chrome"))
+    assert "Sign in to confirm your age" in error["message"] and "kind" not in error

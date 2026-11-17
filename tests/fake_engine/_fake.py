@@ -3,7 +3,8 @@
 Links look like https://fake.test/<scenario>[/<n>][?delay=<seconds per step>].
 It implements only what spool's worker uses: YoutubeDL(params) as a context manager,
 extract_info, process_video_result, download, add_post_processor, progress and post-processor hooks,
-the merger's postprocessor_args, FFmpegMetadataPP and the logger. https://www.youtube.com/@<name>[/<tab>]
+the merger's postprocessor_args, FFmpegMetadataPP, the logger and cookiesfrombrowser, which reads a made-up store,
+~/.fake-signin/<browser>: never a real browser's, and tests point HOME at their own folder. https://www.youtube.com/@<name>[/<tab>]
 is a fake channel. A stream's bytes are its offsets mod 256, so a file joined wrongly shows.
 """
 
@@ -186,7 +187,13 @@ class Named:
 
 
 class DownloadError(Exception):
-    pass
+    def __init__(self, msg, exc_info=None):
+        super().__init__(msg)
+        self.exc_info = exc_info
+
+
+class CookieLoadError(Exception):
+    """yt-dlp's wrapper for any failure while it loads a browser's cookies; the cause is its __context__."""
 
 
 class ReExtractInfo(Exception):
@@ -387,6 +394,8 @@ def scenario(url):
             "_refuse_at": 0,
             "_once": False,
         }, 0
+    if name == "age":  # a video that asks for a signed-in account
+        return {**video(url, n, "Fake age-checked video"), "id": f"age-{n}", "_signin": True}, delay or 0
     if name == "unavailable":
         raise DownloadError(f"ERROR: [fake] {n}: Video unavailable. This video has been removed by the uploader")
     raise DownloadError(f"ERROR: Unsupported URL: {url}")
@@ -424,6 +433,9 @@ class YoutubeDL:
             self.params["logger"].debug("[fake] a new engine object")  # each costs time, and may cost requests
         if "socket_timeout" not in self.params:  # youtube-dl would wait 10 minutes for a host that stops answering
             raise TypeError("the fake engine wants a socket_timeout")
+        self.signed_in = False
+        if self.params.get("cookiesfrombrowser"):  # yt-dlp reads them as it starts
+            self.read_signin(self.params["cookiesfrombrowser"][0])
         self.pps = []  # (when rank, post-processor) in the order the engine runs them
         for p in self.params.get("postprocessors", []):
             options = set(p) - {"key", "when"}
@@ -460,9 +472,38 @@ class YoutubeDL:
         except DownloadError as exc:
             self.fail(str(exc))
         self.needs_js(info)
+        self.asks_signin(info)
         if info.get("_type") == "playlist" and self.params.get("playlistend"):
             info = {**info, "entries": info["entries"][: self.params["playlistend"]]}
         return info
+
+    def read_signin(self, browser):
+        """yt-dlp's load_cookies and cookiejar, on a made-up store: a store that is missing or may not be read fails
+        as it does; one holding "locked" cannot be decrypted, which it only warns about."""
+        store = os.path.expanduser(f"~/.fake-signin/{browser}")
+        try:
+            try:
+                if not os.path.exists(store):
+                    raise FileNotFoundError(f"could not find {browser} cookies database in '{os.path.dirname(store)}'")
+                with open(store) as f:
+                    if f.read().strip() == "locked":
+                        self.params["logger"].warning("cannot decrypt v10 cookies: no key found")
+                        self.log(f"Extracted 0 cookies from {browser} (1 could not be decrypted)")
+                        return
+                self.log(f"Extracted 1 cookies from {browser}")
+                self.signed_in = True
+            except Exception:
+                raise CookieLoadError("failed to load cookies")  # noqa: B904, as yt-dlp does
+        except CookieLoadError as error:
+            self.log(f"ERROR: {error.__context__}")
+            raise DownloadError(f"ERROR: {error.__context__}", sys.exc_info())  # noqa: B904
+
+    def asks_signin(self, info):
+        if info.get("_signin") and not self.signed_in:
+            self.fail(
+                f"ERROR: [youtube] {info['id']}: Sign in to confirm your age. This video may be inappropriate for some "
+                "users. Use --cookies-from-browser or --cookies for the authentication."
+            )
 
     def needs_js(self, info):
         if info.get("_needs_js"):
@@ -492,6 +533,7 @@ class YoutubeDL:
             except DownloadError as exc:
                 self.fail(str(exc))
             self.needs_js(info)
+            self.asks_signin(info)
             if info.get("_type") != "playlist":
                 for reads in range(1, 100):  # the engine reads the video again on every ReExtractInfo, without limit
                     try:

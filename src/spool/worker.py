@@ -1,10 +1,10 @@
 """Worker: a child process that runs one engine call and reports JSON lines on stdout.
 
 Spec on stdin, one line: {engine, engine_path, mode: "probe" | "download", url, ffmpeg, js_runtime?, dest?, preset?,
-item?, hold?}. A download first tells the video's id, before it writes any file; with hold it then reads one more line
+item?, hold?, signin?}. signin: the browser yt-dlp reads the sign-in from. A download first tells the video's id, before it writes any file; with hold it then reads one more line
 and goes on only at "go".
 Events: {"event": "log" | "progress" | "meta" | "id" | "file" | "info" | "done" | "error", ...}; an error carries "kind"
-("live", "no_js" or "playlist") when the worker knows it. A progress event's status is the engine's ("downloading",
+("live", "no_js", "playlist" or "signin_unread") when the worker knows it. A progress event's status is the engine's ("downloading",
 "finished"), or "processing" for how far a join, tags or MP3 step has written its file. An info event of a list
 carries "truncated": a channel has more videos than it lists. Each preset carries "ext", the type of file it saves.
 Standard library only; run with python -I.
@@ -22,6 +22,7 @@ OUT = sys.stdout
 OUT_LOCK = threading.Lock()  # a step's progress is reported from a thread of its own
 LIVE = "This is live now."  # jobs.py maps these words to the error kind "live"
 NO_JS_FAILS = ("requested format is not available", "only images are available")  # what a missing runtime causes
+UNDECRYPTED = ("cannot decrypt", "failed to decrypt", "could not be decrypted")  # yt-dlp only warns of these
 
 
 class Failure(Exception):
@@ -38,9 +39,11 @@ def emit(**event):
 
 class Log:
     no_js = False  # yt-dlp warned that YouTube has no JavaScript runtime to solve its challenge
+    undecrypted = False  # yt-dlp read the browser's sign-in but could not decrypt it
 
     def debug(self, msg):
         Log.no_js = Log.no_js or "No supported JavaScript runtime" in msg
+        Log.undecrypted = Log.undecrypted or any(w in msg for w in UNDECRYPTED)
         emit(event="log", line=msg)
 
     info = warning = error = debug
@@ -700,10 +703,24 @@ def main():
         params["js_runtimes"] = {"deno": {"path": os.path.abspath(spec["js_path"])}}
     elif module == "yt_dlp" and spec.get("js_runtime") not in (None, "deno"):
         params["js_runtimes"] = {spec["js_runtime"]: {}}  # yt-dlp enables deno by itself
+    if module == "yt_dlp" and spec.get("signin"):
+        params["cookiesfrombrowser"] = (spec["signin"],)  # read as the engine object starts
     if spec["mode"] == "probe":
         probe(engine, module, params, spec)
     else:
         download(engine, module, params, spec)
+
+
+def unread(exc):
+    """The engine failed while loading the browser's sign-in: yt-dlp wraps any such failure (a store that is
+    missing, one it may not read, one it cannot copy or decrypt) in CookieLoadError, inside its DownloadError."""
+    seen = []
+    while exc is not None and exc not in seen:
+        if type(exc).__name__ == "CookieLoadError":
+            return True
+        seen.append(exc)
+        exc = (getattr(exc, "exc_info", None) or (None, None))[1] or exc.__cause__ or exc.__context__
+    return False
 
 
 def run():
@@ -714,6 +731,10 @@ def run():
         message, kind = str(exc) or type(exc).__name__, getattr(exc, "kind", None)
         if Log.no_js and any(p in message.lower() for p in NO_JS_FAILS):  # the real cause of what failed
             message, kind = "No supported JavaScript runtime could be found.\n" + message, "no_js"
+        # shortcut: a sign-in that could not be decrypted is taken as the cause of whatever failed after it; the
+        # sign-in is only used for a video that asked for one. Upgrade if it hides other causes in the logs
+        if kind is None and (unread(exc) or Log.undecrypted):
+            kind = "signin_unread"
         emit(event="error", message=message, **({"kind": kind} if kind else {}))
         sys.exit(1)
 
