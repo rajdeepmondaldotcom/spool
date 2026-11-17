@@ -1,5 +1,6 @@
 import http.client
 import json
+import re
 import socket
 import time
 from importlib import metadata
@@ -394,9 +395,10 @@ def test_every_open_stream_hears_that_spool_stopped_then_ends(app):
         conn.request("GET", "/api/events", headers={"Host": host(app), **TOKEN})
         reply = conn.getresponse()
         assert reply.status == 200
-        assert reply.readline().startswith(b"event: snapshot")
-        reply.readline(), reply.readline()
         streams.append(reply)
+    app.engines.on_change()  # a snapshot at the worst moment, as an engine update finishing sends one
     app.jobs.close()  # what Quit, Ctrl+C and a closed terminal all end in
     for reply in streams:
-        assert reply.read() == b"event: stopped\ndata: {}\n\n"  # then the stream ends
+        events = re.findall(rb"event: (\w+)\ndata: (.*)\n\n", reply.read())  # read() returns only once it ends
+        assert events[-1] == (b"stopped", b"{}")  # whatever came before, stopped is last
+        assert [name for name, _ in events].count(b"stopped") == 1

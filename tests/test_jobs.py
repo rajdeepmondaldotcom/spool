@@ -856,3 +856,34 @@ def test_different_videos_with_ids_still_run_two_at_once(app, events):
         entry = {"url": f"https://fake.test/slow/{n}?delay=0.3", "id": f"slow-{n}"}
         app.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})
     assert [j["state"] for j in app.jobs.snapshot()["jobs"]] == ["running", "running"]
+
+
+def test_the_watcher_sends_a_snapshot_only_when_the_folder_or_tools_change(tmp_path, monkeypatch):
+    import queue
+    import types
+
+    import spool.jobs
+    from spool.engines import Engines
+    from spool.jobs import Jobs
+
+    watched = []
+    clock = types.SimpleNamespace(
+        time=time.time,
+        monotonic=time.monotonic,
+        strftime=time.strftime,
+        sleep=lambda s: time.sleep(s) or (s == 1 and watched.append(s)),
+    )
+    monkeypatch.setattr(spool.jobs, "time", clock)
+    tools = {"ffmpeg": True, "js_runtime": "deno", "js_setup": None, "js_path": None, "platform": "x"}
+    jobs = Jobs(tmp_path, Engines(tmp_path / "engines"), tools=lambda: dict(tools))
+    try:
+        q = jobs.subscribe()
+        assert q.get(timeout=1)[0] == "snapshot"
+        until(lambda: len(watched) >= 3)  # two whole rounds with the page open
+        with pytest.raises(queue.Empty):
+            q.get_nowait()  # nothing changed, so nothing was sent
+        tools["ffmpeg"] = False  # the helper was uninstalled
+        event, snap = q.get(timeout=10)
+        assert (event, snap["tools"]["ffmpeg"]) == ("snapshot", False)
+    finally:
+        jobs.close()

@@ -331,8 +331,11 @@ def test_a_newer_spool_found_at_launch_reaches_the_page(tmp_path, monkeypatch):
     q.get(timeout=5)
     try:
         threading.Thread(target=launcher.releases, args=(jobs, tmp_path), daemon=True).start()
-        event, snap = q.get(timeout=5)
-        assert (event, snap["update"]) == ("snapshot", {"version": "0.2.1"})
+        while True:  # any other snapshot may come first; the one that matters must come
+            event, snap = q.get(timeout=5)
+            if event == "snapshot" and snap["update"]:
+                break
+        assert snap["update"] == {"version": "0.2.1"}
     finally:
         jobs.close()
 

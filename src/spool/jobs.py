@@ -69,6 +69,7 @@ class Jobs:
         self.dirty = set()
         self.subscribers = []
         self.closed = False
+        self.shown = None  # the folder and tools the last snapshot showed
         self.waits = WAITS
         self.pace, self.pace_from = PACE, PACE_FROM
         self.rest_until, self.resting = 0.0, False  # the queue pauses until rest_until; resting: a timer will pump
@@ -106,13 +107,15 @@ class Jobs:
         if dest is None or dest["path"] != self.settings["dest"]:  # the setting changed since dest was checked
             dest = self._check(self.settings["dest"], write=False)
         there = self._there() if there is None else there
+        tools = self.tools()
         with self.lock:  # a job finished since there was taken keeps the file_exists it finished with
             jobs = [dict(j, file_exists=there.get(j["path"], j["file_exists"])) for j in self.jobs]
+            self.shown = dict(dest, free_bytes=None), tools  # what the pages now know of the folder and tools
             return {
                 "settings": dict(self.settings),
                 "dest": dest_message(dest),
                 "engines": self.engines.status(),
-                "tools": {k: v for k, v in self.tools().items() if k != "js_path"},
+                "tools": {k: v for k, v in tools.items() if k != "js_path"},
                 "version": VERSION,
                 "update": self.newer and {"version": self.newer},
                 "jobs": jobs,
@@ -634,15 +637,12 @@ class Jobs:
 
     def _watch(self):
         """Destination and tools have no events, so poll them once a second, apart from progress: a check can hang."""
-        last = None  # checked first when a page opens: a write test is not free
         while not self.closed:
             time.sleep(1)
             if self.closed or not self.subscribers:
                 continue
-            now = self._machine()
-            if now != last:
+            if self._machine() != self.shown:  # against what the pages were last sent, not the last poll
                 self._snapshot_changed()
-            last = now
 
 
 MESSAGES = {  # kind -> (the sentence people read, hint). Every sentence the server sends; none names a program.
