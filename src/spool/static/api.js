@@ -76,8 +76,10 @@ export const updateEngine = (name) => call("POST", `/api/engines/${name}/update`
 // server-sent-events format ourselves: "event:" and "data:" lines, a blank line ends each event,
 // lines starting with ":" are pings. A dropped, refused or silent stream is retried every two seconds.
 // A browser allows six connections to one host, so the tabs share one stream: the tab holding the lock reads it
-// and passes every event to the others; when that tab closes, another takes the lock.
+// and passes every event to the others; when that tab closes, another takes the lock. A tab the browser suspends keeps
+// the lock: one that hears nothing from it asks, and if no answer comes, takes the stream over.
 const STALL_MS = 40000; // the server pings every 15 seconds; silence this long means it is suspended or gone
+const ASK_MS = 5000; // the tab holding the stream answers at once, even while Spool is down; silence means it is suspended
 let reopen = () => {};
 // A fresh snapshot (the server sends one on every connect), e.g. when the tab is seen again.
 export const refresh = () => reopen();
@@ -99,12 +101,29 @@ export function listen({ snapshot, job, removed, connected, stopped }) {
     if (event === "stopped") { ended = true; stream?.abort(); }
     handlers[event]?.(data);
   };
-  const emit = (m) => { deliver(m); channel.postMessage(m); };
+  // leading: when this tab took the stream, 0 while it follows. Each message names the newest lead its sender knows,
+  // so one from a tab that lost the stream while it was suspended is ignored.
+  let leading = 0, newest = 0, stream, again = false, refused = false, watch;
+  const post = (m) => channel.postMessage({ ...m, from: leading || newest });
+  const emit = (m) => { deliver(m); post(m); };
   announce = () => emit({ event: "stopped", data: {} });
-  let leading = false, stream, again = false, refused = false;
-  channel.onmessage = ({ data }) => (data.event === "refresh" ? leading && reopen() : deliver(data));
-  reopen = () => channel.postMessage({ event: "refresh" });
-  reopen(); // a tab that joins asks for a snapshot
+  const name = `spool-events-${token}`;
+  const take = (options = {}) => navigator.locks.request(name, options, lead).catch(() => down(!options.steal));
+  // A tab that follows asks for a snapshot and waits for the answer; one that hears nothing for long asks again.
+  const ask = () => {
+    if (ended || leading) return;
+    post({ event: "refresh" });
+    clearTimeout(watch);
+    watch = setTimeout(() => take({ steal: true }), ASK_MS);
+  };
+  channel.onmessage = ({ data }) => {
+    if (data.event === "refresh") return leading && (post({ event: "ping" }), reopen());
+    if (data.from < newest) return;
+    newest = data.from;
+    if (!leading) { clearTimeout(watch); watch = setTimeout(ask, STALL_MS); }
+    deliver(data);
+  };
+  reopen = ask;
 
   const dispatch = (block) => {
     let event = "message";
@@ -114,9 +133,10 @@ export function listen({ snapshot, job, removed, connected, stopped }) {
       else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
     }
     if (data.length && handlers[event]) emit({ event, data: JSON.parse(data.join("\n")) });
+    else post({ event: "ping" }); // a sign of life for the tabs that follow
   };
-  const open = async () => {
-    if (ended) return;
+  const open = async (run) => {
+    if (ended || run !== leading) return;
     stream = new AbortController();
     let timer;
     const quiet = () => { clearTimeout(timer); timer = setTimeout(() => stream.abort(), STALL_MS); };
@@ -140,18 +160,26 @@ export function listen({ snapshot, job, removed, connected, stopped }) {
       }
     } catch { /* the server went away, went quiet, or we asked for a fresh stream; fall through */ }
     clearTimeout(timer);
-    if (ended) return;
-    if (again) { again = false; return open(); }
+    if (ended || run !== leading) return; // stepped down: the tab that took over reads the stream now
+    if (again) { again = false; return open(run); }
     emit({ event: "connected", data: false });
-    setTimeout(open, 2000);
+    setTimeout(() => open(run), 2000);
   };
   const lead = () => {
-    leading = true;
+    clearTimeout(watch);
+    leading = newest = Math.max(Date.now(), newest + 1);
     // a tab that joins after the token was refused has to hear it too: the stream is not coming back
     reopen = () => { if (refused) return emit({ event: "unauthorized" }); again = true; stream?.abort(); };
-    open();
-    return new Promise(() => {}); // held until this tab closes
+    open(leading);
+    return new Promise(() => {}); // held until this tab closes, or another takes it
   };
-  if (shared) navigator.locks.request(`spool-events-${token}`, lead);
-  else lead();
+  // The lock was taken while this tab was suspended: it follows again, and asks for the events it missed.
+  const down = (requeue) => {
+    leading = 0;
+    stream?.abort();
+    reopen = ask;
+    if (requeue) take(); // one that took the lock by force is still in line from before
+    ask();
+  };
+  if (shared) { ask(); take(); } else lead();
 }
