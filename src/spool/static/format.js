@@ -31,6 +31,7 @@ export function presetName(id) {
   if (id === "best") return "Best";
   if (id === "audio") return "Audio";
   if (id === "mp3") return "MP3";
+  if (id === "compatible") return "Plays everywhere";
   return `${id}p`;
 }
 
@@ -41,7 +42,7 @@ export function stageWords(job) {
   if (job.stage === "waiting") return job.note || ""; // the server's sentence for what happened
   if (job.stage === "processing") return STEPS[job.what] || (job.preset === "mp3" ? "Converting to MP3" : job.part > 1 ? "Joining video and audio" : "Finishing");
   if (job.stage === "downloading") return job.what === "audio" || AUDIO.has(job.preset) ? "Downloading audio" : "Downloading video";
-  return "Starting";
+  return job.note || "Starting"; // the server's sentence for what it does first, such as getting a newer engine
 }
 
 // How far the processing step is, as a whole number; null unless the server names the step and its size (an older
@@ -57,25 +58,26 @@ export const folderName = (path = "") => path.split(/[\\/]/).filter(Boolean).pop
 const FFMPEG = { darwin: "brew install ffmpeg", linux: "sudo apt install ffmpeg", win32: "winget install ffmpeg" };
 export const ffmpegCommand = (platform) => FFMPEG[platform] || FFMPEG.linux;
 
-// The quality to select for a video: the remembered one, else the nearest lower class (Best counts as its own
-// class, which the server leaves out of the list), else Best. A video with no Best (no helper, and no stream with
+// The quality to select for a video: the remembered one, else the nearest lower class (Best and Plays everywhere
+// count as their own class, which the server leaves out of the list), else Best. A video with no Best (no helper, and no stream with
 // both picture and sound) gets the first quality it does offer.
 export function pick(presets, remembered) {
   const offered = (id) => presets.some((p) => p.id === id);
   if (offered(remembered)) return remembered;
   const fallback = offered("best") ? "best" : presets[0]?.id;
   if (!/^\d+$/.test(remembered)) return fallback;
-  const height = (p) => parseInt(p.id === "best" ? p.detail : p.id, 10);
+  const height = (p) => parseInt(["best", "compatible"].includes(p.id) ? p.detail : p.id, 10);
   const lower = presets.filter((p) => height(p) < +remembered).sort((a, b) => height(b) - height(a));
   return lower[0]?.id || fallback;
 }
 
-// At most four tiles up front (Best, two classes below it, Audio); the rest go under "More qualities".
+// At most four tiles up front (Best, two classes below it, Audio; Plays everywhere takes one class's place); the rest go under "More qualities".
 export function split(presets) {
   const classes = presets.filter((p) => /^\d+$/.test(p.id));
   const usual = (p) => p.id === "1080" || p.id === "720";
-  const two = [...classes.filter(usual), ...classes.filter((p) => !usual(p))].slice(0, 2);
-  const shown = presets.filter((p) => p.id === "best" || p.id === "audio" || two.includes(p));
+  const fixed = (p) => ["best", "compatible", "audio"].includes(p.id);
+  const two = [...classes.filter(usual), ...classes.filter((p) => !usual(p))].slice(0, presets.some((p) => p.id === "compatible") ? 1 : 2);
+  const shown = presets.filter((p) => fixed(p) || two.includes(p));
   return [shown, presets.filter((p) => !shown.includes(p))];
 }
 
