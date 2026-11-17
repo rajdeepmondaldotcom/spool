@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -710,3 +711,71 @@ def test_a_lookup_makes_one_engine_object():
     events = run("probe", TUBE)
     assert last(events)["event"] == "info"
     assert len(logged(events, "[fake] a new engine object")) == 1
+
+
+# The id before any file, and the queue's go
+
+
+def started(spec, engine="yt-dlp"):
+    """A worker whose stdin stays open after the spec, as the queue's does; killed if it outlives the test."""
+    spec = {"engine": engine, "engine_path": str(FAKE), "mode": "download", "ffmpeg": True, "preset": "best", **spec}
+    proc = subprocess.Popen(
+        [sys.executable, "-I", str(WORKER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    guard = threading.Timer(60, proc.kill)  # our own child: a worker that waits forever fails the test, not the run
+    guard.daemon = True
+    guard.start()
+    proc.stdin.write(json.dumps(spec) + "\n")
+    proc.stdin.flush()
+    return proc
+
+
+def until(proc, event):
+    """The worker's events up to and including the first of this kind."""
+    seen = []
+    for line in proc.stdout:
+        seen.append(json.loads(line))
+        if seen[-1]["event"] == event:
+            return seen
+    raise AssertionError(f"no {event} event: {seen[-3:]}")
+
+
+def test_without_hold_the_worker_never_reads_stdin_again(tmp_path):
+    proc = started({"url": "https://fake.test/video?delay=0", "dest": str(tmp_path)})
+    events = until(proc, "done")  # stdin is open and silent
+    kinds = [e["event"] for e in events]
+    assert kinds.count("id") == 1 and kinds.index("id") < kinds.index("file")
+    assert next(e for e in events if e["event"] == "id")["id"] == "vid-1"
+    proc.stdin.close()
+    proc.wait()
+
+
+@pytest.mark.parametrize("engine", ["yt-dlp", "youtube-dl"])
+def test_a_held_worker_tells_the_id_before_writing_and_goes_on_at_go(tmp_path, engine):
+    proc = started({"url": "https://fake.test/video?delay=0", "dest": str(tmp_path), "hold": True}, engine)
+    assert until(proc, "id")[-1]["id"] == "vid-1"
+    assert list(tmp_path.iterdir()) == []  # held: nothing is written until the go
+    proc.stdin.write("go\n")
+    proc.stdin.close()
+    assert last(until(proc, "done"))["event"] == "done"
+    proc.wait()
+
+
+@pytest.mark.parametrize("engine", ["yt-dlp", "youtube-dl"])
+def test_a_held_worker_stops_at_the_end_of_input_without_writing(tmp_path, engine):
+    proc = started({"url": "https://fake.test/video?delay=0", "dest": str(tmp_path), "hold": True}, engine)
+    until(proc, "id")
+    proc.stdin.close()
+    rest = [json.loads(line)["event"] for line in proc.stdout]
+    proc.wait()
+    assert "done" not in rest and "file" not in rest
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("engine", ["yt-dlp", "youtube-dl"])
+def test_an_item_of_a_list_tells_that_entrys_id(tmp_path, engine):
+    events = run(
+        "download", "https://fake.test/shared-playlist?delay=0", engine, dest=str(tmp_path), preset="best", item=2
+    )
+    assert last(events)["event"] == "done", last(events)
+    assert [e["id"] for e in events if e["event"] == "id"] == ["shared-2"]
