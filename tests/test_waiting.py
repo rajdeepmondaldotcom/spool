@@ -212,40 +212,56 @@ def test_a_site_limiting_the_connection_fails_at_once_with_a_way_to_try_by_hand(
 # Pacing a long list
 
 
-def starts_and_ends(events, ids):
-    """(time, "start" | "end", id) for each job, until all have finished."""
-    seen, ended = [], set()
+def starts_and_ends(app, monkeypatch):
+    """(time, "start" | "end", id, queued) for each run of a job, recorded in the queue itself: a run starts when its
+    thread does and ends when its thread is done, with how many jobs were left queued. The event stream would
+    not do: a job's details can send it again while it is still "starting"."""
+    seen, run = [], app.jobs._run
 
-    def note(e, d):
-        if e == "job" and d["id"] in ids:
-            if d["state"] == "running" and d["stage"] == "starting":
-                seen.append((time.monotonic(), "start", d["id"]))
-            elif d["state"] in ("done", "failed") and d["id"] not in ended:
-                ended.add(d["id"])
-                seen.append((time.monotonic(), "end", d["id"]))
-        return len(ended) == len(ids)
+    def recorded(job):
+        seen.append((time.monotonic(), "start", job["id"], None))
+        try:
+            run(job)
+        finally:
+            with app.jobs.lock:
+                queued = sum(j["state"] == "queued" for j in app.jobs.jobs)
+            seen.append((time.monotonic(), "end", job["id"], queued))
 
-    events.until(note, timeout=30)
+    monkeypatch.setattr(app.jobs, "_run", recorded)
     return seen
 
 
-def test_with_many_waiting_the_next_starts_a_few_seconds_after_one_finishes(app, events):
+def test_with_many_waiting_the_next_starts_a_few_seconds_after_one_finishes(app, events, monkeypatch):
     app.jobs.pace = 1.0
     app.jobs.pace_from = 3  # queued jobs at which the pause begins
-    ids = {add(app, f"https://fake.test/video/{n}?delay=0") for n in range(6)}
-    seen = starts_and_ends(events, ids)
-    starts = [t for t, what, _ in seen if what == "start"]
-    assert len(starts) == 6
-    for began in starts[2:4]:  # 4, then 3 were still queued when these began
-        last_end = max(t for t, what, _ in seen if what == "end" and t < began)
-        assert began - last_end >= 0.9
+    seen = starts_and_ends(app, monkeypatch)
+    ids = [add(app, f"https://fake.test/video/{n}?delay=0", id=f"vid-{n}") for n in range(6)]
+    end = time.time() + 60
+    while sum(what == "end" for _, what, _, _ in seen) < 6:
+        assert time.time() < end
+        time.sleep(0.05)
+    starts = [(t, i) for t, what, i, _ in seen if what == "start"]
+    assert sorted(i for _, i in starts) == sorted(ids)  # each job started once
+    paced = 0
+    for began, _ in starts:
+        before = [(t, queued) for t, what, _, queued in seen if what == "end" and t < began]
+        if before and before[-1][1] >= app.jobs.pace_from:  # the last finish left a long list: it rests first
+            assert began - before[-1][0] >= 0.9
+            paced += 1
+    assert paced >= 2
 
 
 def test_a_handful_of_downloads_is_not_slowed(app, events):
     app.jobs.pace = 30
     began = time.monotonic()
-    ids = {add(app, f"https://fake.test/video/{n}?delay=0") for n in range(4)}
-    starts_and_ends(events, ids)
+    ids = [add(app, f"https://fake.test/video/{n}?delay=0", id=f"vid-{n}") for n in range(4)]
+    ended = set()
+    events.until(
+        lambda e, d: (
+            e == "job" and d["id"] in ids and d["state"] == "done" and not ended.add(d["id"]) and len(ended) == 4
+        ),
+        timeout=30,
+    )
     assert time.monotonic() - began < 15
 
 
