@@ -9,7 +9,7 @@ import time
 import pytest
 import serve_fake  # on the path through conftest
 from playwright.sync_api import expect
-from support import Held, until
+from support import Client, Held, until
 
 VIDEO = "https://fake.test/video"
 
@@ -1588,36 +1588,24 @@ def test_two_videos_added_from_the_page_download_at_the_same_time(app, spool):
     expect(group(app, "Downloading").get_by_role("progressbar")).to_have_count(2)
 
 
-# Spool 0.3.0. The server these tests run is still 0.2's, so each test puts in place what 0.3's sends.
+# Spool 0.3.0
 
 
-def plays_everywhere(route):
-    """The details as 0.3 answers them for a video with H.264 and AAC at 720p: Plays everywhere second, after Best,
-    and the 720p class it stands in for left out."""
-    response = route.fetch()
-    body = response.json()
-    presets = body["entries"][0]["presets"]
-    same = next(p for p in presets if p["id"] == "720")
-    presets.remove(same)
-    presets.insert(1, {**same, "id": "compatible", "label": "Plays everywhere", "detail": "720p", "ext": "mp4"})
-    route.fulfill(response=response, json=body)
+TALL = "https://fake.test/h264-tall"  # Best is VP9 at 2160p; the largest H.264 with AAC is 1440p
 
 
-def default_quality(spool, preset):
-    """This 0.2 server refuses Plays everywhere as the default, so it is set straight in its settings."""
-    jobs = spool[1]
-    with jobs.lock:
-        jobs.settings["preset"] = preset
-    jobs._snapshot_changed()
+def save_settings(spool, changes):
+    """Through the settings route, as the page saves them, so the queue's own checks run."""
+    status, body = Client(spool[0].split("/#")[0]).json("PUT", "/api/settings", changes)
+    assert status == 200, body
 
 
 def test_plays_everywhere_is_a_quality_like_the_others(app):
-    app.route("**/api/probe", plays_everywhere)
-    look_up(app, VIDEO)
-    quality = tray(app, "Fake video 1").get_by_role("group", name="Quality")
+    look_up(app, TALL)
+    quality = tray(app, "Fake tall video").get_by_role("group", name="Quality")
     radios = quality.get_by_role("radio")
-    expect(radios).to_have_count(4)  # Best, Plays everywhere, 1080p's place taken, Audio
-    expect(radios.nth(1)).to_have_accessible_name(re.compile(r"^Plays everywhere 720p \d+(\.\d)? (KB|MB|GB) MP4$"))
+    expect(radios).to_have_count(4)  # Best, Plays everywhere, 1080p, Audio: it takes one class's place
+    expect(radios.nth(1)).to_have_accessible_name(re.compile(r"^Plays everywhere 1440p \d+(\.\d)? (KB|MB|GB) MP4$"))
     radios.nth(1).check()
     with app.expect_request("**/api/jobs") as sent:
         app.keyboard.press("ControlOrMeta+Enter")
@@ -1627,9 +1615,8 @@ def test_plays_everywhere_is_a_quality_like_the_others(app):
 @pytest.mark.parametrize("width", [375, 320])
 def test_the_plays_everywhere_tile_fits_a_phone(app, width):
     app.set_viewport_size({"width": width, "height": 800})
-    app.route("**/api/probe", plays_everywhere)
-    look_up(app, VIDEO)
-    tile = tray(app, "Fake video 1").locator(".tile").filter(has_text="Plays everywhere")
+    look_up(app, TALL)
+    tile = tray(app, "Fake tall video").locator(".tile").filter(has_text="Plays everywhere")
     tile.get_by_role("radio").check()
     fits = tile.evaluate(
         """t => { const words = document.createRange(), r = t.getBoundingClientRect();
@@ -1644,22 +1631,26 @@ def test_the_plays_everywhere_tile_fits_a_phone(app, width):
 
 
 def test_plays_everywhere_as_the_default_is_selected_or_falls_back_to_best(app, spool):
-    default_quality(spool, "compatible")
+    save_settings(spool, {"preset": "compatible"})
     expect(app.get_by_text(re.compile(r"(Cmd|Ctrl)\+Enter downloads at Plays everywhere\."))).to_be_visible()
-    look_up(app, VIDEO)  # a video that does not offer it
+    look_up(app, VIDEO)  # Best is already H.264 and AAC here, so it is not offered
     expect(tray(app, "Fake video 1").get_by_role("radio", name=re.compile("^Best"))).to_be_checked()
     app.keyboard.press("Escape")
-    app.route("**/api/probe", plays_everywhere)
-    look_up(app, VIDEO)
-    expect(tray(app, "Fake video 1").get_by_role("radio", name=re.compile("^Plays everywhere"))).to_be_checked()
+    look_up(app, TALL)
+    expect(tray(app, "Fake tall video").get_by_role("radio", name=re.compile("^Plays everywhere"))).to_be_checked()
 
 
-def test_a_starting_download_says_what_spool_does_first(app, spool):
-    add(spool, [("https://fake.test/slow?delay=60", "Fake slow video")])
-    processing(spool, "Fake slow video", stage="starting", note="Getting a newer engine.")
-    row = group(app, "Downloading").get_by_role("listitem")
-    expect(row.locator(".meta")).to_have_text("Getting a newer engine.")
-    assert_no_program_names(app, "getting a newer engine")
+def test_a_starting_download_says_what_spool_does_first(app, spool, monkeypatch):
+    looking = threading.Event()  # the look for a newer engine is held until the test has seen it
+    monkeypatch.setattr(spool[1].engines, "newer", lambda name: looking.wait(30) and False)
+    try:
+        add(spool, [("https://fake.test/403", "Fake refused video")])
+        row = group(app, "Downloading").get_by_role("listitem")
+        expect(row.locator(".meta")).to_have_text("Getting a newer engine.", timeout=15000)
+        assert_no_program_names(app, "getting a newer engine")
+    finally:
+        looking.set()
+    expect(group(app, "Stopped").get_by_text("The site refused the download.")).to_be_visible(timeout=15000)
 
 
 BROWSERS = ["Off", "Brave", "Chrome", "Chromium", "Edge", "Firefox", "Opera", "Safari", "Vivaldi", "Whale"]
@@ -1667,30 +1658,23 @@ SIGNIN_HELP = (
     "For private and age-restricted videos. Spool reads the sign-in the browser you pick already has, and uses it "
     "only for videos that ask for one. A site may limit an account used this way."
 )
+HOMES = ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME")  # where an engine looks for a browser
 
 
-def with_signin(spool, monkeypatch, browser=None):
-    """The sign-in setting as 0.3 keeps it, on this 0.2 server: saved with the others and sent in the snapshot."""
-    jobs = spool[1]
-    plain = jobs.update_settings
-
-    def update(changes):
-        changes = dict(changes)
-        if "signin" in changes:
-            with jobs.lock:
-                jobs.settings["signin"] = changes.pop("signin")
-        return plain(changes)
-
-    monkeypatch.setattr(jobs, "update_settings", update)
-    update({"signin": browser})
+@pytest.fixture
+def own_home(monkeypatch, tmp_path):
+    """Every worker these tests start looks for a browser's sign-in in an empty folder, never this machine's."""
+    home = tmp_path / "home"
+    home.mkdir()
+    for name in HOMES:
+        monkeypatch.setenv(name, str(home))
 
 
 def sign_in_choice(page):
     return page.get_by_role("dialog", name="Settings").get_by_role("group", name="Sign in with")
 
 
-def test_settings_offer_signing_in_with_a_browser_off_by_default(app, spool, monkeypatch):
-    with_signin(spool, monkeypatch)
+def test_settings_offer_signing_in_with_a_browser_off_by_default(app, spool):
     app.get_by_role("button", name="Settings", exact=True).click()
     choice = sign_in_choice(app)
     expect(choice).to_have_accessible_description(SIGNIN_HELP)
@@ -1706,17 +1690,19 @@ def test_settings_offer_signing_in_with_a_browser_off_by_default(app, spool, mon
         app.keyboard.press("ArrowRight")  # the keyboard moves through the browsers, as through the qualities
     assert saved.value.post_data_json == {"signin": "opera"}
     expect(choice.get_by_role("radio", name="Opera")).to_be_checked()
+    until(lambda: spool[1].snapshot()["settings"]["signin"] == "opera")
     with app.expect_request("**/api/settings") as saved:
         choice.get_by_role("radio", name="Off").check()
     assert saved.value.post_data_json == {"signin": None}
+    until(lambda: spool[1].snapshot()["settings"]["signin"] is None)
 
 
-def test_a_sign_in_choice_the_server_refuses_says_why_and_stays_as_it_was(app, spool, monkeypatch):
-    with_signin(spool, monkeypatch)
+def test_a_sign_in_choice_the_server_refuses_says_why_and_stays_as_it_was(app, spool):
+    # A mocked refusal: the real server accepts every browser the page offers.
     app.route(
         "**/api/settings",
         lambda route: route.fulfill(
-            status=422, json={"error": {"kind": "invalid_setting", "message": "The server's words.", "hint": None}}
+            status=422, json={"error": {"kind": "invalid_signin", "message": "The server's words.", "hint": None}}
         ),
     )
     app.get_by_role("button", name="Settings", exact=True).click()
@@ -1726,27 +1712,21 @@ def test_a_sign_in_choice_the_server_refuses_says_why_and_stays_as_it_was(app, s
     expect(choice.get_by_role("radio", name="Off")).to_be_checked()
 
 
-def test_a_download_that_needs_a_sign_in_opens_settings_at_the_choice(app, spool, monkeypatch):
-    with_signin(spool, monkeypatch)
-    add(spool, [("https://fake.test/unsupported", "Fake private video")])
-    job = server_job(spool, "Fake private video", "failed")
-    jobs = spool[1]
-    with jobs.lock:  # failed as 0.3 fails it when no browser is chosen
-        job = next(j for j in jobs.jobs if j["id"] == job["id"])
-        job["error"] = {"kind": "signin", "message": "The server's words for signin.", "hint": "signin"}
-        jobs._changed(job)
+def test_a_download_that_needs_a_sign_in_opens_settings_at_the_choice(app, spool, own_home):
+    add(spool, [("https://fake.test/age?delay=0", "Fake age-checked video")])
     stopped = group(app, "Stopped")
-    expect(stopped.get_by_text("The server's words for signin.")).to_be_visible()
+    expect(stopped.get_by_text("This video needs a signed-in account. Choose your browser in Settings.")).to_be_visible(
+        timeout=15000
+    )
     expect(stopped.get_by_role("button", name="Try again")).to_have_class("fill")  # once a browser is chosen
     stopped.get_by_role("button", name="Choose a browser").click()
     expect(sign_in_choice(app).get_by_role("radio", name="Off")).to_be_focused()
 
 
-def test_details_that_need_a_sign_in_open_settings_at_the_browser_chosen(app, spool, monkeypatch):
-    with_signin(spool, monkeypatch, "firefox")
-    probe_answers(app, "signin_unread", "signin")
-    look_up(app, VIDEO)
-    error = app.get_by_role("alert").filter(has_text="The server's words for signin_unread.")
+def test_details_whose_sign_in_cannot_be_read_open_settings_at_the_browser_chosen(app, spool, own_home):
+    save_settings(spool, {"signin": "firefox"})  # its made-up store is missing from the empty home
+    look_up(app, "https://fake.test/age")
+    error = app.get_by_role("alert").filter(has_text="Spool couldn't read the sign-in from Firefox.")
     expect(error.get_by_role("button")).to_have_text("Choose a browser")
     error.get_by_role("button").click()
     expect(sign_in_choice(app).get_by_role("radio", name="Firefox")).to_be_focused()
