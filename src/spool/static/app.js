@@ -28,6 +28,9 @@ const local = {
 };
 const canNotify = () => "Notification" in window;
 const notifying = () => canNotify() && Notification.permission === "granted" && local.get("spool-notify") === "on";
+// A thumbnail that fails to load becomes a clear picture over the plain block, not the browser's broken-image icon.
+const BLANK = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+const blank = (e) => { e.target.src = BLANK; };
 const UNDO_MS = 5000, FLASH_MS = 2000, SHOWN = 10;
 const BROWSERS = { brave: "Brave", chrome: "Chrome", chromium: "Chromium", edge: "Edge", firefox: "Firefox", opera: "Opera", safari: "Safari", vivaldi: "Vivaldi", whale: "Whale" };
 
@@ -489,7 +492,7 @@ function Tray({ data, preset, setPreset, picked, setPicked, dest, busy, error, d
     <section class="tray" aria-labelledby="tray-title" ref=${trayRef}>
       <form onSubmit=${(e) => { e.preventDefault(); download(); }} novalidate>
         <div class="tray-head">
-          ${!playlist && first.thumbnail && html`<img class="thumb" src=${first.thumbnail} alt="" width="160" height="90" />`}
+          ${!playlist && first.thumbnail && html`<img class="thumb" src=${first.thumbnail} alt="" width="160" height="90" onError=${blank} />`}
           <div class="tray-title">
             <h2 id="tray-title" class="clamp" dir="auto" title=${data.title}>${data.title}</h2>
             <p class="dim">
@@ -673,7 +676,7 @@ function Row({ job, flash, snap, say, whenUpdated, openSettings, connected, take
     };
     return html`
       <li class="${cls} done" data-job=${job.id}>
-        ${job.thumbnail ? html`<img class="thumb small" src=${job.thumbnail} alt="" width="64" height="36" loading="lazy" />` : html`<div class="thumb small" />`}
+        ${job.thumbnail ? html`<img class="thumb small" src=${job.thumbnail} alt="" width="64" height="36" loading="lazy" onError=${blank} />` : html`<div class="thumb small" />`}
         <div class="body">
           ${title}
           <p class="meta dim"><span>${f.presetName(job.preset)}</span><span class="num">${f.bytes(job.size)}</span>
