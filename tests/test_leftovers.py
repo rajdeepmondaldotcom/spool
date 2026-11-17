@@ -56,15 +56,84 @@ def test_removing_a_cancelled_twin_after_the_finished_one_keeps_the_file(app, ev
     assert names(app.dest) == [os.path.basename(done["path"])]
 
 
-def test_remove_keeps_the_partial_file_a_running_twin_is_writing(app, events):
-    first = add(app, "https://fake.test/slow?delay=0.1")
-    wait_for(events, first, lambda d: d["stage"] == "downloading")
+HELD = """
+import json, os, pathlib, sys, time
+spec = json.loads(sys.stdin.read())
+here = pathlib.Path(sys.argv[0]).parent
+name = os.path.join(spec["dest"], "Same video [v].mp4")
+print(json.dumps({"event": "file", "path": name}), flush=True)
+with open(name + ".part", "ab") as f:
+    f.write(b"x" * 100)
+print(json.dumps({"event": "progress", "status": "downloading", "part": 1, "downloaded": 100, "total": 300,
+                  "speed": None, "eta": None, "progress": None, "what": "video"}), flush=True)
+end = time.time() + 30
+while not (here / "go").exists() and time.time() < end:  # held mid-file until the test says go
+    time.sleep(0.02)
+with open(name + ".part", "ab") as f:
+    f.write(b"x" * 100)
+os.replace(name + ".part", name)
+print(json.dumps({"event": "done", "path": name, "size": os.path.getsize(name)}), flush=True)
+"""
+
+
+def until(test, timeout=20):
+    end = time.time() + timeout
+    while not test():
+        assert time.time() < end
+        time.sleep(0.02)
+
+
+def held_worker(monkeypatch, tmp_path):
+    import spool.jobs
+
+    worker = tmp_path / "held" / "worker.py"
+    worker.parent.mkdir()
+    worker.write_text(HELD, encoding="utf-8")
+    monkeypatch.setattr(spool.jobs, "WORKER", worker)
+    return worker.with_name("go")
+
+
+def job(app, job_id):
+    return next(j for j in app.jobs.snapshot()["jobs"] if j["id"] == job_id)
+
+
+def test_a_twin_waits_its_turn_and_removing_it_spares_the_file_the_running_one_writes(app, monkeypatch, tmp_path):
+    go = held_worker(monkeypatch, tmp_path)
+    part = app.dest / "Same video [v].mp4.part"
+    entry = {"url": "https://fake.test/a", "id": "v"}
+    twin = app.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})[1]["jobs"][0]["id"]
+    until(lambda: job(app, twin)["downloaded"] == 100)  # the twin wrote its first bytes, and is held
+    app.json("POST", f"/api/jobs/{twin}/cancel")
+    until(lambda: twin not in app.jobs.procs)  # its worker is gone
+    other = {"url": "https://fake.test/b", "id": "v"}  # the same video under another link
+    first = app.json("POST", "/api/jobs", {"entries": [other], "preset": "best"})[1]["jobs"][0]["id"]
+    until(lambda: job(app, first)["downloaded"] == 100 and part.stat().st_size == 200)  # held, resuming the file
+    assert app.json("POST", f"/api/jobs/{twin}/retry")[0] == 200
+    assert job(app, twin)["state"] == "queued"  # a free slot, and it waits for the video's other job
+    assert app.json("POST", f"/api/jobs/{twin}/cancel")[1]["state"] == "cancelled"
+    assert app.request("DELETE", f"/api/jobs/{twin}")[0] == 204
+    assert part.stat().st_size == 200  # the file the running job writes is still there, untouched
+    go.touch()
+    until(lambda: job(app, first)["state"] == "done")
+    assert job(app, first)["size"] == 300
+
+
+def test_a_twin_waits_while_a_cancelled_jobs_worker_is_still_dying(app, monkeypatch, tmp_path):
+    from spool import system
+
+    go = held_worker(monkeypatch, tmp_path)
+    dying = []
+    monkeypatch.setattr(system, "kill_soon", dying.append)  # the worker outlives its cancel until we stop it
+    entry = {"url": "https://fake.test/a", "id": "v"}
+    first = app.json("POST", "/api/jobs", {"entries": [entry], "preset": "best"})[1]["jobs"][0]["id"]
+    until(lambda: job(app, first)["downloaded"] == 100)
     app.json("POST", f"/api/jobs/{first}/cancel")
-    second = add(app, "https://fake.test/slow?delay=0.1")
-    wait_for(events, second, lambda d: d["stage"] == "downloading")
-    assert app.request("DELETE", f"/api/jobs/{first}")[0] == 204
-    assert names(app.dest) == ["Fake slow video [slow-1].mp4.part"]
-    assert wait_for(events, second, lambda d: d["state"] == "done")["size"] == 4_000_000
+    twin = app.json("POST", "/api/jobs", {"entries": [dict(entry, url="https://fake.test/b")], "preset": "best"})
+    twin = twin[1]["jobs"][0]["id"]
+    assert job(app, twin)["state"] == "queued"  # the cancelled job's worker may still write the file
+    system.kill(dying[0])  # our own child, started by this test's Spool
+    go.touch()
+    until(lambda: job(app, twin)["state"] == "done")
 
 
 def test_remove_cleans_the_partial_file_after_a_restart(tmp_path):

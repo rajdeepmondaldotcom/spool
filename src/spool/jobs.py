@@ -246,7 +246,8 @@ class Jobs:
             self._publish("job_removed", {"id": job_id})
             self._save()
             keep = {job["path"]} | {j["path"] for j in self.jobs}
-            keep |= {f for j in self.jobs if j["state"] in ("queued", "running") for f in j["files"]}
+            going = [f for j in self.jobs if j["state"] in ("queued", "running") for f in j["files"]]
+            keep |= {f + end for f in going for end in ("", ".part", ".ytdl")}  # the engine writes beside each name
         (self.logs / f"{job_id}.log").unlink(missing_ok=True)
         remove_leftovers(job, keep)
 
@@ -433,7 +434,7 @@ class Jobs:
                 j
                 for j in self.jobs
                 if j is not job
-                and j["state"] == "running"
+                and (j["state"] == "running" or j["id"] in self.procs)  # a cancelled job's worker may still write
                 and j["dest"] == job["dest"]
                 and not (job["entry_id"] and j["entry_id"] and j["entry_id"] != job["entry_id"])
             ),
