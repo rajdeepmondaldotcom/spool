@@ -560,6 +560,8 @@ class Jobs:
                 return False
             job.update(stage="starting", note=LOOKING, speed=None, eta=None)
             self._changed(job)
+        # shortcut: a cancel shows at once but the slot stays taken until the look ends (minutes if the release page
+        # hangs); when that matters, run the look on its own thread and wait on self.wake
         found = self.engines.newer(job["engine"])  # it may take seconds: never under the lock
         with self.lock:
             if self.closed or job["state"] != "running":
