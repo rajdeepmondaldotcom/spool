@@ -20,7 +20,11 @@ CASES = [
     ("presetName", ["1080"], "1080p"),
     ("presetName", ["compatible"], "Plays everywhere"),
     ("stageWords", [{"stage": "starting", "preset": "best"}], "Starting"),
-    ("stageWords", [{"stage": "starting", "note": "Getting a newer engine.", "preset": "best"}], "Getting a newer engine."),
+    (
+        "stageWords",
+        [{"stage": "starting", "note": "Getting a newer engine.", "preset": "best"}],
+        "Getting a newer engine.",
+    ),
     ("stageWords", [{"stage": "downloading", "part": 1, "what": "video", "preset": "best"}], "Downloading video"),
     ("stageWords", [{"stage": "downloading", "part": 2, "what": "audio", "preset": "best"}], "Downloading audio"),
     ("stageWords", [{"stage": "downloading", "part": 1, "what": None, "preset": "audio"}], "Downloading audio"),
