@@ -1,8 +1,10 @@
 """Worker: a child process that runs one engine call and reports JSON lines on stdout.
 
-Spec on stdin: {engine, engine_path, mode: "probe" | "download", url, ffmpeg, js_runtime?, dest?, preset?, item?}.
-Events: {"event": "log" | "progress" | "meta" | "file" | "info" | "done" | "error", ...}; an error carries "kind"
-("live", "no_js" or "playlist") when the worker knows it. A progress event's status is the engine's ("downloading",
+Spec on stdin, one line: {engine, engine_path, mode: "probe" | "download", url, ffmpeg, js_runtime?, dest?, preset?,
+item?, hold?, signin?}. signin: the browser yt-dlp reads the sign-in from. A download first tells the video's id, before it writes any file; with hold it then reads one more line
+and goes on only at "go".
+Events: {"event": "log" | "progress" | "meta" | "id" | "file" | "info" | "done" | "error", ...}; an error carries "kind"
+("live", "no_js", "playlist" or "signin_unread") when the worker knows it. A progress event's status is the engine's ("downloading",
 "finished"), or "processing" for how far a join, tags or MP3 step has written its file. An info event of a list
 carries "truncated": a channel has more videos than it lists. Each preset carries "ext", the type of file it saves.
 Standard library only; run with python -I.
@@ -20,6 +22,7 @@ OUT = sys.stdout
 OUT_LOCK = threading.Lock()  # a step's progress is reported from a thread of its own
 LIVE = "This is live now."  # jobs.py maps these words to the error kind "live"
 NO_JS_FAILS = ("requested format is not available", "only images are available")  # what a missing runtime causes
+UNDECRYPTED = ("cannot decrypt", "failed to decrypt", "could not be decrypted")  # yt-dlp only warns of these
 
 
 class Failure(Exception):
@@ -36,9 +39,11 @@ def emit(**event):
 
 class Log:
     no_js = False  # yt-dlp warned that YouTube has no JavaScript runtime to solve its challenge
+    undecrypted = False  # yt-dlp read the browser's sign-in but could not decrypt it
 
     def debug(self, msg):
         Log.no_js = Log.no_js or "No supported JavaScript runtime" in msg
+        Log.undecrypted = Log.undecrypted or any(w in msg for w in UNDECRYPTED)
         emit(event="log", line=msg)
 
     info = warning = error = debug
@@ -53,7 +58,7 @@ def format_params(preset, ffmpeg, module):
     if preset in AUDIO:
         return {"format": AUDIO[preset]}
     if module == "yt_dlp":  # its sorter's res is the short side; resolution first, H.264 + AAC only break ties
-        res = "res" if preset == "best" else f"res:{preset}"
+        res = "res" if preset in ("best", "compatible") else f"res:{preset}"  # compatible: Narrow does the rest
         return {"format": "bv*+ba/b" if ffmpeg else "b", "format_sort": [res, "fps", "vcodec:h264", "acodec:aac"]}
     return {"format": ladder(preset, ffmpeg)}
 
@@ -66,6 +71,10 @@ def ladder(preset, ffmpeg):
     Upgrade if youtube-dl gains format sorting, or drop the ladder if yt-dlp becomes the only engine."""
     if preset == "best":
         return "bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best" if ffmpeg else "best"
+    if preset == "compatible":  # H.264 and AAC in MP4 when the video has them, else what class 1080 saves
+        mp4 = "[vcodec^=avc1][ext=mp4]"
+        pair = f"bestvideo{mp4}+bestaudio[acodec^=mp4a][ext=m4a]/" if ffmpeg else ""
+        return f"{pair}best{mp4}[acodec^=mp4a]/" + ladder("1080", ffmpeg)
     n = int(preset)
     fit, tall = f"[height<={LONG[n]}][width<={LONG[n]}]", f"[height<={n}]"
     if not ffmpeg:
@@ -83,7 +92,7 @@ NAME = {  # yt-dlp's spool_* fields are set by the Name step in download(); yout
 }
 HEIGHTS = (2160, 1440, 1080, 720, 480, 360, 240)
 FLAT_PRESETS = ("best", "1080", "720", "480", "audio")  # a flat playlist listing has no formats to read
-LABELS = {"best": "Best", "audio": "Audio", "mp3": "MP3"}
+LABELS = {"best": "Best", "compatible": "Plays everywhere", "audio": "Audio", "mp3": "MP3"}
 CLASS = {str(h): f" {h}p" for h in HEIGHTS}  # two classes of one video must not share a file name
 
 
@@ -171,8 +180,39 @@ def ranking(n):
     return key
 
 
+def fits(f):
+    """H.264 picture and AAC sound, as far as the stream has them, in a file an MP4 can hold: plays everywhere."""
+    video = not has(f, "vcodec") or str(f.get("vcodec")).startswith(("avc", "h264"))
+    audio = not has(f, "acodec") or str(f.get("acodec")).startswith(("mp4a", "aac"))
+    return video and audio and f.get("ext") in ("mp4", "m4a")
+
+
+def everywhere(formats, ffmpeg):
+    """The formats preset compatible chooses among, like Best: those that fit, when they hold one stream with picture
+    and sound, or a pair to join. None when they do not."""
+    fit = [f for f in formats if fits(f)]
+    both = any(has(f, "vcodec") and has(f, "acodec") for f in fit)
+    pair = any(not has(f, "acodec") for f in fit) and any(not has(f, "vcodec") for f in fit)
+    return fit if both or (ffmpeg and pair) else None
+
+
+def narrow(ydl, info, ffmpeg):
+    """Preset compatible, before yt-dlp chooses: only what plays everywhere, else class 1080's order."""
+    if not info.get("formats"):
+        return  # a list, or a site with one stream: nothing to choose
+    fit = everywhere(info["formats"], ffmpeg)
+    if fit:
+        info["formats"] = fit
+    else:
+        ydl.params["format_sort"] = format_params("1080", ffmpeg, "yt_dlp")["format_sort"]
+        ydl.sort_formats(info)
+
+
 def picked(formats, preset, ffmpeg):
     """The streams a preset downloads, by the rule yt-dlp uses; (None,) if none fit."""
+    if preset == "compatible":
+        fit = everywhere(formats, ffmpeg)
+        return chosen(fit, None, ffmpeg) if fit else chosen(formats, 1080, ffmpeg)
     if preset in AUDIO:
         audio = [f for f in formats if has(f, "acodec") and not has(f, "vcodec")]
         both = [f for f in formats if has(f, "acodec") and has(f, "vcodec")]
@@ -208,15 +248,21 @@ def entry(info, ffmpeg, compatible=None):
         formats = info.get("formats") or [info]  # a site with one stream puts it on the info itself
         playable = formats if ffmpeg else [f for f in formats if has(f, "acodec")]  # no merging without ffmpeg
         classes = {klass(f) for f in playable if has(f, "vcodec")}
-        top = chosen(formats, None, ffmpeg)[0]
+        tops = chosen(formats, None, ffmpeg)
+        top = tops[0]
         best = klass(top) if top and has(top, "vcodec") else None  # Best's own class: offered once, as its detail
-        heights = [str(h) for h in HEIGHTS if h in classes and h != best]
-        ids = ["best"] * bool(top) + heights + ["audio"] + ["mp3"] * bool(ffmpeg)  # no Best when nothing fits
+        fit = everywhere(formats, ffmpeg)
+        comp = fit and chosen(fit, None, ffmpeg)  # what plays everywhere, offered once: not when Best is it
+        comp = comp if comp != tops else None
+        heights = [str(h) for h in HEIGHTS if h in classes and h != best and picked(formats, str(h), ffmpeg) != comp]
+        ids = ["best"] * bool(top) + ["compatible"] * bool(comp) + heights + ["audio"] + ["mp3"] * bool(ffmpeg)
         presets = [preset(p, estimate(formats, p, ffmpeg, info.get("duration"))) for p in ids]
         for p in presets:  # the MP3 step decides its type, whatever stream it starts from
             p["ext"] = "mp3" if p["id"] == "mp3" else file_type(picked(formats, p["id"], ffmpeg), compatible)
         if top:
             presets[0]["detail"] = best and f"{best}p"
+        if comp:
+            presets[1]["detail"] = f"{klass(comp[0])}p"
     if ffmpeg and presets[-1]["id"] != "mp3":
         presets.append(preset("mp3"))
     thumbnails = info.get("thumbnails") or [{}]
@@ -404,6 +450,17 @@ def download(engine, module, params, spec):
             details(information)  # youtube-dl's hooks carry no info, so this is where it tells us
             return [], information
 
+    told = []
+
+    def tell(vid):
+        """The video's id, once, before any file is written; held, go on only at the queue's go."""
+        if told:
+            return
+        told.append(vid)
+        emit(event="id", id=vid)
+        if spec.get("hold") and sys.stdin.readline().strip() != "go":
+            os._exit(0)  # the queue said stop: nothing is written, nothing more to say
+
     plan = []
     seen = set()
     pieces = [module == "yt_dlp"]  # off once pieces failed: then the job goes on the old way, one connection
@@ -420,14 +477,17 @@ def download(engine, module, params, spec):
         """yt-dlp's step between choosing the streams and naming the file."""
 
         def run(self, information):
+            tell(information.get("id"))
             plan[:] = information.get("requested_formats") or [information]
             title = ydl.evaluate_outtmpl("%(title)s", information, sanitize=True)  # cleaned first: "|" takes 3 bytes
             video = next((f for f in plan if has(f, "vcodec")), None)
             got = video and klass(video)  # a class preset gives the best below it: name the file for what it got
             information["spool_title"] = title.encode()[:150].decode(errors="ignore")
             information["spool_class"] = (
-                f" {got}p" if got and spec["preset"] in CLASS else CLASS.get(spec["preset"], "")
+                f" {got}p" if got and spec["preset"] in (*CLASS, "compatible") else CLASS.get(spec["preset"], "")
             )
+            if got and spec["preset"] == "compatible" and all(fits(f) for f in plan):
+                information["spool_class"] += " H.264"  # else it is what class 1080 saves, and named so
             base, ext = os.path.splitext(ydl.prepare_filename(information))
             for e in {ext, ".mp3" if spec["preset"] == "mp3" else ext}:  # the merge and the metadata step write here
                 wrote(base + ".temp" + e)
@@ -546,11 +606,14 @@ def download(engine, module, params, spec):
         if info.get("is_live") or info.get("live_status") == "is_live":
             refused.append(Failure(LIVE, "live"))
             return "Spool does not record live streams"
+        if module != "yt_dlp":  # youtube-dl asks only once the streams are chosen, before it writes
+            tell(info.get("id"))
         return None
 
     # shortcut: youtube-dl has no step between choosing and naming, so its class is the preset's, even when a
-    # playlist entry has no such class, and its merge's .temp file goes unreported; drop with youtube-dl
-    cls = "" if module == "yt_dlp" else CLASS.get(spec["preset"], "")
+    # playlist entry has no such class or plays everywhere only as what class 1080 saves, and its merge's .temp file
+    # goes unreported; drop with youtube-dl
+    cls = "" if module == "yt_dlp" else {**CLASS, "compatible": " H.264"}.get(spec["preset"], "")
     params.update(
         match_filter=wanted,
         **format_params(spec["preset"], spec["ffmpeg"], module),
@@ -574,8 +637,18 @@ def download(engine, module, params, spec):
         os.chdir(spec["dest"])
     except OSError:
         raise RuntimeError("The destination folder is missing.") from None
+
+    class Narrow(PostProcessor):
+        """yt-dlp's step before it chooses the streams."""
+
+        def run(self, information):
+            narrow(ydl, information, spec["ffmpeg"])
+            return [], information
+
     with engine.YoutubeDL(params) as ydl:
         if module == "yt_dlp":
+            if spec["preset"] == "compatible":
+                ydl.add_post_processor(Narrow(), when="pre_process")
             ydl.add_post_processor(Name(), when="video")
             if spec["ffmpeg"]:  # after the MP3 step, which params added first
                 ydl.add_post_processor(Details(), when="post_process")
@@ -621,7 +694,7 @@ def download(engine, module, params, spec):
 
 
 def main():
-    spec = json.load(sys.stdin)
+    spec = json.loads(sys.stdin.readline())  # one line: with hold, the go follows on stdin
     module = "yt_dlp" if spec["engine"] == "yt-dlp" else "youtube_dl"
     sys.path.insert(0, os.path.abspath(spec["engine_path"]))  # download() moves into dest; engines import late
     engine = import_module(module)
@@ -630,10 +703,24 @@ def main():
         params["js_runtimes"] = {"deno": {"path": os.path.abspath(spec["js_path"])}}
     elif module == "yt_dlp" and spec.get("js_runtime") not in (None, "deno"):
         params["js_runtimes"] = {spec["js_runtime"]: {}}  # yt-dlp enables deno by itself
+    if module == "yt_dlp" and spec.get("signin"):
+        params["cookiesfrombrowser"] = (spec["signin"],)  # read as the engine object starts
     if spec["mode"] == "probe":
         probe(engine, module, params, spec)
     else:
         download(engine, module, params, spec)
+
+
+def unread(exc):
+    """The engine failed while loading the browser's sign-in: yt-dlp wraps any such failure (a store that is
+    missing, one it may not read, one it cannot copy or decrypt) in CookieLoadError, inside its DownloadError."""
+    seen = []
+    while exc is not None and exc not in seen:
+        if type(exc).__name__ == "CookieLoadError":
+            return True
+        seen.append(exc)
+        exc = (getattr(exc, "exc_info", None) or (None, None))[1] or exc.__cause__ or exc.__context__
+    return False
 
 
 def run():
@@ -644,6 +731,10 @@ def run():
         message, kind = str(exc) or type(exc).__name__, getattr(exc, "kind", None)
         if Log.no_js and any(p in message.lower() for p in NO_JS_FAILS):  # the real cause of what failed
             message, kind = "No supported JavaScript runtime could be found.\n" + message, "no_js"
+        # shortcut: a sign-in that could not be decrypted is taken as the cause of whatever failed after it; the
+        # sign-in is only used for a video that asked for one. Upgrade if it hides other causes in the logs
+        if kind is None and (unread(exc) or Log.undecrypted):
+            kind = "signin_unread"
         emit(event="error", message=message, **({"kind": kind} if kind else {}))
         sys.exit(1)
 
