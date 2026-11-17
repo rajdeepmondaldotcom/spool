@@ -236,6 +236,33 @@ def test_pasting_several_links_queues_them_all(app):
     expect(app.get_by_text("Added 3 downloads.")).to_be_hidden()  # gone after 5 seconds
 
 
+def test_a_thumbnail_that_fails_to_load_shows_the_plain_block(app, spool):
+    broken = "https://fake.test/thumb.jpg"
+    app.context.route(broken, lambda route: route.abort())  # as on a connection that drops the picture
+
+    def with_broken_thumb(route):
+        response = route.fetch()
+        body = response.json()
+        body["entries"][0]["thumbnail"] = broken
+        route.fulfill(response=response, json=body)
+
+    app.route("**/api/probe", with_broken_thumb)
+    look_up(app, VIDEO)
+    spool[1].add([{"url": "https://fake.test/video/5", "title": "Fake video 5", "thumbnail": broken}], "best")
+    for thumb, size in (
+        (tray(app, "Fake video 1").locator(".thumb"), (160, 90)),
+        (group(app, "Finished").locator(".thumb"), (64, 36)),
+    ):
+        expect(thumb).to_be_visible(timeout=15000)
+        # The browser's broken-image icon is drawn for a picture that settled with nothing in it.
+        app.wait_for_function(
+            "el => el.tagName !== 'IMG' || (el.complete && el.naturalWidth > 0)", arg=thumb.element_handle()
+        )
+        box = thumb.bounding_box()
+        assert (round(box["width"]), round(box["height"])) == size
+        assert thumb.evaluate("el => getComputedStyle(el).backgroundColor") != "rgba(0, 0, 0, 0)"
+
+
 @pytest.mark.parametrize("width", [1440, 375])
 def test_the_skeleton_is_as_tall_as_the_tray_it_stands_in_for(app, width):
     app.set_viewport_size({"width": width, "height": 900})
@@ -1073,6 +1100,100 @@ def test_a_tab_from_an_earlier_launch_works_again_once_a_new_tab_is_let_in(page,
     newer.goto(spool[0])  # the tab the new launch opens
     expect(newer.get_by_label("Link to download")).to_be_visible()
     expect(page.get_by_label("Link to download")).to_be_visible()
+
+
+# api.js: silence that means the stream is gone; how long a question waits for an answer
+STALL_MS, ASK_MS = 40_000, 2_000
+
+
+def suspend(page):
+    """The tab stops running, as one the browser suspends in the background: it keeps its locks, and none of its
+    scripts run until the returned session sends Debugger.resume. (Chromium's frozen lifecycle state still answers the
+    other tabs here, so the debugger holds the tab instead.)"""
+    cdp = page.context.new_cdp_session(page)
+    cdp.send("Debugger.enable")
+    cdp.send("Debugger.pause")
+    return cdp
+
+
+def locks(page):
+    return page.evaluate("async () => { const q = await navigator.locks.query(); return [q.held, q.pending]; }")
+
+
+def test_a_new_tab_opens_while_the_tab_holding_the_stream_is_suspended(page, spool):
+    page.goto(spool[0])
+    expect(page.get_by_label("Link to download")).to_be_visible()
+    suspend(page)
+    second = page.context.new_page()
+    second.goto(spool[0])
+    expect(second.get_by_label("Link to download")).to_be_visible(timeout=ASK_MS + 5000)
+
+
+def test_a_tab_keeps_hearing_progress_after_the_tab_holding_the_stream_goes_silent(page, spool):
+    page.clock.install()  # nothing on a timer happens until the test moves the clock on
+    page.goto(spool[0])
+    second = page.context.new_page()
+    second.goto(spool[0])
+    expect(second.get_by_label("Link to download")).to_be_visible()
+    # The first tab still runs but no longer reaches the others. (The debugger cannot hold it here: moving the
+    # clock waits for every tab.)
+    page.evaluate("() => { BroadcastChannel.prototype.postMessage = () => {}; }")
+    add(spool, [("https://fake.test/video/5", "Fake video 5")])
+    second.clock.run_for(STALL_MS + ASK_MS)  # a long silence, then a question nobody answers
+    expect(group(second, "Finished").get_by_text("Fake video 5")).to_be_visible(timeout=15000)
+
+
+def test_a_suspended_tab_that_wakes_up_hands_the_stream_over(page, spool):
+    page.goto(spool[0])
+    expect(page.get_by_label("Link to download")).to_be_visible()
+    cdp = suspend(page)
+    second = page.context.new_page()
+    second.goto(spool[0])
+    expect(second.get_by_label("Link to download")).to_be_visible(timeout=ASK_MS + 5000)
+    cdp.send("Debugger.resume")
+    second.wait_for_function("async () => (await navigator.locks.query()).pending.length === 2")  # back in line
+    add(spool, [("https://fake.test/video/5", "Fake video 5")])
+    for tab in (page, second):
+        expect(group(tab, "Finished").get_by_text("Fake video 5")).to_be_visible(timeout=15000)
+    until(lambda: len(spool[1].subscribers) == 1)  # the woken tab's stream is gone once Spool next writes to it
+    held, pending = locks(second)
+    assert (len(held), len(pending)) == (1, 2)  # one tab reads; both wait in line for when it closes
+
+
+def test_a_browser_that_refuses_the_lock_still_shows_the_page(page, spool):
+    # As when site storage is blocked: the browser refuses every lock at once.
+    page.add_init_script(
+        "LockManager.prototype.request = () => Promise.reject(new DOMException('blocked', 'SecurityError'));"
+    )
+    page.clock.install()  # nothing on a timer happens until the test moves the clock on
+    made = []
+    page.on("request", lambda r: "/api/events" in r.url and made.append(r))
+    page.goto(spool[0])
+    expect(page.get_by_label("Link to download")).to_be_visible(timeout=10000)
+    look_up(page, VIDEO)  # the page still answers
+    expect(tray(page, "Fake video 1")).to_be_visible()
+    page.clock.run_for(ASK_MS)  # past the question it asked on joining
+    fence(page)
+    assert len(made) == 1
+
+
+def test_tabs_never_take_the_stream_from_each_other_while_spool_is_down(page, spool):
+    page.clock.install()
+    page.goto(spool[0])
+    second = page.context.new_page()
+    second.goto(spool[0])
+    expect(second.get_by_label("Link to download")).to_be_visible()
+    held = locks(second)[0]
+    page.context.route("**/api/events", lambda route: route.abort())  # every next try fails at once
+    vanish(spool[1])
+    second.evaluate(
+        """() => { const c = new BroadcastChannel('spool-fake-token');
+        c.onmessage = (e) => { if (e.data.event === 'ping') window.answered = true; }; }"""
+    )
+    second.clock.run_for(STALL_MS)  # a long silence: the tab asks whether the one holding the stream is still there
+    second.wait_for_function("() => window.answered")  # it is, and says so at once
+    second.clock.run_for(ASK_MS)
+    assert locks(second)[0] == held
 
 
 def test_clear_sends_only_the_rows_it_took_off(app, spool):
