@@ -245,14 +245,14 @@ def test_a_presets_file_type_and_a_lists_truncated_reach_the_page(app, monkeypat
     entry = {"url": "https://fake.test/v/1", "id": "v1", "title": "One", "presets": [preset]}
     info = {"event": "info", "kind": "playlist", "title": "A channel", "entries": [entry], "truncated": True}
     worker = tmp_path / "worker.py"
-    worker.write_text(f"import sys\nsys.stdin.read()\nprint({json.dumps(json.dumps(info))})\n")
+    worker.write_text(f"import sys\nsys.stdin.readline()\nprint({json.dumps(json.dumps(info))})\n")
     monkeypatch.setattr(spool.jobs, "WORKER", worker)
     status, body = app.json("POST", "/api/probe", {"url": "https://fake.test/channel"})
     assert status == 200
     assert (body["kind"], body["title"], body["truncated"]) == ("playlist", "A channel", True)
     assert body["entries"] == [entry]
     info["truncated"] = False
-    worker.write_text(f"import sys\nsys.stdin.read()\nprint({json.dumps(json.dumps(info))})\n")
+    worker.write_text(f"import sys\nsys.stdin.readline()\nprint({json.dumps(json.dumps(info))})\n")
     assert app.json("POST", "/api/probe", {"url": "https://fake.test/channel"})[1]["truncated"] is False
 
 

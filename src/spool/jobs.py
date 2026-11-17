@@ -67,6 +67,7 @@ class Jobs:
         ]
         self.lock = threading.RLock()
         self.procs = {}  # job id -> the worker running it
+        self.going = {}  # job id -> the video id its worker may be writing under; None: not known, so any
         self.dirty = set()
         self.subscribers = []
         self.closed = False
@@ -412,7 +413,7 @@ class Jobs:
         try:
             out = subprocess.run(
                 [sys.executable, "-I", "-X", "utf8", str(WORKER)],
-                input=json.dumps(self._spec(**spec)),
+                input=json.dumps(self._spec(**spec)) + "\n",  # one line
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -439,27 +440,46 @@ class Jobs:
         for job in reversed(self.jobs):
             if len(self.procs) >= AT_ONCE or self.closed:
                 return
-            if job["state"] == "queued" and job["id"] not in self.procs and not self._clash(job):
+            # a job with no id yet starts held: its worker tells the id, then waits for _go
+            if job["state"] == "queued" and job["id"] not in self.procs and not (job["entry_id"] and self._clash(job)):
                 job.update(state="running", stage="starting", started=time.time())
                 self._changed(job)
                 self.procs[job["id"]] = None  # no worker yet
+                if job["entry_id"]:
+                    self.going[job["id"]] = job["entry_id"]
                 threading.Thread(target=self._run, args=(job,), daemon=True).start()
 
     def _clash(self, job):
-        """A running job that may write the same file, so this one waits in the queue. A file's name carries the
-        video's id and is known only once the worker runs: two jobs in one folder run together only when both
-        have ids and they differ. A link added without its details (no id) runs alone in its folder."""
-        return next(
-            (
-                j
-                for j in self.jobs
-                if j is not job
-                and (j["state"] == "running" or j["id"] in self.procs)  # a cancelled job's worker may still write
-                and j["dest"] == job["dest"]
-                and not (job["entry_id"] and j["entry_id"] and j["entry_id"] != job["entry_id"])
-            ),
-            None,
+        """Whether another job's worker may be writing the same file, so this one waits. A file's name carries the
+        video's id: two jobs in one folder write together only when their ids differ. A job whose id is not known
+        writes alone in its folder."""
+        return any(
+            j is not job
+            and j["id"] in self.going  # until its worker is gone: a cancelled one may still write
+            and j["dest"] == job["dest"]
+            and (job["entry_id"] is None or self.going[j["id"]] in (None, job["entry_id"]))
+            for j in self.jobs
         )
+
+    def _go(self, job, proc, vid, hold):
+        """The worker named its video: keep the id, and tell a held worker go once no other job may be writing
+        that video in the same folder. Waits for that here, holding the slot; a cancel or a quit says stop."""
+        with self.lock:
+            if vid is not None and job["entry_id"] is None:
+                job["entry_id"] = text(vid, 200)
+                self._save()  # a later Retry knows it
+            if not hold:
+                return
+            while not self.closed and job["state"] == "running" and self._clash(job):
+                self.wake.wait(1)
+            go = not self.closed and job["state"] == "running"
+            if go:
+                self.going[job["id"]] = job["entry_id"]
+        try:
+            proc.stdin.write("go\n" if go else "")
+            proc.stdin.close()  # without a go, the end of input means stop
+        except OSError:
+            pass  # the worker is gone: its stdout says what happened
 
     def _rested(self):
         with self.lock:
@@ -514,6 +534,8 @@ class Jobs:
                 pass
         with self.lock:
             self.procs.pop(job["id"], None)
+            self.going.pop(job["id"], None)
+            self.wake.notify_all()  # a held job may be waiting for this one's worker to be gone
             if self.closed:
                 return
             if job["state"] == "running" and result is not None:  # else cancelled, and perhaps retried since
@@ -567,6 +589,7 @@ class Jobs:
     def _attempt(self, job, signin=None):
         """One worker run: its last event, or None if the job was cancelled before it could start. signin: the
         browser to read the sign-in from, on a try that uses it."""
+        hold = job["entry_id"] is None  # known after a first try that got as far as the id
         spec = self._spec(
             job["engine"],
             mode="download",
@@ -575,6 +598,7 @@ class Jobs:
             preset=job["preset"],
             item=job["item"],
             **signed(signin),
+            **({"hold": True} if hold else {}),
         )
         result = {"event": "error", "message": ""}
         with open(self.logs / f"{job['id']}.log", "a", encoding="utf-8") as log:
@@ -593,8 +617,13 @@ class Jobs:
                     errors="replace",  # ffmpeg shares the pipe and may write any bytes
                 )
                 self.procs[job["id"]] = proc
-            proc.stdin.write(json.dumps(spec))
-            proc.stdin.close()
+            try:
+                proc.stdin.write(json.dumps(spec) + "\n")  # one line; a held worker reads the go after it
+                proc.stdin.flush()
+                if not hold:
+                    proc.stdin.close()
+            except OSError:
+                pass  # the worker died at once: its stdout says what happened
             for line in proc.stdout:
                 event = parse(line)
                 if not event or event.get("event") == "log":
@@ -603,6 +632,9 @@ class Jobs:
                     self._progress(job, event)
                 elif event["event"] == "meta":
                     self._details(job, event)
+                elif event["event"] == "id":
+                    self._go(job, proc, event.get("id"), hold)
+                    hold = False
                 elif event["event"] == "file":
                     with self.lock:
                         job["files"].append(event["path"])
@@ -611,6 +643,10 @@ class Jobs:
                     result = event
                     break  # a child the engine left behind may hold the pipe open; this was the last word
             system.kill_leftovers(proc)  # it waits for the worker itself, and reaps it last
+            try:
+                proc.stdin.close()  # a worker that died before its id never read a go
+            except OSError:
+                pass
         return result
 
     def _progress(self, job, event):

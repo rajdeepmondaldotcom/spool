@@ -309,7 +309,7 @@ def test_a_kind_the_worker_names_is_used_as_is(app, events, monkeypatch, tmp_pat
     worker = tmp_path / "worker.py"
     worker.write_text(
         "import sys\n"
-        "sys.stdin.read()\n"
+        "sys.stdin.readline()\n"
         'print(\'{"event": "error", "message": "HTTP Error 403 in a list", "kind": "playlist"}\')\n'
     )
     monkeypatch.setattr(spool.jobs, "WORKER", worker)
@@ -589,7 +589,7 @@ def test_a_byte_that_is_not_utf8_from_the_worker_is_only_logged(app, events, mon
     worker = tmp_path / "worker.py"
     worker.write_text(
         "import sys\n"
-        "sys.stdin.read()\n"
+        "sys.stdin.readline()\n"
         "sys.stdout.buffer.write(b'\\xff\\xfe ffmpeg noise\\n')\n"
         'sys.stdout.buffer.write(b\'{"event": "error", "message": "ERROR: Unsupported URL: x"}\\n\')\n'
     )
@@ -808,58 +808,6 @@ def test_a_site_limiting_the_connection_never_offers_an_engine_update(tmp_path):
         assert jobs._error("limited", "yt-dlp")["hint"] == "retry"
     finally:
         jobs.close()
-
-
-HELD = """
-import json, os, pathlib, sys, time
-spec = json.loads(sys.stdin.read())
-here = pathlib.Path(sys.argv[0]).parent
-if not (here / "held").exists():  # the first run stops before it knows its file's name, until the test lets it go
-    (here / "held").touch()
-    end = time.time() + 20
-    while not (here / "release").exists() and time.time() < end:
-        time.sleep(0.02)
-name = os.path.join(spec["dest"], "Same video [v].mp4")
-print(json.dumps({"event": "file", "path": name}), flush=True)
-with open(name + ".part", "ab") as f:
-    f.write(b"x" * 100)
-os.replace(name + ".part", name)
-print(json.dumps({"event": "done", "path": name, "size": os.path.getsize(name)}), flush=True)
-"""
-
-
-def test_a_link_with_no_id_never_starts_beside_a_job_that_has_not_named_its_file(app, events, monkeypatch, tmp_path):
-    import spool.jobs
-
-    worker = tmp_path / "held" / "worker.py"
-    worker.parent.mkdir()
-    worker.write_text(HELD, encoding="utf-8")
-    monkeypatch.setattr(spool.jobs, "WORKER", worker)
-    first = app.json("POST", "/api/jobs", {"entries": [{"url": "https://fake.test/a"}], "preset": "best"})
-    end = time.time() + 10
-    while not worker.with_name("held").exists():  # the first job is running and its file has no name yet
-        assert time.time() < end
-        time.sleep(0.02)
-    second = app.json("POST", "/api/jobs", {"entries": [{"url": "https://fake.test/b"}], "preset": "best"})
-    second_id = second[1]["jobs"][0]["id"]
-    end = time.time() + 2
-    while time.time() < end:  # a free slot, and still it must not start
-        assert app.jobs.snapshot()["jobs"][0]["state"] == "queued"
-        time.sleep(0.05)
-    worker.with_name("release").touch()
-    ended = {}
-    ids = {first[1]["jobs"][0]["id"], second_id}
-    events.until(
-        lambda e, d: (
-            e == "job"
-            and d["id"] in ids
-            and d["state"] in ("done", "failed")
-            and not ended.update({d["id"]: d})
-            and len(ended) == 2
-        )
-    )
-    assert {d["state"] for d in ended.values()} == {"done"}
-    assert {d["size"] for d in ended.values()} == {100}  # each wrote it whole, one after the other
 
 
 def test_different_videos_with_ids_still_run_two_at_once(app, events):

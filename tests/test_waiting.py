@@ -84,7 +84,7 @@ def test_a_refusal_mid_download_continues_the_partial_file(app, events):
 
 STUB = """
 import json, pathlib, sys
-spec = json.loads(sys.stdin.read())
+spec = json.loads(sys.stdin.readline())
 count = pathlib.Path(sys.argv[0]).with_name("runs")
 n = int(count.read_text()) + 1 if count.exists() else 1
 count.write_text(str(n))
@@ -294,7 +294,7 @@ def test_the_test_server_paces_nothing_unless_a_test_asks(tmp_path):
 
 PARTS = """
 import json, pathlib, sys
-sys.stdin.read()
+sys.stdin.readline()
 count = pathlib.Path(sys.argv[0]).with_name("runs")
 n = int(count.read_text()) + 1 if count.exists() else 1
 count.write_text(str(n))
@@ -330,7 +330,7 @@ def test_progress_on_a_later_stream_starts_the_count_again(app, events, monkeypa
 
 UNICODE = """
 import json, sys
-sys.stdin.read()
+sys.stdin.readline()
 said = {"utf8": sys.flags.utf8_mode, "encoding": sys.stdout.encoding}
 print(json.dumps({"event": "meta", "title": "Ünïcödé 日本語 " + json.dumps(said), "uploader": "Zoë", "thumbnail": None,
                   "duration": 1}, ensure_ascii=False), flush=True)

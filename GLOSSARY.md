@@ -17,7 +17,8 @@ The words the code uses. Where the screen uses a plainer word, it is in brackets
 | **Engine** | The program Spool runs to fetch a video. Spool keeps its own copies of two and uses the second when the first fails on a link. |
 | **Source** | A release page an engine's builds come from. The first engine has two, its stable releases and its daily builds; launch installs from the stable one, and a newer engine may come from either. Versions compare by their numbers, so no update goes backwards. |
 | **Note** | A running job's short line on what is happening: why it waits to try again, or that it is getting a newer engine. |
-| **Worker** | A child process that runs one engine call (a probe or a download) and reports as JSON lines. |
+| **Worker** | A child process that runs one engine call (a probe or a download) and reports as JSON lines. Its spec arrives as one line on stdin. |
+| **Hold** (go) | A job added without its video's id starts held: its worker tells the id before it writes, then waits for the queue's `go`, which comes once no other job may be writing that video in the same folder. A held job is in stage `starting` and takes a slot. A job whose id is still unknown writes alone in its folder. |
 | **Destination** (folder) | The folder finished files are saved to. |
 | **Sign-in** (sign in with) | The signed-in account a browser on this computer already has. The `signin` setting names the browser, or is off; Spool reads it only for a video that asks for an account, on one try again. |
 | **Snapshot** | The whole state the browser needs, sent when it connects: settings, destination, engines, tools and jobs. |
