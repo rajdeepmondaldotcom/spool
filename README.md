@@ -114,7 +114,8 @@ Your downloaded files are not in that folder, and Spool does not delete them.
 | You see | What to do |
 |---|---|
 | "The site refused the download." | Press Try again. Sites refuse some requests and accept the next. |
-| A video needs a signed-in account | Press Choose a browser, pick the browser you're signed in with, then press Try again. |
+| "This video needs a signed-in account. Choose your browser in Settings." | Press Choose a browser, pick the browser you're signed in with, then press Try again. |
+| "Spool couldn't read the sign-in from …" | On a Mac, Safari's sign-in can be read only once your terminal app has Full Disk Access (System Settings, Privacy & Security). Chrome and browsers built on it make macOS ask for your Mac password once: choose Allow. Or choose another browser. |
 | "This quality needs a free helper…" | Run the command from step 3 of Install, then press Try again. |
 | "… isn't connected." | Plug the drive in, or press Change and pick another folder. |
 | "This tab lost its link to Spool." | Run `spool` again. It opens a working tab. |
@@ -136,6 +137,7 @@ Options: `spool --port 8000` picks the port, and `spool --no-open` starts withou
 ## Limits
 
 - It doesn't download subtitles yet.
+- Spool reads a few links with its second engine, and that one can't sign in, so a private video there won't download.
 - It is built and used on macOS. Linux and Windows pass the automated tests but have had no hands-on run.
 
 ## Use it fairly
