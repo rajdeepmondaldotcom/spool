@@ -40,6 +40,7 @@ def emit(**event):
 class Log:
     no_js = False  # yt-dlp warned that YouTube has no JavaScript runtime to solve its challenge
     undecrypted = False  # yt-dlp read the browser's sign-in but could not decrypt it
+    signin = False  # this try reads a browser's sign-in: only then can a failure be that one
 
     def debug(self, msg):
         Log.no_js = Log.no_js or "No supported JavaScript runtime" in msg
@@ -262,7 +263,7 @@ def entry(info, ffmpeg, compatible=None):
         if top:
             presets[0]["detail"] = best and f"{best}p"
         if comp:
-            presets[1]["detail"] = f"{klass(comp[0])}p"
+            presets[1]["detail"] = klass(comp[0]) and f"{klass(comp[0])}p"  # a stream with no size has no class
     if ffmpeg and presets[-1]["id"] != "mp3":
         presets.append(preset("mp3"))
     thumbnails = info.get("thumbnails") or [{}]
@@ -705,6 +706,7 @@ def main():
         params["js_runtimes"] = {spec["js_runtime"]: {}}  # yt-dlp enables deno by itself
     if module == "yt_dlp" and spec.get("signin"):
         params["cookiesfrombrowser"] = (spec["signin"],)  # read as the engine object starts
+        Log.signin = True
     if spec["mode"] == "probe":
         probe(engine, module, params, spec)
     else:
@@ -733,7 +735,7 @@ def run():
             message, kind = "No supported JavaScript runtime could be found.\n" + message, "no_js"
         # shortcut: a sign-in that could not be decrypted is taken as the cause of whatever failed after it; the
         # sign-in is only used for a video that asked for one. Upgrade if it hides other causes in the logs
-        if kind is None and (unread(exc) or Log.undecrypted):
+        if kind is None and Log.signin and (unread(exc) or Log.undecrypted):
             kind = "signin_unread"
         emit(event="error", message=message, **({"kind": kind} if kind else {}))
         sys.exit(1)

@@ -420,6 +420,8 @@ class YoutubeDL:
     NAME = "youtube-dl"
 
     def scenario(self, url):
+        if "warn=decrypt" in url:  # a line that looks like a sign-in that could not be decrypted
+            self.params["logger"].warning("[fake] failed to decrypt something unrelated")
         if self.NAME == "yt-dlp" and "/ytdl-only" in url:  # a site only the second engine reads
             raise DownloadError(f"ERROR: Unsupported URL: {url}")
         return scenario(url)
