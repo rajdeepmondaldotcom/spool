@@ -62,9 +62,12 @@ def frozen_timers(page):
 
 
 def stop_clock(page):
-    """Stops the installed clock, once the page has loaded on it: until now its time ran on in real time. Tabs that
-    load afterwards start on the stopped clock too."""
-    page.clock.pause_at(page.evaluate("() => Date.now()") / 1000 + 0.05)  # a moment ahead: it cannot be set back
+    """Stops the installed clock, once the page has loaded on it: until now its time ran on in real time. Every tab of
+    the browser context stops, and tabs that load afterwards start on the stopped clock too."""
+    # A second ahead of the tab furthest on: each tab keeps its own time and none can be set back, and on a busy
+    # machine the call takes a while to arrive. Timers due within that second (only the load's own) fire once.
+    now = max(tab.evaluate("() => Date.now()") for tab in page.context.pages)
+    page.clock.pause_at(now / 1000 + 1)
 
 
 def test_the_stopped_clock_holds_the_page_until_the_test_moves_it(app):
