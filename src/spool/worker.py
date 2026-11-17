@@ -1,7 +1,9 @@
 """Worker: a child process that runs one engine call and reports JSON lines on stdout.
 
-Spec on stdin: {engine, engine_path, mode: "probe" | "download", url, ffmpeg, js_runtime?, dest?, preset?, item?}.
-Events: {"event": "log" | "progress" | "meta" | "file" | "info" | "done" | "error", ...}; an error carries "kind"
+Spec on stdin, one line: {engine, engine_path, mode: "probe" | "download", url, ffmpeg, js_runtime?, dest?, preset?,
+item?, hold?}. A download first tells the video's id, before it writes any file; with hold it then reads one more line
+and goes on only at "go".
+Events: {"event": "log" | "progress" | "meta" | "id" | "file" | "info" | "done" | "error", ...}; an error carries "kind"
 ("live", "no_js" or "playlist") when the worker knows it. A progress event's status is the engine's ("downloading",
 "finished"), or "processing" for how far a join, tags or MP3 step has written its file. An info event of a list
 carries "truncated": a channel has more videos than it lists. Each preset carries "ext", the type of file it saves.
@@ -404,6 +406,17 @@ def download(engine, module, params, spec):
             details(information)  # youtube-dl's hooks carry no info, so this is where it tells us
             return [], information
 
+    told = []
+
+    def tell(vid):
+        """The video's id, once, before any file is written; held, go on only at the queue's go."""
+        if told:
+            return
+        told.append(vid)
+        emit(event="id", id=vid)
+        if spec.get("hold") and sys.stdin.readline().strip() != "go":
+            os._exit(0)  # the queue said stop: nothing is written, nothing more to say
+
     plan = []
     seen = set()
     pieces = [module == "yt_dlp"]  # off once pieces failed: then the job goes on the old way, one connection
@@ -420,6 +433,7 @@ def download(engine, module, params, spec):
         """yt-dlp's step between choosing the streams and naming the file."""
 
         def run(self, information):
+            tell(information.get("id"))
             plan[:] = information.get("requested_formats") or [information]
             title = ydl.evaluate_outtmpl("%(title)s", information, sanitize=True)  # cleaned first: "|" takes 3 bytes
             video = next((f for f in plan if has(f, "vcodec")), None)
@@ -546,6 +560,8 @@ def download(engine, module, params, spec):
         if info.get("is_live") or info.get("live_status") == "is_live":
             refused.append(Failure(LIVE, "live"))
             return "Spool does not record live streams"
+        if module != "yt_dlp":  # youtube-dl asks only once the streams are chosen, before it writes
+            tell(info.get("id"))
         return None
 
     # shortcut: youtube-dl has no step between choosing and naming, so its class is the preset's, even when a
@@ -621,7 +637,7 @@ def download(engine, module, params, spec):
 
 
 def main():
-    spec = json.load(sys.stdin)
+    spec = json.loads(sys.stdin.readline())  # one line: with hold, the go follows on stdin
     module = "yt_dlp" if spec["engine"] == "yt-dlp" else "youtube_dl"
     sys.path.insert(0, os.path.abspath(spec["engine_path"]))  # download() moves into dest; engines import late
     engine = import_module(module)
