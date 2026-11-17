@@ -58,6 +58,22 @@ def frozen_timers(page):
     page.clock.install()
     page.reload()
     page.get_by_label("Link to download").wait_for()
+    stop_clock(page)
+
+
+def stop_clock(page):
+    """Stops the installed clock, once the page has loaded on it: until now its time ran on in real time. Tabs that
+    load afterwards start on the stopped clock too."""
+    page.clock.pause_at(page.evaluate("() => Date.now()") / 1000 + 0.05)  # a moment ahead: it cannot be set back
+
+
+def test_the_stopped_clock_holds_the_page_until_the_test_moves_it(app):
+    frozen_timers(app)
+    app.evaluate("() => { window.fired = false; window.then = Date.now(); setTimeout(() => { fired = true; }, 1); }")
+    app.evaluate("async () => { await fetch('/api/fence').catch(() => {}); }")  # real time passes, as for a reply
+    assert app.evaluate("() => [fired, Date.now() - then]") == [False, 0]
+    app.clock.run_for(1)
+    assert app.evaluate("() => fired")
 
 
 def fence(page):
@@ -745,7 +761,9 @@ def test_finished_shows_ten_then_show_all_and_clear_list_keeps_the_files(app, sp
     frozen_timers(app)
     add(spool, [(f"https://fake.test/video/{n}", f"Fake video {n}") for n in range(1, 13)])
     finished = group(app, "Finished")
-    expect(finished.get_by_role("button", name="Show all 12")).to_be_visible(timeout=30000)
+    expect(finished.get_by_role("listitem")).to_have_count(12, timeout=30000)  # a row just finished stays in view
+    app.clock.run_for(2000)  # while it is tinted
+    expect(finished.get_by_role("button", name="Show all 12")).to_be_visible()
     expect(finished.get_by_role("listitem")).to_have_count(10)
     finished.get_by_role("button", name="Show all 12").click()
     expect(finished.get_by_role("listitem")).to_have_count(12)
@@ -1162,16 +1180,23 @@ def test_a_new_tab_opens_while_the_tab_holding_the_stream_is_suspended(page, spo
 
 
 def test_a_tab_keeps_hearing_progress_after_the_tab_holding_the_stream_goes_silent(page, spool):
-    page.clock.install()  # nothing on a timer happens until the test moves the clock on
+    page.clock.install()
     page.goto(spool[0])
     second = page.context.new_page()
     second.goto(spool[0])
     expect(second.get_by_label("Link to download")).to_be_visible()
+    stop_clock(page)  # nothing on a timer happens until the test moves the clock on
     # The first tab still runs but no longer reaches the others. (The debugger cannot hold it here: moving the
     # clock waits for every tab.)
     page.evaluate("() => { BroadcastChannel.prototype.postMessage = () => {}; }")
     add(spool, [("https://fake.test/video/5", "Fake video 5")])
-    second.clock.run_for(STALL_MS + ASK_MS)  # a long silence, then a question nobody answers
+    second.evaluate(
+        """() => { const c = new BroadcastChannel('spool-fake-token');
+        c.onmessage = (e) => { if (e.data.event === 'refresh') window.asked = true; }; }"""
+    )
+    second.clock.run_for(STALL_MS)  # a long silence: the tab asks whether the one holding the stream is still there
+    second.wait_for_function("() => window.asked")
+    second.clock.run_for(ASK_MS)  # and nobody answers
     expect(group(second, "Finished").get_by_text("Fake video 5")).to_be_visible(timeout=15000)
 
 
@@ -1203,7 +1228,10 @@ LockManager.prototype.request = function (name, options, callback) {
   const tag = options.steal ? 'take-over' : first ? 'in line' : 'in line again';
   const send = () => real.call(this, name, options, (lock) => { order.push(tag + ' granted'); return callback(lock); })
     .catch((e) => { order.push(tag + ' ended: ' + e.name); throw e; });
-  if (!options.steal && first) { first = false; return new Promise((ok, no) => { waiting = () => send().then(ok, no); }); }
+  if (!options.steal && first) {
+    first = false;
+    return new Promise((ok, no) => { waiting = () => send().then(ok, no); window.held = true; });
+  }
   if (options.steal && waiting) { waiting(); waiting = null; }
   return send();
 };
@@ -1212,11 +1240,13 @@ LockManager.prototype.request = function (name, options, callback) {
 
 def test_a_tab_granted_its_lock_as_it_takes_the_stream_over_keeps_one_stream(page, spool):
     page.add_init_script(OWN_LOCK_TAKEN)
-    page.clock.install()  # nothing on a timer happens until the test moves the clock on
+    page.clock.install()
     made = []
     page.on("request", lambda r: "/api/events" in r.url and made.append(r))
     page.goto(spool[0])
-    expect(page.get_by_text("Connecting to Spool…")).to_be_visible()  # its place in line is held back
+    expect(page.get_by_text("Connecting to Spool…")).to_be_visible()
+    page.wait_for_function("() => window.held")  # its place in line is held back
+    stop_clock(page)  # nothing on a timer happens until the test moves the clock on
     page.clock.run_for(ASK_MS)  # its take-over fires
     expect(page.get_by_label("Link to download")).to_be_visible()
     page.wait_for_function("() => order.some((o) => o.startsWith('in line ended'))")
@@ -1240,11 +1270,12 @@ def test_a_browser_that_refuses_the_lock_still_shows_the_page(page, spool):
     page.add_init_script(
         "LockManager.prototype.request = () => Promise.reject(new DOMException('blocked', 'SecurityError'));"
     )
-    page.clock.install()  # nothing on a timer happens until the test moves the clock on
+    page.clock.install()
     made = []
     page.on("request", lambda r: "/api/events" in r.url and made.append(r))
     page.goto(spool[0])
     expect(page.get_by_label("Link to download")).to_be_visible(timeout=10000)
+    stop_clock(page)  # nothing on a timer happens until the test moves the clock on
     look_up(page, VIDEO)  # the page still answers
     expect(tray(page, "Fake video 1")).to_be_visible()
     page.clock.run_for(ASK_MS)  # past the question it asked on joining
@@ -1258,6 +1289,7 @@ def test_tabs_never_take_the_stream_from_each_other_while_spool_is_down(page, sp
     second = page.context.new_page()
     second.goto(spool[0])
     expect(second.get_by_label("Link to download")).to_be_visible()
+    stop_clock(page)
     held = locks(second)[0]
     page.context.route("**/api/events", lambda route: route.abort())  # every next try fails at once
     vanish(spool[1])
@@ -1691,9 +1723,11 @@ def test_a_clean_stop_stops_every_tab_reconnecting(app, spool):
     frozen_timers(app)
     made = []
     app.context.on("request", lambda r: "/api/events" in r.url and made.append(r))
+    app.clock.resume()  # a tab loads on a running clock: on a stopped one it waits for its first frame
     other = app.context.new_page()
     other.goto(spool[0])
     other.get_by_label("Link to download").wait_for()
+    stop_clock(other)
     spool[1].close()  # a clean stop: every stream hears `stopped`
     expect(app.get_by_text(STOPPED)).to_be_visible()
     expect(other.get_by_text(STOPPED)).to_be_visible()  # it does not read the stream itself
@@ -1711,9 +1745,10 @@ def test_a_stopped_tab_follows_the_tab_of_the_next_launch(page, context, tmp_pat
 
     httpd, url, jobs, _ = serve_fake.start(tmp_path)
     port = httpd.server_address[1]
-    page.clock.install()  # nothing on a timer happens until the test moves the clock on
+    page.clock.install()
     page.goto(url)
     page.get_by_label("Link to download").wait_for()
+    stop_clock(page)  # nothing on a timer happens until the test moves the clock on
     jobs.close()
     httpd.shutdown()
     httpd.server_close()
@@ -1728,6 +1763,7 @@ def test_a_stopped_tab_follows_the_tab_of_the_next_launch(page, context, tmp_pat
         page.clock.run_for(10_000)  # well past the next try of the stream
         fence(page)
         assert made == []  # a stopped tab never tries by itself
+        page.clock.resume()  # a tab loads on a running clock: on a stopped one it waits for its first frame
         newer = context.new_page()
         newer.goto(url.replace("fake-token", "next-launch"))
         expect(newer.get_by_label("Link to download")).to_be_visible()
@@ -1742,7 +1778,11 @@ def test_a_stopped_tab_follows_the_tab_of_the_next_launch(page, context, tmp_pat
 
 def test_a_stream_that_just_ends_keeps_reconnecting(app, spool):
     frozen_timers(app)
+    add(spool, [("https://fake.test/slow?delay=60", "Fake slow video")])  # held a minute after its first step
+    row = group(app, "Downloading").get_by_role("listitem")
+    expect(row.get_by_text("Downloading video")).to_be_visible(timeout=10000)
     made = ending_stream(app, spool)
+    expect(row.get_by_text("Reconnecting…")).to_be_visible()  # the stream has ended, and the next try waits
     with app.expect_request("**/api/events"):
         app.clock.run_for(2000)  # the next try
     assert len(made) >= 1
