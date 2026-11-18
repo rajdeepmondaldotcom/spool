@@ -31,13 +31,15 @@ def default_dest():
 
 
 CHECK_TIMEOUT = 3.0  # a sleeping drive or a macOS permission prompt can block a write test for ever
+# shortcut: a drive another program wrote to flat out took up to 11.5 s for a write test; revisit if real ones run longer
+START_TIMEOUT = 60.0  # a job's own check, on its own thread, waits this long before calling the drive not answering
 MOUNTS = ("/Volumes", "/mnt", "/media", "/run/media")
 _checks = {}  # path -> the one check thread running for it, and when it started
 _checks_lock = threading.Lock()
 
 
-def check_dest(path, write=True):
-    """The destination's problem, or none. Waits CHECK_TIMEOUT at most; one check per path runs at a time.
+def check_dest(path, write=True, wait=None):
+    """The destination's problem, or none. Waits CHECK_TIMEOUT (or wait) at most; one check per path runs at a time.
 
     write=False skips the real write test, for polling: it never wakes a sleeping drive or touches a synced folder."""
     path = str(path)
@@ -50,7 +52,7 @@ def check_dest(path, write=True):
             flight = _checks[(path, write)] = (thread, time.monotonic(), result)
             thread.start()
     thread, started, result = flight
-    thread.join(max(0.0, started + CHECK_TIMEOUT - time.monotonic()))
+    thread.join(max(0.0, started + (wait or CHECK_TIMEOUT) - time.monotonic()))
     if thread.is_alive() or not result:  # still stuck, or the check itself failed
         p = Path(path)
         return {"path": str(p), "display": display(p), "ok": False, "problem": "not_responding", "free_bytes": None}
