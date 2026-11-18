@@ -319,6 +319,15 @@ def test_a_drive_slow_to_take_a_write_starts_the_download_at_the_first_click(app
     assert seen[-1][1]["state"] == "done", seen[-1][1]["error"]
 
 
+def test_a_drive_slow_to_take_a_write_opens_its_folder_at_once(app, monkeypatch, slow_writes):
+    opened = []
+    monkeypatch.setattr(system, "open_folder", opened.append)  # never a real window
+    t = time.time()
+    assert app.request("POST", "/api/dest/reveal")[0] == 204
+    assert time.time() - t < 1
+    assert opened == [str(app.dest)]
+
+
 def test_a_write_test_that_never_finishes_fails_the_job_after_a_while(app, monkeypatch, stuck_writes):
     monkeypatch.setattr(system, "START_TIMEOUT", 0.6)
     events = app.events()

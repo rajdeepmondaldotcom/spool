@@ -303,7 +303,7 @@ class Jobs:
 
     def reveal_dest(self):
         dest = self.settings["dest"]
-        dest_problem(self._check(dest), status=409)
+        dest_problem(self._check(dest, write=False), status=409)  # opening it writes nothing
         system.open_folder(dest)
 
     def log(self, job_id):
