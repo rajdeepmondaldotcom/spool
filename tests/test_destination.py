@@ -1,6 +1,7 @@
 import os
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -283,6 +284,72 @@ def test_a_drive_busy_with_spools_own_download_is_answering(app, monkeypatch, tm
     events.close()
     status, body = app.json("PUT", "/api/settings", {"dest": str(app.dest)})  # no job of Spool's there now
     assert body["dest"]["problem"] == "not_responding"
+
+
+def writes_wait(monkeypatch, seconds):
+    """Our write test waits in line seconds (None: for ever) while a look answers at once, as on a drive another
+    program writes to flat out."""
+    monkeypatch.setattr(system, "CHECK_TIMEOUT", 0.3)
+    release, real = threading.Event(), system.probe
+    monkeypatch.setattr(system, "probe", lambda path, write: (write and release.wait(seconds), real(path, write))[1])
+    return release
+
+
+@pytest.fixture
+def slow_writes(monkeypatch):
+    release = writes_wait(monkeypatch, 1.5)  # well past CHECK_TIMEOUT, as the 11.5 s measured against its 3
+    yield
+    release.set()
+
+
+@pytest.fixture
+def stuck_writes(monkeypatch):
+    release = writes_wait(monkeypatch, None)
+    yield
+    release.set()
+
+
+def test_a_drive_slow_to_take_a_write_starts_the_download_at_the_first_click(app, slow_writes):
+    events = app.events()
+    events.next()
+    status, body = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})
+    assert status == 201, body
+    seen = events.until(lambda e, d: e == "job" and d["state"] in ("done", "failed"), timeout=20)
+    events.close()
+    assert seen[-1][1]["state"] == "done", seen[-1][1]["error"]
+
+
+def test_a_drive_slow_to_take_a_write_opens_its_folder_at_once(app, monkeypatch, slow_writes):
+    opened = []
+    monkeypatch.setattr(system, "open_folder", opened.append)  # never a real window
+    t = time.time()
+    assert app.request("POST", "/api/dest/reveal")[0] == 204
+    assert time.time() - t < 1
+    assert opened == [str(app.dest)]
+
+
+def test_a_write_test_that_never_finishes_fails_the_job_after_a_while(app, monkeypatch, stuck_writes):
+    monkeypatch.setattr(system, "START_TIMEOUT", 0.6)
+    events = app.events()
+    events.next()
+    status, body = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})
+    assert status == 201, body
+    seen = events.until(lambda e, d: e == "job" and d["state"] in ("done", "failed"), timeout=20)
+    events.close()
+    error = seen[-1][1]["error"]
+    assert (seen[-1][1]["state"], error["kind"], error["hint"]) == ("failed", "dest_not_responding", "check_dest")
+
+
+def test_a_job_waiting_on_a_write_test_can_be_cancelled_and_frees_its_slot(app, monkeypatch, stuck_writes):
+    monkeypatch.setattr(system, "START_TIMEOUT", 1.0)
+    status, body = app.json("POST", "/api/jobs", {"entries": [entry()], "preset": "best"})
+    assert status == 201, body
+    job = body["jobs"][0]
+    until(lambda: app.jobs.snapshot()["jobs"][0]["stage"] == "starting")  # its worker waits on the write test
+    status, body = app.json("POST", f"/api/jobs/{job['id']}/cancel")
+    assert (status, body["state"]) == (200, "cancelled")
+    until(lambda: not app.jobs.procs, timeout=10)  # the slot is free once the wait is over
+    assert app.jobs.snapshot()["jobs"][0]["state"] == "cancelled"
 
 
 # A check never raises, and a watcher's check writes nothing

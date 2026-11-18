@@ -892,6 +892,17 @@ def test_a_drive_that_does_not_answer_blocks_download(app, monkeypatch):
         release.set()
 
 
+def test_a_drive_slow_to_take_a_write_downloads_at_the_first_click(app, monkeypatch):
+    from spool import system
+
+    monkeypatch.setattr(system, "CHECK_TIMEOUT", 0.3)
+    real = system.probe
+    monkeypatch.setattr(system, "probe", lambda path, write: (write and time.sleep(1.5), real(path, write))[1])
+    download(app, VIDEO, "Fake video 1")
+    expect(group(app, "Finished").get_by_role("listitem")).to_have_count(1, timeout=15000)
+    expect(app.get_by_text("isn't answering")).to_have_count(0)
+
+
 def test_a_file_saved_to_another_folder_names_that_folder(app, spool, tmp_path):
     download(app, VIDEO, "Fake video 1")
     finished = group(app, "Finished")

@@ -855,7 +855,9 @@ def test_a_cancel_never_tests_the_folder(app, monkeypatch, tmp_path):
 
     worker = Held(monkeypatch, tmp_path)
     written, check = [], system.check_dest
-    monkeypatch.setattr(system, "check_dest", lambda p, write=True: written.append(write) or check(p, write=write))
+    monkeypatch.setattr(
+        system, "check_dest", lambda p, write=True, **kw: written.append(write) or check(p, write, **kw)
+    )
     job_id = post(app, "https://fake.test/hold")
     worker.held()
     before = written.count(True)  # the add and the start each test the folder

@@ -191,7 +191,10 @@ class Jobs:
         if not isinstance(entries, list) or not entries or not all(isinstance(e, dict) for e in entries):
             raise Problem(422, "invalid_entries", "Choose at least one video to download.")
         dest = self.settings["dest"]
-        dest_problem(self._check(dest), status=409)
+        check = self._check(dest)
+        if check["problem"] == "not_responding":  # a drive busy with another program's writes is slow, not gone
+            check = self._check(dest, write=False)  # the job's own check waits longer for the write test
+        dest_problem(check, status=409)
         new = [new_job(e, preset, engine, dest) for e in entries]
         with self.lock:
             done = [(j, j["path"]) for j in self.jobs if j["state"] == "done" and j["path"]]
@@ -300,7 +303,7 @@ class Jobs:
 
     def reveal_dest(self):
         dest = self.settings["dest"]
-        dest_problem(self._check(dest), status=409)
+        dest_problem(self._check(dest, write=False), status=409)  # opening it writes nothing
         system.open_folder(dest)
 
     def log(self, job_id):
@@ -364,10 +367,10 @@ class Jobs:
             raise problem(404, "not_found")
         return job
 
-    def _check(self, path, write=True, but=None):
+    def _check(self, path, write=True, but=None, wait=None):
         """system.check_dest, except that a folder a job of ours is writing to is never "not answering": on a slow
         drive the write test waits behind that job's own writes. but: a job that cannot vouch for itself."""
-        check = system.check_dest(path, write=write)
+        check = system.check_dest(path, write=write, wait=wait)
         if check["problem"] == "not_responding":
             with self.lock:
                 writing = any(
@@ -494,13 +497,15 @@ class Jobs:
             failure, switched, waited, furthest, looked = None, False, 0, None, False
             signin = None  # the browser this run signs in with, once a try asked for an account
             while True:
-                dest_problem(self._check(job["dest"], but=job))
+                # shortcut: a cancel shows at once but the slot stays taken until this wait ends (START_TIMEOUT at most)
+                dest_problem(self._check(job["dest"], but=job, wait=system.START_TIMEOUT))
                 result = self._attempt(job, signin)
                 if result is None or result["event"] == "done" or self.closed or job["state"] != "running":
                     break  # done, or cancelled or quit: nothing failed, so there is nothing to check
                 kind = result.get("kind") if result.get("kind") in KINDS else classify(result["message"])
                 try:
-                    dest_problem(self._check(job["dest"], but=job))  # a drive unplugged mid-download says so
+                    # a drive unplugged mid-download says so
+                    dest_problem(self._check(job["dest"], but=job, wait=system.START_TIMEOUT))
                 except Problem as p:
                     kind = p.kind
                 if kind in NEWER and not looked:
